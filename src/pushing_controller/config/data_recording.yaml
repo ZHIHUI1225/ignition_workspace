@@ -1,0 +1,9 @@
+# Configuration parameters for data recording node.
+
+output_directory: '/home/filippo/pushing_ws/src/pushing_controller/data/TRO_review'
+
+topics:
+ - '/epuck_robot_7/mobile_base/cmd_vel'
+ - '/vrpn_client_node/Box/pose'
+ - '/vrpn_client_node/epuck_robot_7/pose'
+

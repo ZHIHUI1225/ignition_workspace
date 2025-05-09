@@ -1,0 +1,54 @@
+# 使用官方ROS 2 Humble基础镜像
+FROM osrf/ros:humble-desktop-full
+
+# 修复时区配置（避免交互式提示）
+ENV DEBIAN_FRONTEND=noninteractive
+RUN ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime
+
+# 安装核心系统工具
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git \
+    wget \
+    curl \
+    gnupg2 \
+    lsb-release \
+    build-essential \
+    python3-pip \
+    python3-rosdep \
+    python3-colcon-common-extensions \
+    && rm -rf /var/lib/apt/lists/*
+
+# 添加 Gazebo Fortress 软件源
+RUN curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null
+
+
+
+# 安装 Gazebo Fortress 和 ROS 集成包
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ignition-fortress \
+    ros-humble-ros-gz \
+    && rm -rf /var/lib/apt/lists/*
+
+# 修复符号链接和路径问题
+RUN if [ -f /usr/bin/ign ]; then ln -sf /usr/bin/ign /usr/bin/gz; fi && \
+    echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
+    echo "export GZ_VERSION=fortress" >> /root/.bashrc && \
+    echo "export IGN_GAZEBO_RESOURCE_PATH=/usr/share/ignition/ignition-gazebo-7:\${IGN_GAZEBO_RESOURCE_PATH}" >> /root/.bashrc && \
+    echo "export IGN_GAZEBO_SYSTEM_PLUGIN_PATH=/usr/lib/$(uname -m)-linux-gnu/ign-gazebo-7/plugins/:\${IGN_GAZEBO_SYSTEM_PLUGIN_PATH}" >> /root/.bashrc
+
+# 创建工作空间目录
+RUN mkdir -p /ros_ws/src
+WORKDIR /ros_ws
+
+# 初始化rosdep（必须步骤）
+RUN if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then rosdep init; fi && \
+    rosdep update
+# 创建启动脚本
+# RUN echo '#!/bin/bash\nsource /opt/ros/humble/setup.bash\nexec "$@"' > /ros_entrypoint.sh && \
+#     chmod +x /ros_entrypoint.sh
+
+# ENTRYPOINT ["/ros_entrypoint.sh"]
+# CMD ["bash", "-c", "ign gazebo -v"]

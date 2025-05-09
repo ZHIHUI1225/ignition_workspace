@@ -1,0 +1,7 @@
+<launch>
+  <node name="pushing_controller" 
+        pkg="pushing_controller"
+        type="pushing_controller_node"
+        output="screen"
+        launch-prefix="gdb -ex run --args" />
+</launch>

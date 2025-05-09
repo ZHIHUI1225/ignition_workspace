@@ -1,0 +1,36 @@
+<launch>
+    <arg name="server" default="192.168.2.50" />
+    <node pkg="vrpn_client_ros" type="vrpn_client_node" name="vrpn_client_node" output="screen">
+        <rosparam subst_value="true">
+            server: $(arg server)
+            port: 3883
+            frame_id: world
+            broadcast_tf: true
+            # Must either specify refresh frequency > 0.0, or a list of trackers to create
+            update_frequency: 120
+            refresh_tracker_frequency: 1.0
+            #trackers:
+            #- FirstTracker
+            #- SecondTracker
+        </rosparam>
+    </node>
+    <group ns="data_recording">
+        <rosparam command="load" file="$(find pushing_controller)/config/data_recording_turtle.yaml" />
+    </group>
+  
+    <node name="dynparam" pkg="dynamic_reconfigure" type="dynparam" args="load /pushing_controller $(find pushing_controller)/config/controller_params.yaml"/>
+    <node name="data_recording" pkg="data_recording" type="data_recording.py" output="screen" />
+  
+    <node name="rqt_reconfigure" pkg="rqt_reconfigure" type="rqt_reconfigure"/>
+    <node name="pushing_state_publisher" pkg="pushing_state_publisher" type="node" output="screen">
+        <param name="pub_freq" type="double" value="240" />
+        <param name="robot_topic" type="string" value="/vrpn_client_node/turtle5/pose" />
+        <param name="box_topic" type="string" value="/vrpn_client_node/Box/pose" />
+    </node>
+    <node name="pushing_controller" pkg="pushing_controller" type="pushing_controller_matlab_node" output="screen">
+        <remap from="/pusher/cmd_vel" to="/turtle5/cmd_vel" />
+    </node>
+
+    <param name="box_description" textfile="$(find pushing_controller)/urdf/box_urdf.xml"/>
+    
+</launch>

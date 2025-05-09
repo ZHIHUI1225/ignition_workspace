@@ -1,0 +1,27 @@
+<launch>
+    <param name="use_sim_time" value="true"/>
+    <node name="pushing_state_publisher" pkg="pushing_state_publisher" type="node" output="screen">
+        <param name="pub_freq" type="double" value="20" />
+        <param name="robot_topic" type="string" value="/ePuck0/pose" />
+        <param name="box_topic" type="string" value="/Box/pose" />
+
+    </node>
+    <node name="dynparam" pkg="dynamic_reconfigure" type="dynparam" args="load /pushing_controller $(find pushing_controller)/config/controller_params.yaml"/>
+    <node name="rqt_reconfigure" pkg="rqt_reconfigure" type="rqt_reconfigure"/>
+    <node name="pushing_controller" pkg="pushing_controller" type="pushing_controller_matlab_node" output="screen" respawn="true">
+        <remap from="/pusher/cmd_vel" to="/ePuck0/cmd_vel" />
+        <remap from="/vrpn_client_node/Box/pose" to="/Box/pose"/>
+    </node>
+
+    <group ns="data_recording">
+        <rosparam command="load" file="$(find pushing_controller)/config/data_recording.yaml" />
+    </group>
+     <node name="data_recording" pkg="data_recording" type="data_recording.py" output="screen" />
+    <!-- <node name="rviz" pkg="rviz" type="rviz" respawn="false" args="-d $(find pushing_controller)/rviz/epuck_sim.rviz" /> -->
+    <param name="robot_description" textfile="$(find pushing_controller)/urdf/epuck_urdf.xml"/>
+    <param name="box_description" textfile="$(find pushing_controller)/urdf/box_urdf.xml"/>
+    <!-- <node name="epuck_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher">
+        <param name="tf_prefix" value="ePuck0" />
+    </node> -->
+
+</launch>

@@ -1,0 +1,9 @@
+# Configuration parameters for data recording node.
+
+output_directory: '/home/filippo/pushing_ws/src/pushing_controller/data/TRO_review'
+
+topics:
+ - '/turtle5/cmd_vel'
+ - '/vrpn_client_node/Box/pose'
+ - '/vrpn_client_node/turtle5/pose'
+

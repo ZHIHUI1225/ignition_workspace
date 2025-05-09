@@ -1,0 +1,105 @@
+<?xml version='1.0'?>
+<sdf version='1.9'>
+  <model name='parcel'>
+   <static>false</static>
+    <!-- Add a base link (can be minimal) -->
+    <link name='base_link'>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-9</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>1e-9</iyy>
+          <iyz>0</iyz>
+          <izz>1e-9</izz>
+        </inertia>
+      </inertial>
+      <!-- Optional: Add a small visual/collision for the base if needed -->
+    </link>
+
+    <link name='link'>
+    <pose>0.0 0.0 0.02 0.0 0.0 0</pose>
+      <!-- 物理属性优化 -->
+      <inertial>
+        <mass>0.20</mass>
+        <inertia>
+          <ixx>0.00016667</ixx>  <!-- (1/12)*m*(a²) for 0.1m cube -->
+          <ixy>0.0</ixy>
+          <ixz>0.0</ixz>
+          <iyy>0.00016667</iyy>
+          <iyz>0.0</iyz>
+          <izz>0.00016667</izz>
+        </inertia>
+      </inertial>
+
+      <!-- 视觉表现配置 -->
+      <visual name='visual'>
+        <geometry>
+          <box>
+            <size>0.1 0.1 0.1</size>
+          </box>
+        </geometry>
+        <material>
+            <ambient>0.62 0.52 0.15 1</ambient>
+            <diffuse>0.85 0.72 0.25 1</diffuse>
+            <pbr>
+              <metal>
+                <roughness>0.45</roughness>
+                <metalness>0.1</metalness>
+              </metal>
+            </pbr>
+          </material>
+      </visual>
+
+      <!-- 碰撞属性优化 -->
+      <collision name='collision'>
+        <geometry>
+          <box>
+            <size>0.1 0.1 0.1</size>
+          </box>
+        </geometry>
+        <max_contacts>10</max_contacts>
+        <surface>
+          <friction>
+            <ode>
+              <mu>0.8</mu>
+              <mu2>0.8</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+    </link>
+
+    <!-- Add a joint connecting base_link and link -->
+    <joint name='link_joint' type='revolute'>
+      <parent>base_link</parent>
+      <child>link</child>
+      <pose>0 0 0 0 0 0</pose> <!-- Pose of the joint relative to the parent link -->
+      <axis>
+        <xyz>0 0 1</xyz> <!-- Axis of rotation (e.g., Z-axis) -->
+        <limit>
+          <lower>-3.14159</lower>
+          <upper>3.14159</upper>
+          <effort>1.0</effort>
+          <velocity>1.0</velocity>
+        </limit>
+        <dynamics>
+          <damping>0.1</damping>
+        </dynamics>
+      </axis>
+    </joint>
+<!-- Pose Publisher Plugin (no changes needed here) -->
+    <plugin filename="libignition-gazebo-pose-publisher-system.so"
+          name="ignition::gazebo::systems::PosePublisher">
+        <publish_model_pose>true</publish_model_pose>
+        <publish_link_pose>false</publish_link_pose>
+        <publish_nested_model_pose>true</publish_nested_model_pose>
+        <use_pose_vector_msg>false</use_pose_vector_msg>
+        <update_frequency>20</update_frequency>
+        <frame>map</frame> 
+        <static_publisher>true</static_publisher>
+        <static_update_frequency>10</static_update_frequency>
+    </plugin>
+  </model>
+</sdf>

@@ -1,0 +1,36 @@
+digraph root {
+graph [fontname="times-roman"];
+node [fontname="times-roman"];
+edge [fontname="times-roman"];
+ROOT [fillcolor=ghostwhite, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nManipulation\nTask" [fillcolor=cyan, fontcolor=black, fontsize=11, shape=octagon, style=filled];
+ROOT -> "?\nManipulation\nTask";
+"Is object\n at target?" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nManipulation\nTask" -> "Is object\n at target?";
+"->\nManipulate" [fillcolor=orange, fontcolor=black, fontsize=11, shape=box, style=filled];
+"?\nManipulation\nTask" -> "->\nManipulate";
+"?\nIs there a\nvalid \ntrajectory?" [fillcolor=cyan, fontcolor=black, fontsize=11, shape=octagon, style=filled];
+"->\nManipulate" -> "?\nIs there a\nvalid \ntrajectory?";
+"Is current\ntrajectory\nvalid?" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nIs there a\nvalid \ntrajectory?" -> "Is current\ntrajectory\nvalid?";
+"Compute\nTrajectory" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nIs there a\nvalid \ntrajectory?" -> "Compute\nTrajectory";
+"?\nCan Robot\nPush?" [fillcolor=cyan, fontcolor=black, fontsize=11, shape=octagon, style=filled];
+"->\nManipulate" -> "?\nCan Robot\nPush?";
+"Is robot\n in correct\n contact?" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nCan Robot\nPush?" -> "Is robot\n in correct\n contact?";
+"->*\nReposition\nRobot" [fillcolor=orange, fontcolor=black, fontsize=11, shape=box, style=filled];
+"?\nCan Robot\nPush?" -> "->*\nReposition\nRobot";
+"?\nCan robot\nmove safely?" [fillcolor=cyan, fontcolor=black, fontsize=11, shape=octagon, style=filled];
+"->*\nReposition\nRobot" -> "?\nCan robot\nmove safely?";
+"Is robot\nfar from\nthe object?" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nCan robot\nmove safely?" -> "Is robot\nfar from\nthe object?";
+"Move away \nfrom\nthe object" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"?\nCan robot\nmove safely?" -> "Move away \nfrom\nthe object";
+"Align with\n desired \nobject side" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"->*\nReposition\nRobot" -> "Align with\n desired \nobject side";
+"Move to \ncontact\n position" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"->*\nReposition\nRobot" -> "Move to \ncontact\n position";
+"Push\nalong\ntrajectory" [fillcolor=gray, fontcolor=black, fontsize=11, shape=ellipse, style=filled];
+"->\nManipulate" -> "Push\nalong\ntrajectory";
+}

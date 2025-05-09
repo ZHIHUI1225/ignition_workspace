@@ -1,0 +1,14 @@
+<launch>
+    <include file="$(find pushing_planner)/launch/sr_planner_viz.launch"/>
+    <include file="$(find pushing_controller)/launch/launch_epuck_sim.launch"/>
+    <node name="pushing_supervisor" pkg="pushing_supervisor" type="pushing_supervisor.py" output="screen">
+        <param name="map_file" type="string" value="$(find pushing_supervisor)/res/map6.png"/>
+        <param name="box_topic" type="string" value="/Box/pose"/>
+        <param name="robot_topic" type="string" value="/ePuck0/pose"/>
+    </node>
+    <!-- <node name="local_costmap" pkg="costmap_2d" type="costmap_2d_node">
+        <rosparam file="$(find pushing_supervisor)/param/map_param.yaml" command="load" ns="costmap"/>
+    </node> -->
+    <!-- <node pkg="tf" type="static_transform_publisher" name="bl_tf" args="0.5 0.5 0 0 0 0 /world /base_link 240"/>
+    <node pkg="tf" type="static_transform_publisher" name="map_tf" args="0 0 0 0 0 0 /world /map 240"/>  -->
+</launch>
