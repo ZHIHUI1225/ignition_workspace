@@ -1,0 +1,8 @@
+<launch>
+<param name="/use_sim_time" value="true"/>
+  <node name="pushing_controller" pkg="pushing_controller" type="pushing_controller_matlab_node" output="screen" >
+    <remap from="/pusher/cmd_vel" to="/RosAria/cmd_vel"/>
+  </node>
+  <include file="$(find pushing_state_publisher)/launch/filter.launch"/>
+  <!--node name="vrpn_client_node" pkg="vrpn_client_ros" type="vrpn_client_node" output="screen"/-->
+</launch>

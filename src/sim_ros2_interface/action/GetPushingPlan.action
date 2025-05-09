@@ -1,0 +1,11 @@
+uint8 PLANNER_TYPE_ASTAR=0
+uint8 PLANNER_TYPE_RRT=1
+# Goal
+uint8 planner_type
+geometry_msgs/Pose start
+geometry_msgs/Pose target
+---
+pushing_interfaces/PushingAction[] plan
+---
+std_msgs/String message
+pushing_interfaces/PushingAction[] partial_plan

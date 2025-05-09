@@ -1,0 +1,49 @@
+<?xml version='1.0'?>
+<sdf version='1.9'>
+  <model name="RelayPoint">
+    <static>true</static>
+    <!-- Add a base link (can be minimal) -->
+    <!-- <link name='base_link'>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-9</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>1e-9</iyy>
+          <iyz>0</iyz>
+          <izz>1e-9</izz>
+        </inertia>
+      </inertial>
+    </link> -->
+
+    <link name="circle_link">
+      <pose>0 0 0.01 0 0 0</pose>
+      
+      <!-- Visual Element (PBR Material) -->
+      <visual name='visual'>
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.01</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>1.0 0.0 0.0 1</ambient>
+          <diffuse>0.8 0.0 0.0 1</diffuse>
+          <transparency>0.5</transparency>
+        </material>
+      </visual>
+    </link>
+    <plugin filename="libignition-gazebo-pose-publisher-system.so"
+          name="ignition::gazebo::systems::PosePublisher">
+        <publish_model_pose>true</publish_model_pose>
+        <publish_link_pose>false</publish_link_pose>
+        <publish_nested_model_pose>true</publish_nested_model_pose>
+        <use_pose_vector_msg>false</use_pose_vector_msg>
+        <update_frequency>30</update_frequency>
+        <static_publisher>true</static_publisher>
+        <static_update_frequency>10</static_update_frequency>
+    </plugin>
+  </model>
+</sdf>

@@ -1,0 +1,6 @@
+nav_msgs/OccupancyGrid map
+pushing_interfaces/PushingConfig[] contact_configurations
+geometry_msgs/Polygon object_footprint
+geometry_msgs/Polygon robot_footprint
+---
+bool success

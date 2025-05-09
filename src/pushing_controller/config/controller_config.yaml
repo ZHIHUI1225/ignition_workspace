@@ -1,0 +1,26 @@
+/pushing_controller:
+  ros__parameters:
+    min_turning_radius: 0.47
+    pushing:
+      P_mult: 50.0
+      ang_vel_gain: 0.1
+      ang_vel_rate_gain: 0.05
+      lin_vel_gain: 0.1
+      lin_vel_rate_gain: 0.05
+      theta_gain: 0.5
+      x_gain: 1.0
+      y_gain: 2.0
+    robot:
+      P_mult: 10.0
+      ang_acc_gain: 0.05
+      ang_acc_rate_gain: 1.0
+      distance_success_threshold: 0.02
+      lin_acc_gain: 0.05
+      lin_acc_rate_gain: 1.0
+      omega_gain: 0.05
+      theta_gain: 2.0
+      v_gain: 0.05
+      x_gain: 10.0
+      y_gain: 20.0
+    safe_distance: 0.15
+    use_sim_time: false

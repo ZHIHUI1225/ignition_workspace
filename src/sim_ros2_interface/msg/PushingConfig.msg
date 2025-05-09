@@ -1,0 +1,4 @@
+int8 id
+geometry_msgs/PoseStamped robot_pose
+geometry_msgs/PoseStamped safe_pose
+float64 turning_radius

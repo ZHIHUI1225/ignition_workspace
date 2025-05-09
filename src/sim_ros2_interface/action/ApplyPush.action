@@ -1,0 +1,5 @@
+pushing_interfaces/PushingAction action
+---
+bool success
+---
+nav_msgs/Path current_ref

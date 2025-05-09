@@ -1,0 +1,107 @@
+- ros_topic_name: "/clock"
+  gz_topic_name: "/clock"
+  ros_type_name: rosgraph_msgs/msg/Clock
+  gz_type_name: ignition.msgs.Clock
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/parcel/pose"
+  gz_topic_name: "/model/parcel/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/turtlebot0/odometry"
+  gz_topic_name: "/model/turtlebot0/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "ignition.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- ros_topic_name: "/turtlebot1/odometry"
+  gz_topic_name: "/model/turtlebot1/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "ignition.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- ros_topic_name: "/turtlebot2/odometry"
+  gz_topic_name: "/model/turtlebot2/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "ignition.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- ros_topic_name: "/turtlebot3/odometry"
+  gz_topic_name: "/model/turtlebot3/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "ignition.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- ros_topic_name: "/turtlebot4/odometry"
+  gz_topic_name: "/model/turtlebot4/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "ignition.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- ros_topic_name: "/Relaypoint0/pose"
+  gz_topic_name: "/model/Relaypoint0/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/Relaypoint1/pose"
+  gz_topic_name: "/model/Relaypoint1/pose_static" # Corrected topic name
+  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/Relaypoint2/pose"
+  gz_topic_name: "/model/Relaypoint2/pose_static" # Corrected topic name
+  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/Relaypoint3/pose"
+  gz_topic_name: "/model/Relaypoint3/pose_static" # Corrected topic name
+  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/Relaypoint4/pose" 
+  gz_topic_name: "/model/Relaypoint4/pose_static" # Corrected topic name
+  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/Relaypoint5/pose" 
+  gz_topic_name: "/model/Relaypoint5/pose_static" # Corrected topic name
+  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/turtlebot0/cmd_vel"
+  gz_topic_name: "/model/turtlebot0/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "ignition.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/turtlebot1/cmd_vel"
+  gz_topic_name: "/model/turtlebot1/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "ignition.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/turtlebot2/cmd_vel"
+  gz_topic_name: "/model/turtlebot2/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "ignition.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/turtlebot3/cmd_vel"
+  gz_topic_name: "/model/turtlebot3/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "ignition.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/turtlebot4/cmd_vel"
+  gz_topic_name: "/model/turtlebot4/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "ignition.msgs.Twist"
+  direction: ROS_TO_GZ

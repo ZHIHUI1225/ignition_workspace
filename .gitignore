@@ -1,0 +1,15 @@
+build/
+log/
+install/
+devel/
+*.pyc 
+__pycache__/
+
+.vscode/
+.idea/
+*.swp 
+*.swo 
+~/.ros 
+~/.catkin_tools/
+*.bak 
+*.tmp
