@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <sdf version='1.9'>
-  <model name='parcel'>
+  <model name='parcel0'>
    <static>false</static>
     <!-- Add a base link (can be minimal) -->
     <link name='base_link'>
@@ -22,14 +22,14 @@
     <pose>0.0 0.0 0.02 0.0 0.0 0</pose>
       <!-- 物理属性优化 -->
       <inertial>
-        <mass>0.20</mass>
+        <mass>0.25</mass>
         <inertia>
-          <ixx>0.00016667</ixx>  <!-- (1/12)*m*(a²) for 0.1m cube -->
+          <ixx>0.0003</ixx>  <!-- (1/12)*m*(a²) for 0.1m cube -->
           <ixy>0.0</ixy>
           <ixz>0.0</ixz>
-          <iyy>0.00016667</iyy>
+          <iyy>0.0003</iyy>
           <iyz>0.0</iyz>
-          <izz>0.00016667</izz>
+          <izz>0.0003</izz>
         </inertia>
       </inertial>
 
@@ -59,7 +59,7 @@
             <size>0.1 0.1 0.1</size>
           </box>
         </geometry>
-        <max_contacts>10</max_contacts>
+        <max_contacts>100</max_contacts>
         <surface>
           <friction>
             <ode>
@@ -67,10 +67,30 @@
               <mu2>0.8</mu2>
             </ode>
           </friction>
+          <contact>
+            <ode>
+                <kp>1e3</kp>  <!-- 增加接触刚度 -->
+                <kd>1e3</kd>  <!-- 调整接触阻尼 -->
+            </ode>
+          </contact>
         </surface>
       </collision>
+      
+      <!-- Add contact sensor to the parcel -->
+      <sensor name="contact_sensor" type="contact">
+        <always_on>true</always_on>
+        <update_rate>30</update_rate>
+        <contact>
+          <collision>collision</collision>
+        </contact>
+        <plugin filename="libignition-gazebo-contact-system.so" 
+                name="ignition::gazebo::systems::Contact">
+          <topic>parcel/contact</topic>
+        </plugin>
+        <visualize>false</visualize>
+      </sensor>
     </link>
-
+    
     <!-- Add a joint connecting base_link and link -->
     <joint name='link_joint' type='revolute'>
       <parent>base_link</parent>
@@ -96,10 +116,10 @@
         <publish_link_pose>false</publish_link_pose>
         <publish_nested_model_pose>true</publish_nested_model_pose>
         <use_pose_vector_msg>false</use_pose_vector_msg>
-        <update_frequency>20</update_frequency>
+        <update_frequency>60</update_frequency>
         <frame>map</frame> 
         <static_publisher>true</static_publisher>
-        <static_update_frequency>10</static_update_frequency>
+        <static_update_frequency>60</static_update_frequency>
     </plugin>
   </model>
 </sdf>

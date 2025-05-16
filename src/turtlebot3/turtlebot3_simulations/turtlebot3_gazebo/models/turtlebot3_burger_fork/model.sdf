@@ -2,7 +2,7 @@
 <sdf version="1.9">
   <model name="turtlebot3_burger">
     <pose>0.0 0.0 0.0 0.0 0.0 0.0</pose>
-
+    
     <link name="base_footprint"/>
 
     <link name="base_link">
@@ -57,9 +57,9 @@
             <izz>0.0003367</izz>
           </inertia>
       </inertial>
-      <collision name="pushing collision">
+      <collision name="pushing_collision">
         <pose>0.06 0 0.05 0 0.0 0.0</pose>
-        <max_contacts>20</max_contacts>
+        <max_contacts>200</max_contacts>
         <geometry>
           <box>
             <size>0.02 0.2 0.1</size>
@@ -72,8 +72,15 @@
               <mu2>0.9</mu2>
             </ode>
           </friction>
+          <contact>
+            <ode>
+              <kp>1e6</kp> 
+              <kd>1e3</kd>  
+            </ode>
+          </contact>
         </surface>
       </collision>
+     
       <visual name="pushing visual">
         <pose>0.06 0 0.05 0.0 0.0 0.0</pose>
         <geometry>
@@ -87,6 +94,18 @@
           <specular>0.8 0.8 0.8 1</specular>
         </material>
       </visual>
+       <sensor name="contact_sensor" type="contact">
+        <always_on>true</always_on>
+        <update_rate>30</update_rate>
+        <contact>
+          <collision>pushing_collision</collision>
+        </contact>
+        <plugin filename="libignition-gazebo-contact-system.so" 
+                name="ignition::gazebo::systems::Contact">
+          <topic>${namespace}/contact</topic>
+        </plugin>
+        <visualize>false</visualize>
+      </sensor>
     </link>
 
     <link name="fork_left">
@@ -117,6 +136,12 @@
               <mu2>0.9</mu2>
             </ode>
           </friction>
+          <contact>
+            <ode>
+              <kp>1e6</kp> 
+              <kd>1e3</kd>  
+            </ode>
+          </contact>
         </surface>
       </collision>
       <visual name="fork_left visual">
@@ -162,6 +187,12 @@
               <mu2>0.8</mu2>
             </ode>
           </friction>
+          <contact>
+            <ode>
+              <kp>1e6</kp> 
+              <kd>1e3</kd>  
+            </ode>
+          </contact>
         </surface>
       </collision>
       <visual name="fork_right visual">

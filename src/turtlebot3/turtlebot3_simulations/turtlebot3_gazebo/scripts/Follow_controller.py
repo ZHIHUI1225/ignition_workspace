@@ -8,10 +8,12 @@ from nav_msgs.msg import Path, Odometry
 import re
 import casadi as ca
 from std_msgs.msg import Header
+import transforms3d.euler as euler
 import tf_transformations as tf
 import threading
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 import os
+from std_srvs.srv import Trigger # Add this import
 
 class MobileRobotMPC:
     def __init__(self):
@@ -113,33 +115,57 @@ class CmdVelPublisher(Node):
         # Declare and get the namespace parameter
         self.declare_parameter('namespace', 'tb_default') # Provide a default value
         self.namespace = self.get_parameter('namespace').get_parameter_value().string_value
-                
-        # self.declare_parameter('use_sim_time', True) # This was already correctly removed
-        self.Pushing_flag=Bool()
-        self.Pushing_flag.data=False
-        self.Ready_flag=False
+        
+        # Current parcel index (defaults to 0 for parcel0)
+        self.current_parcel_index = 0
+        
+        # Subscribe to this robot's specific parcel index topic
+        self.parcel_index_sub = self.create_subscription(
+            Int32,
+            f'/{self.namespace}/current_parcel_index',
+            self.parcel_index_callback,
+            10
+        )
+        
+        # Get relay point number (namespace number + 1)
+        self.namespace_number = self.extract_namespace_number(self.namespace)
+        self.relay_point_number = self.namespace_number + 1
+        
+        # Subscribe to relay point pose (the goal)
+        self.relay_point_pose = None
+        self.relay_point_sub = self.create_subscription(
+            PoseStamped,
+            f'/Relaypoint{self.relay_point_number}/pose',
+            self.relay_point_callback,
+            10
+        )
+        
+        self.pushing_complete_flag = Bool()
+        self.pushing_complete_flag.data = False
+        self.pushing_ready_flag = False # Internal flag, not set by subscriber anymore
         self.state_lock = threading.Lock()
         self.publisher_ = self.create_publisher(Twist, 'pushing/cmd_vel', 10)
         self.prediction_publisher = self.create_publisher(Path, 'pushing/pred_path', 10)
         self.ref_publisher = self.create_publisher(Path, 'pushing/ref_path', 10)
-        self.pushing_flag_pub=self.create_publisher(Bool, 'Pushing_flag', 10)
-        # Add a subscriber for robot pose
+        self.pushing_complete_flag_pub = self.create_publisher(Bool, 'Pushing_flag', 10)
         self.robot_pose_sub = self.create_subscription(
             Odometry, 'pushing/robot_pose', self.robot_pose_callback, 10)
-        # self.robot_twist_sub = self.create_subscription(
-        #     TwistStamped, 'pushing/robot_twist', self.robot_twist_callback, 10)
-        self.parcel_pose_sub = self.create_subscription(
-            PoseStamped, 'pushing/object_pose', self.parcel_pose_callback, 10)
-        # self.Pushing_flag_sub = self.create_subscription(
-        #     Bool, 'Pushing_flag', self.Pushing_flag_callback, 10)
-        self.Ready_flag_sub = self.create_subscription(
-            Bool, 'Ready_flag', self.Ready_flag_callback, 10)
         
-        # Use self.namespace which is now a class member
+        self.parcel_pose_sub = None
+        self.update_parcel_subscription()
+            
+        # Add start_pushing service server
+        self.start_pushing_service = self.create_service(
+            Trigger, 
+            f'/{self.namespace}/start_pushing', 
+            self.start_pushing_callback
+        )
+        self.get_logger().info(f'/{self.namespace}/start_pushing service created.')
+        
         json_file_path = f'/root/workspace/data/{self.namespace}_DiscreteTrajectory.json'
         with open(json_file_path, 'r') as json_file:
             self.data = json.load(json_file)['Trajectory']
-            self.goal=self.data[-1]
+            self.goal = self.data[-1].copy()  # Initialize goal from the last trajectory point
         # Initialize current state (x, y, theta, v, omega)
         self.current_state = np.zeros(5)
         self.parcel_state = np.zeros(3)
@@ -147,17 +173,85 @@ class CmdVelPublisher(Node):
         self.index = 0
         timer_period = 0.1# seconds
         self.ref_traj= Path()
-        self.ref_traj.header.frame_id = 'map'
+        self.ref_traj.header.frame_id = 'world'
         self.ref_traj.header.stamp = self.get_clock().now().to_msg()
         self.pre_traj= Path()
-        self.pre_traj.header.frame_id = 'map'
+        self.pre_traj.header.frame_id = 'world'
         self.pre_traj.header.stamp = self.get_clock().now().to_msg()
         self.MPC=MobileRobotMPC()
         self.P_HOR = self.MPC.N
-         # Timing control
+        
+        # Track pushing state and pickup transition
+        self.pushing_complete = False
+        self.backing_away = False
+        self.safe_distance_reached = False
+        self.prev_picking_flag = False
+        
+        # Timing control
         self.timer = self.create_timer(timer_period, self.control_loop)
         
-        
+    def parcel_index_callback(self, msg):
+        """Handle updates to the current parcel index"""
+        new_index = msg.data
+        if new_index != self.current_parcel_index:
+            with self.state_lock:
+                old_index = self.current_parcel_index
+                self.current_parcel_index = new_index
+                self.get_logger().info(f'Follow controller updated parcel index: {old_index} -> {self.current_parcel_index}')
+                # Reset state flags on new parcel
+                self.pushing_ready_flag = False
+                self.pushing_complete_flag.data = False
+                self.pushing_complete = False
+                self.backing_away = False
+                self.safe_distance_reached = False
+                self.index = 0  # Reset trajectory index
+                # Update subscription to the correct parcel
+                self.update_parcel_subscription()
+    
+    def update_parcel_subscription(self):
+        """Update subscription to the correct parcel topic - always use parcel0"""
+        # If we already have a subscription, destroy it
+        if self.parcel_pose_sub is not None:
+            self.destroy_subscription(self.parcel_pose_sub)
+            
+        # Always create subscription for parcel0
+        self.parcel_pose_sub = self.create_subscription(
+            PoseStamped,
+            f'/parcel{self.current_parcel_index}/pose',
+            self.parcel_pose_callback,
+            10
+        )
+        self.get_logger().info(f'Now tracking parcel{self.current_parcel_index} for pushing')
+
+    def extract_namespace_number(self, namespace):
+        """Extract numerical index from namespace string using regex"""
+        match = re.search(r'tb(\d+)', namespace)
+        if (match):
+            return int(match.group(1))
+        return 0  # Default to 0 if no number found
+    
+    def relay_point_callback(self, msg):
+        """Process the relay point pose as the goal"""
+        with self.state_lock:
+            self.relay_point_pose = msg.pose
+            
+            # Update the goal position based on the relay point
+            self.goal[0] = self.relay_point_pose.position.x
+            self.goal[1] = self.relay_point_pose.position.y
+            
+            # Extract yaw from quaternion
+            # transforms3d expects [w, x, y, z]
+            quat = [
+                msg.pose.orientation.x,
+                msg.pose.orientation.y,
+                msg.pose.orientation.z,
+                msg.pose.orientation.w
+            ]
+            euler = tf.euler_from_quaternion(quat)
+            self.goal[2]=euler[2]
+            
+            self.get_logger().debug(f'Updated goal from relay point: x={self.goal[0]:.2f}, y={self.goal[1]:.2f}, theta={self.goal[2]:.2f}')
+
     def parcel_pose_callback(self, msg):
         self.parcel_state[0] = msg.pose.position.x
         self.parcel_state[1] = msg.pose.position.y
@@ -169,19 +263,35 @@ class CmdVelPublisher(Node):
         ]
         euler = tf.euler_from_quaternion(quat)
         self.parcel_state[2] = euler[2]
-        # self.get_logger().info(f'Parcel pose: {self.parcel_state[0]:.2f}, {self.parcel_state[1]:.2f}, {self.parcel_state[2]:.2f}')
 
-    # def Pushing_flag_callback(self, msg):
-    #     self.Pushing_flag=msg.data
-        # self.get_logger().info(f'Pushing_flag: {self.Pushing_flag}')
-    def Ready_flag_callback(self, msg):
-        old_flag = self.Ready_flag
-        self.Ready_flag = msg.data
-        if old_flag != self.Ready_flag:
-            self.get_logger().info(f'Ready_flag changed: {old_flag} -> {self.Ready_flag}')
+    # Remove pushing_ready_flag_callback
+    # def pushing_ready_flag_callback(self, msg):
+    #     """Update pushing ready flag from external system"""
+    #     old_flag = self.pushing_ready_flag
+    #     self.pushing_ready_flag = msg.data
+    #     if old_flag != self.pushing_ready_flag:
+    #         self.get_logger().info(f'Pushing ready flag changed: {old_flag} -> {self.pushing_ready_flag}')
+            
+    def start_pushing_callback(self, request, response):
+        # self.get_logger().info(f'Start pushing service called for {self.namespace}. Current pushing_ready_flag: {self.pushing_ready_flag}')
+        if not self.pushing_ready_flag: # Only act if not already ready
+            self.pushing_ready_flag = True
+            # Reset other relevant state variables for a new pushing task
+            self.pushing_complete = False
+            self.backing_away = False
+            self.safe_distance_reached = False
+            self.index = 0 # Reset trajectory index
+            self.get_logger().info('Pushing task enabled.')
+            response.success = True
+            response.message = 'Pushing started.'
+        else:
+            # self.get_logger().info('Already in pushing ready state.')
+            response.success = True # Still success, just noting it's already ready
+            response.message = 'Already in pushing ready state.'
+        return response
+
     def robot_pose_callback(self, msg):
         """Update position and orientation from pose message"""
-        # print(f"robot_pose_callback: {msg}") # Optional: Keep or remove the raw message print
         with self.state_lock:
             # Position
             self.current_state[0] = msg.pose.pose.position.x
@@ -198,26 +308,73 @@ class CmdVelPublisher(Node):
             self.current_state[2] = euler[2]  # yaw
             self.current_state[3] = msg.twist.twist.linear.x   # Linear velocity
             self.current_state[4] = msg.twist.twist.angular.z  # Angular velocity
-            # Example using more decimal places:
-            # self.get_logger().info(f'Robot pose: {self.current_state[0]:.2e}, {self.current_state[1]:.2e}, {self.current_state[2]:.2e}')
+
 
     def control_loop(self):
-        self.get_logger().info('Entering control_loop')
-        if self.Ready_flag is False:
-            self.get_logger().info('Ready_flag is False, skipping control loop')
+        # print(f'Control loop called with index: {self.index}, pushing_ready_flag: {self.pushing_ready_flag}', flush=True)
+        if self.pushing_ready_flag is False:
+            self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
             return
         try:
             # 1. Update reference trajectory
-            distance_error=np.sqrt((self.current_state[0]-self.goal[0])**2+(self.current_state[1]-self.goal[1])**2)
-            object_distance=np.sqrt((self.goal[0]-self.parcel_state[0])**2+(self.goal[1]-self.parcel_state[1])**2)
-            # MPC controller works and publishes cmd_vel when:
-            # 1. We still have trajectory points to follow (index < len(data))
-            # 2. We're not close enough to the goal (distance_error > 0.1)
-            # 3. We're not in pushing mode (Pushing_flag is False)
-            if self.index < len(self.data) and object_distance > 0.05 and self.Pushing_flag.data is False:  
-                self.Pushing_flag.data=False
-                self.pushing_flag_pub.publish(self.Pushing_flag)
-                print(f'index: {self.index}, distance_error: {distance_error:.2f}')
+            distance_error = np.sqrt((self.current_state[0]-self.goal[0])**2+(self.current_state[1]-self.goal[1])**2)
+            object_distance = np.sqrt((self.goal[0]-self.parcel_state[0])**2+(self.goal[1]-self.parcel_state[1])**2)
+            robot_parcel_distance = np.sqrt((self.current_state[0]-self.parcel_state[0])**2+(self.current_state[1]-self.parcel_state[1])**2)
+            
+            # Check if parcel reached the goal position and start backing away immediately
+            if object_distance <= 0.06 and not self.pushing_complete:
+                self.get_logger().info(f'Parcel{self.current_parcel_index} reached goal. Distance to goal: {object_distance:.2f}m')
+                # # Update the subscription to track the next parcel
+                # self.update_parcel_subscription()
+                self.pushing_complete = True
+                self.backing_away = True
+                self.pushing_complete_flag.data = True
+                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
+                
+                # Start backing away immediately without waiting for next loop iteration
+                cmd_msg = Twist()
+                cmd_msg.linear.x = -0.08  # Faster reverse speed for immediate response
+                cmd_msg.angular.z = 0.0
+                self.publisher_.publish(cmd_msg)
+                self.get_logger().info('Backing away immediately!')
+                
+                # Removed spawn_next_parcel publication from here - now handled in PickUp_controller.py
+                return
+            
+            if self.backing_away:
+                # Continue backing away from the parcel to a safe distance
+                distance = np.sqrt((self.current_state[0]-self.goal[0])**2 + (self.current_state[1]-self.goal[1])**2)
+                cmd_msg = Twist()
+                self.pushing_complete_flag.data = True
+                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
+                if distance < 0.35:  # Still need to back up more
+                    cmd_msg.linear.x = -0.05
+                    cmd_msg.angular.z = 0.0
+                    self.publisher_.publish(cmd_msg)
+                    self.get_logger().info(f'Backing to safe distance: current={distance:.2f}m, target=0.35m')
+                    
+                else:
+                    # Safe distance reached, stop backing
+                    self.backing_away = False
+                    self.safe_distance_reached = True
+                    cmd_msg.linear.x = 0.0
+                    cmd_msg.angular.z = 0.0
+                    self.publisher_.publish(cmd_msg)
+                    self.get_logger().info('Safe distance reached. Ready for pickup task.')
+                    # Reset flags for next cycle
+                    self.pushing_ready_flag = False
+                    self.pushing_complete = False
+                    # self.backing_away = False # Already set
+                    # self.safe_distance_reached = False # Will be reset by service call
+                    self.index = 0 # Reset trajectory index
+                return
+            
+            # Normal path following with MPC
+            if self.index < len(self.data) and not self.pushing_complete_flag.data and not self.backing_away:  
+                # Not in pushing mode and still have trajectory points to follow  
+                self.pushing_complete_flag.data = False
+                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
+                # print(f'index: {self.index}, distance_error: {distance_error:.2f}')
                 ref_array = np.zeros((5, self.P_HOR+1))  # N+1 points for reference trajectory
                 self.ref_traj.poses = []  # Clear existing poses
                 
@@ -231,10 +388,10 @@ class CmdVelPublisher(Node):
                     yaw = self.data[min(self.index+i,len(self.data)-1)][2]
                     # Convert yaw to quaternion
                     quat = tf.quaternion_from_euler(0.0, 0.0, yaw)
-                    pose_msg.pose.orientation.x = quat[0]
-                    pose_msg.pose.orientation.y = quat[1]
-                    pose_msg.pose.orientation.z = quat[2]
-                    pose_msg.pose.orientation.w = quat[3]
+                    pose_msg.pose.orientation.x = quat[1]
+                    pose_msg.pose.orientation.y = quat[2]
+                    pose_msg.pose.orientation.z = quat[3]
+                    pose_msg.pose.orientation.w = quat[0]
                     
                     self.ref_traj.poses.append(pose_msg)
                     
@@ -249,16 +406,10 @@ class CmdVelPublisher(Node):
                         ref_array[3, i] = 0
                         ref_array[4, i] = 0
                 
-                # self.MPC.set_reference_trajectory(ref_array)
                 self.ref_publisher.publish(self.ref_traj)
 
-            
-                # 2. Get current state snapshot
-                # with self.state_lock:
-                # if self.ref_traj!=None:
                 current_state = self.current_state.copy()
                 
-                # 3. MPC Update - this is when the controller calculates optimal control inputs
                 try:
                     self.MPC.set_reference_trajectory(ref_array)
                     u = self.MPC.update(current_state)
@@ -268,7 +419,8 @@ class CmdVelPublisher(Node):
                     cmd_msg.linear.x = u[0]
                     cmd_msg.angular.z = u[1]
                     self.publisher_.publish(cmd_msg)
-                    print(f'Publishing cmd_vel: linear.x={cmd_msg.linear.x:.2f}, angular.z={cmd_msg.angular.z:.2f}')
+                    # print(f'Publishing cmd_vel: linear.x={cmd_msg.linear.x:.2f}, angular.z={cmd_msg.angular.z:.2f}')
+                    
                     # Publish predicted trajectory
                     pred_traj = self.MPC.get_predicted_trajectory()
                     self.pre_traj.poses = []
@@ -281,36 +433,24 @@ class CmdVelPublisher(Node):
                         yaw = pred_traj[2, i]
                         # Convert yaw to quaternion
                         quat = tf.quaternion_from_euler(0.0, 0.0, yaw)
-                        pose_msg.pose.orientation.x = quat[0]
-                        pose_msg.pose.orientation.y = quat[1]
-                        pose_msg.pose.orientation.z = quat[2]
-                        pose_msg.pose.orientation.w = quat[3]
+                        pose_msg.pose.orientation.x = quat[1]
+                        pose_msg.pose.orientation.y = quat[2]
+                        pose_msg.pose.orientation.z = quat[3]
+                        pose_msg.pose.orientation.w = quat[0]
                         self.pre_traj.poses.append(pose_msg)
                     self.prediction_publisher.publish(self.pre_traj)
                     self.index += 1
                     
                 except Exception as e:
                     self.get_logger().error(f'Control error: {str(e)}')
-            else:
-                distance=np.sqrt((self.current_state[0]-self.goal[0])**2+(self.current_state[1]-self.goal[1])**2)
+            
+            elif self.safe_distance_reached:
+                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
                 cmd_msg = Twist()
-                self.Pushing_flag.data=True
-                if distance<0.3 :
-                    cmd_msg.linear.x =-0.05
-                    cmd_msg.angular.z = 0.0
-                    self.publisher_.publish(cmd_msg)
-                    self.get_logger().info(f'back to safe distance: {distance:.2f}m')
-                    self.pushing_flag_pub.publish(self.Pushing_flag)
-                else:
-                    self.pushing_flag_pub.publish(self.Pushing_flag)
-                    cmd_msg.linear.x = 0.0
-                    cmd_msg.angular.z = 0.0
-                    self.publisher_.publish(cmd_msg)
-                    self.get_logger().info('Finished pushing.')
-                    self.timer.cancel()
-                    return
-            print(f"Current state: {self.current_state}")
-            print(f"Goal state: {self.goal}")
+                cmd_msg.linear.x = 0.0
+                cmd_msg.angular.z = 0.0
+                self.publisher_.publish(cmd_msg)
+                
         except Exception as e:
             self.get_logger().error(f"Error in control loop: {e}")
             self.timer.cancel()

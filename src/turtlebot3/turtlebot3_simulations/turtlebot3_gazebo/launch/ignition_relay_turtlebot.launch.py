@@ -3,11 +3,13 @@ import json
 import math
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, RegisterEventHandler, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler, IncludeLaunchDescription, SetEnvironmentVariable, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
-from launch.event_handlers import OnProcessExit
+from launch.event_handlers import OnProcessExit, OnProcessStart
+from launch.actions import ExecuteProcess, RegisterEventHandler
+from std_msgs.msg import Bool
 
 
 def generate_launch_description():
@@ -103,13 +105,13 @@ def generate_launch_description():
     y_parcel = relay_points[0]['Position'][1] / 100
     theta = relay_points[0]['Orientation']
 
-    # Spawn parcel for each robot
+    # Spawn parcel for each robot (initial, if you ever enable it)
     spawn_parcel_cmd = Node(
         package="ros_gz_sim",
         executable="create",
         arguments=[
             "-file", urdf_parcel,
-            "-name", "parcel",
+            "-name", "parcel0",
             "-x", str(x_parcel),
             "-y", str(y_parcel),
             "-z", "0.05",
@@ -119,6 +121,21 @@ def generate_launch_description():
         output="screen",
     )
     ld.add_action(spawn_parcel_cmd)
+
+    # --- Add subscriber handler for '/spawn_next_parcel' ---
+
+  
+    listener_node = Node(
+        package='turtlebot3_gazebo',
+        executable='spawn_listener.py',
+        name='parcel_spawner',
+        output='screen',
+        parameters=[{
+            'urdf_path': urdf_parcel  # 从launch文件传递URDF路径
+        }]
+    )
+    ld.add_action(listener_node)
+    # --- end subscriber setup ---
 
     # Spawn relay points, robots, and parcels
     last_action = None
@@ -231,7 +248,7 @@ def generate_launch_description():
     )
     ld.add_action(spawn_goal)
 
-    # Add ROS-Ignition bridge
+    # ROS-Ignition bridge with service forwarding
     config_file = os.path.join(
         get_package_share_directory('turtlebot3_gazebo'),
         'config',

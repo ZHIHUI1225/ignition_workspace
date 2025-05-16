@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <sdf version='1.9'>
   <world name='default'>
-     <plugin
+     <!-- <plugin
       filename="gz-sim-physics-system"
       name="gz::sim::systems::Physics">
     </plugin>
@@ -12,7 +12,7 @@
     <plugin
       filename="gz-sim-scene-broadcaster-system"
       name="gz::sim::systems::SceneBroadcaster">
-      <update_rate>20</update_rate> <!-- Set your desired frequency here -->
+      <update_rate>20</update_rate> 
     </plugin>
     <plugin
       filename="gz-sim-sensors-system"
@@ -26,11 +26,9 @@
 
     <scene>
       <shadows>false</shadows>
-      <ambient>0.4 0.4 0.4 1</ambient>  <!-- 提升环境光强度 -->
+      <ambient>0.4 0.4 0.4 1</ambient>  
       <background>0.7 0.7 0.7 1</background>
     </scene>
-
-    <!-- 主定向光源（太阳） -->
 
     <light type="directional" name="sun">
       <cast_shadows>false</cast_shadows>
@@ -44,12 +42,112 @@
         <quadratic>0.001</quadratic>
       </attenuation>
       <direction>-0.5 0.1 -0.9</direction>
-    </light>
-    
+    </light> -->
+    <physics name="1ms" type="dart">
+      <max_contacts>100</max_contacts>
+      <contact_surface_layer>true</contact_surface_layer>
+    </physics>
+      <plugin
+          filename="libignition-gazebo-physics-system.so"
+          name="ignition::gazebo::systems::Physics">
+      </plugin>
+      <plugin
+          filename="libignition-gazebo-user-commands-system.so"
+          name="ignition::gazebo::systems::UserCommands">
+      </plugin>
+      <plugin
+          filename="libignition-gazebo-scene-broadcaster-system.so"
+          name="ignition::gazebo::systems::SceneBroadcaster">
+      </plugin>
+
+      <gui fullscreen="0">
+
+          <!-- 3D scene -->
+          <plugin filename="GzScene3D" name="3D View">
+              <ignition-gui>
+              <title>3D View</title>
+              <property type="bool" key="showTitleBar">false</property>
+              <property type="string" key="state">docked</property>
+              </ignition-gui>
+
+              <engine>ogre2</engine>
+              <scene>scene</scene>
+              <ambient_light>0.4 0.4 0.4</ambient_light>
+              <background_color>0.8 0.8 0.8</background_color>
+          </plugin>
+
+          <!-- World control -->
+          <plugin filename="WorldControl" name="World control">
+              <ignition-gui>
+              <title>World control</title>
+              <property type="bool" key="showTitleBar">false</property>
+              <property type="bool" key="resizable">false</property>
+              <property type="double" key="height">72</property>
+              <property type="double" key="width">121</property>
+              <property type="double" key="z">1</property>
+
+              <property type="string" key="state">floating</property>
+              <anchors target="3D View">
+                  <line own="left" target="left"/>
+                  <line own="bottom" target="bottom"/>
+              </anchors>
+              </ignition-gui>
+
+              <play_pause>true</play_pause>
+              <step>true</step>
+              <start_paused>true</start_paused>
+              <service>/world/car_world/control</service>
+              <stats_topic>/world/car_world/stats</stats_topic>
+          </plugin>
+
+          <!-- World statistics -->
+          <plugin filename="WorldStats" name="World stats">
+              <ignition-gui>
+              <title>World stats</title>
+              <property type="bool" key="showTitleBar">false</property>
+              <property type="bool" key="resizable">false</property>
+              <property type="double" key="height">110</property>
+              <property type="double" key="width">290</property>
+              <property type="double" key="z">1</property>
+
+              <property type="string" key="state">floating</property>
+              <anchors target="3D View">
+                  <line own="right" target="right"/>
+                  <line own="bottom" target="bottom"/>
+              </anchors>
+              </ignition-gui>
+
+              <sim_time>true</sim_time>
+              <real_time>true</real_time>
+              <real_time_factor>true</real_time_factor>
+              <iterations>true</iterations>
+              <topic>/world/car_world/stats</topic>
+
+          </plugin>
+
+          <!-- Entity tree -->
+          <plugin filename="EntityTree" name="Entity tree">
+          </plugin>
+
+        </gui>
+
+        <light type="directional" name="sun">
+            <cast_shadows>false</cast_shadows>
+            <pose>0 0 10 0 0 0</pose>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+            <specular>0.2 0.2 0.2 1</specular>
+            <attenuation>
+                <range>1000</range>
+                <constant>0.9</constant>
+                <linear>0.01</linear>
+                <quadratic>0.001</quadratic>
+            </attenuation>
+            <direction>-0.5 0.1 -0.9</direction>
+        </light>
+
     <gui fullscreen='0'>
       <camera name='user_camera'>
-        <pose>0.319654 -0.235002 9.29441 0 1.5138 0.009599</pose>
-        <!-- Removed frame attribute -->
+        <pose>2 1 20 0 1.5708 0</pose>
         <view_controller>orbit</view_controller>
         <projection_type>perspective</projection_type>
       </camera>
@@ -350,7 +448,7 @@
               <size>7.025 0.15 2.5</size>
             </box>
           </geometry>
-          <pose>-0.4875 0 1.25 0 -0 0</pose>
+          <pose>-0.4875 0 1.35 0 -0 0</pose>
           <max_contacts>10</max_contacts>
           <surface>
             <contact>
@@ -590,7 +688,7 @@
           <mass>20</mass>
           <pose>0 0 0 0 -0 0</pose>
         </inertial>
-        <pose>-0.393911 0.603019 0 0 -0 0</pose>
+        <pose>-0.393911 0.703019 0 0 -0 0</pose>
         <gravity>1</gravity>
         <self_collide>0</self_collide>
         <kinematic>0</kinematic>
@@ -636,7 +734,7 @@
           <mass>20</mass>
           <pose>0 0 0 0 -0 0</pose>
         </inertial>
-        <pose>-0.400091 -1.22987 0 0 -0 0</pose>
+        <pose>-0.400091 -1.32987 0 0 -0 0</pose>
         <visual name='visual'>
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
