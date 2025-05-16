@@ -4,11 +4,41 @@
   gz_type_name: ignition.msgs.Clock
   direction: GZ_TO_ROS
 
-- ros_topic_name: "/parcel/pose"
-  gz_topic_name: "/model/parcel/pose_static"
-  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+- ros_topic_name: "/parcel0/pose"
+  gz_topic_name: "/model/parcel0/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
+
+- ros_topic_name: "/parcel1/pose"
+  gz_topic_name: "/model/parcel1/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/parcel2/pose"
+  gz_topic_name: "/model/parcel2/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/parcel3/pose"
+  gz_topic_name: "/model/parcel3/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/parcel4/pose"
+  gz_topic_name: "/model/parcel4/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
+  gz_type_name: "ignition.msgs.Pose"
+  direction: GZ_TO_ROS
+
+# - ros_topic_name: "/parcel/pose"
+#   gz_topic_name: "/model/parcel/pose_static"
+#   ros_type_name: "geometry_msgs/msg/PoseStamped"
+#   gz_type_name: "ignition.msgs.Pose"
+#   direction: GZ_TO_ROS
 
 - ros_topic_name: "/turtlebot0/odometry"
   gz_topic_name: "/model/turtlebot0/odometry"
@@ -47,32 +77,32 @@
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/Relaypoint1/pose"
-  gz_topic_name: "/model/Relaypoint1/pose_static" # Corrected topic name
-  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_topic_name: "/model/Relaypoint1/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/Relaypoint2/pose"
-  gz_topic_name: "/model/Relaypoint2/pose_static" # Corrected topic name
-  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_topic_name: "/model/Relaypoint2/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/Relaypoint3/pose"
-  gz_topic_name: "/model/Relaypoint3/pose_static" # Corrected topic name
-  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+  gz_topic_name: "/model/Relaypoint3/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
-- ros_topic_name: "/Relaypoint4/pose" 
-  gz_topic_name: "/model/Relaypoint4/pose_static" # Corrected topic name
-  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+- ros_topic_name: "/Relaypoint4/pose"
+  gz_topic_name: "/model/Relaypoint4/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
-- ros_topic_name: "/Relaypoint5/pose" 
-  gz_topic_name: "/model/Relaypoint5/pose_static" # Corrected topic name
-  ros_type_name: "geometry_msgs/msg/PoseStamped" # Corrected ROS type
+- ros_topic_name: "/Relaypoint5/pose"
+  gz_topic_name: "/model/Relaypoint5/pose_static"
+  ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
@@ -104,4 +134,12 @@
   gz_topic_name: "/model/turtlebot4/cmd_vel"
   ros_type_name: "geometry_msgs/msg/Twist"
   gz_type_name: "ignition.msgs.Twist"
+  direction: ROS_TO_GZ
+
+# Service bridge for spawning entities
+services:
+- ros_service_name: "/spawn_entity"
+  gz_service_name: "/spawn_entity"
+  ros_type_name: "ros_gz_interfaces/srv/SpawnEntity"
+  gz_type_name: "ignition.msgs.EntityFactory"
   direction: ROS_TO_GZ

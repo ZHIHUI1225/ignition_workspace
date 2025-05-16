@@ -11,8 +11,10 @@ import math
 def generate_launch_description():
     ld = LaunchDescription()
     goals = []
+    
+    
     # Create multiple controllers in different namespaces
-    for i in range(5):
+    for i in range(2):
         with open(f'/root/workspace/data/tb{i}_DiscreteTrajectory.json', 'r') as f:
             data = json.load(f)
         trajectory_data = data["Trajectory"]
@@ -33,11 +35,27 @@ def generate_launch_description():
                 ],
                 remappings=[
                 (f'/{namespace}/pushing/robot_pose', f'/turtlebot{i}/odom_map'),
-                (f'/{namespace}/pushing/object_pose', f'/parcel/pose'),
                 (f'/{namespace}/pushing/cmd_vel', f'/turtlebot{i}/cmd_vel'),
                 ]
             )
         ld.add_action(controller_node)  # Ensure this is added only once
+        pickup_node = Node(
+            package='turtlebot3_gazebo',
+            executable='PickUp_controller.py',
+            name=f'pickup_controller_{i}',
+            namespace=namespace,
+            output='screen',
+            parameters=[
+                {'use_sim_time': True},  # Ensure use_sim_time is passed
+                {'namespace': namespace}  # Pass namespace as parameter
+            ],
+            remappings=[
+                (f'/{namespace}/pickup/robot_pose', f'/turtlebot{i}/odom_map'),
+                (f'/{namespace}/pickup/cmd_vel', f'/turtlebot{i}/cmd_vel'),
+                ]
+        )
+        ld.add_action(pickup_node)  # Ensure this is added only once
+        ####
         nub_relay=i+1
         namespace_r= f"tb{nub_relay}"
         if i==0:
@@ -45,6 +63,20 @@ def generate_launch_description():
         else:
             last_num=int(i-1)
         namespace_last= f"tb{last_num}"
+        # Add parcel index publisher node
+        parcel_index_node = Node(
+            package='turtlebot3_gazebo',
+            executable='parcel_index_publisher.py',
+            name=f'parcel_index_publisher_{i}',
+            namespace=namespace,
+            output='screen',
+            parameters=[
+                {'use_sim_time': True},
+                {'namespace': namespace}
+            ]
+        )
+        ld.add_action(parcel_index_node)
+        
         Flag_node=Node(
             package='turtlebot3_gazebo',
             executable='State_switch.py',
@@ -58,7 +90,6 @@ def generate_launch_description():
             remappings=[
                 (f'/{namespace}/Target/pose', f'/Relaypoint{nub_relay}/pose'),
                 (f'/{namespace}/Start/pose', f'/Relaypoint{i}/pose'),
-                (f'/{namespace}/parcel/pose', f'/parcel/pose'),
                 (f'/{namespace}/Robot/pose', f'/turtlebot{i}/odom_map'),
                 (f'/{namespace}/Last/pose', f'/turtlebot{last_num}/odom_map'),
                 (f'/{namespace}/Last_flag', f'/{namespace_last}/Pushing_flag'),

@@ -53,7 +53,7 @@
     <link name="pushing_board">
       <inertial>
         <pose>0.06 0 0.05 0 0.0 0.0</pose>
-        <mass>0.05</mass>
+        <mass>0.1</mass>
           <inertia>
             <ixx>0.0004167</ixx>
             <ixy>0</ixy>

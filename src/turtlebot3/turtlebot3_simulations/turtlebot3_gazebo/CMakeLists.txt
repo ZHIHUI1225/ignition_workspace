@@ -95,13 +95,13 @@ install(PROGRAMS
   scripts/test_debug.py
   scripts/tb_pose_publish.py
   scripts/gazebo_state_test.py
-  DESTINATION lib/${PROJECT_NAME}  # Changed from lib/${PROJECT_NAME}
+  scripts/PickUp_controller.py
+  scripts/ParcelSpawner.py
+  scripts/ParcelManager.py
+  scripts/spawn_listener.py
+  scripts/parcel_index_publisher.py
+  DESTINATION lib/${PROJECT_NAME}
 )
-
-################################################################################
-# Setup for Python modules and scripts
-################################################################################
-# ament_python_install_package(${PROJECT_NAME})
 
 ################################################################################
 # Macro for ament package
