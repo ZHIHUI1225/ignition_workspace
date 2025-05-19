@@ -196,10 +196,16 @@ class PickupController(Node):
             response = future.result()
             if response.success:
                 self.get_logger().info(f'Successfully notified picking finished: {response.message}')
+                # self.picking_finished_service_called_for_current_parcel remains True
+                # It will be reset by parcel_index_callback when the index changes.
             else:
-                self.get_logger().warn(f'Failed to notify picking finished: {response.message}')
+                self.get_logger().warn(f'Failed to notify picking finished: {response.message}. Will retry.')
+                # Reset flag to allow retry for the current parcel
+                self.picking_finished_service_called_for_current_parcel = False
         except Exception as e:
-            self.get_logger().error(f'Service call failed: {str(e)}')
+            self.get_logger().error(f'Service call for picking_finished failed with exception: {str(e)}. Will retry.')
+            # Reset flag to allow retry for the current parcel
+            self.picking_finished_service_called_for_current_parcel = False
         
     def control_loop(self):
         """Main control loop running at fixed frequency"""
@@ -285,13 +291,13 @@ class PickupController(Node):
         else:                # Target reached
             if not self.pickup_complete:
                 self.get_logger().info('Target reached, pickup complete.')
-                self.pickup_complete = True
-                self.pickup_active = False  # Stop MPC/movement
-                self.waiting_for_next = True # Indicate it's ready for the next parcel cycle
-                
+
                 if not self.picking_finished_service_called_for_current_parcel:
                     self.call_picking_finished_service() # Notify central index manager
                     self.picking_finished_service_called_for_current_parcel = True
+                    self.pickup_complete = True
+                    self.pickup_active = False  # Stop MPC/movement
+                    self.waiting_for_next = True # Indicate it's ready for the next parcel cycle
                     self.get_logger().info('picking_finished service called and flagged for current parcel.')
                 else:
                     self.get_logger().warn('picking_finished service already called for this parcel. Skipping.')

@@ -92,8 +92,9 @@ def generate_launch_description():
                 (f'/{namespace}/Start/pose', f'/Relaypoint{i}/pose'),
                 (f'/{namespace}/Robot/pose', f'/turtlebot{i}/odom_map'),
                 (f'/{namespace}/Last/pose', f'/turtlebot{last_num}/odom_map'),
-                (f'/{namespace}/Last_flag', f'/{namespace_last}/Pushing_flag'),
+                (f'/{namespace}/Last_Flag', f'/{namespace_last}/Pushing_Flag'), # Corrected to Pushing_Flag for consistency
                 (f'/{namespace}/cmd_vel', f'/turtlebot{i}/cmd_vel'),
+                 # Removed obsolete remapping: (f'/{namespace}/Pushing_Flag', f'/{namespace}/Pushing_Flag')
                  ]
                  )
         ld.add_action(Flag_node)

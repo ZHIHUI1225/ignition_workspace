@@ -13,7 +13,7 @@ import tf_transformations as tf
 import threading
 from std_msgs.msg import Bool, Int32
 import os
-from std_srvs.srv import Trigger # Add this import
+from std_srvs.srv import Trigger, SetBool # SetBool might be unused now
 
 class MobileRobotMPC:
     def __init__(self):
@@ -140,14 +140,22 @@ class CmdVelPublisher(Node):
             10
         )
         
-        self.pushing_complete_flag = Bool()
-        self.pushing_complete_flag.data = False
-        self.pushing_ready_flag = False # Internal flag, not set by subscriber anymore
+        self.pushing_ready_flag = False 
         self.state_lock = threading.Lock()
         self.publisher_ = self.create_publisher(Twist, 'pushing/cmd_vel', 10)
         self.prediction_publisher = self.create_publisher(Path, 'pushing/pred_path', 10)
         self.ref_publisher = self.create_publisher(Path, 'pushing/ref_path', 10)
-        self.pushing_complete_flag_pub = self.create_publisher(Bool, 'Pushing_flag', 10)
+        self.pushing_complete_flag_pub = self.create_publisher(Bool, 'Pushing_Flag', 10)
+        # Initialize Pushing_Flag to False
+        self.pushing_complete_flag_pub.publish(Bool(data=False))
+
+        # Service client to report pushing status to State_switch
+        self.pushing_finish_client = self.create_client(Trigger, f'/{self.namespace}/pushing_finish') # Renamed client and service
+        if not self.pushing_finish_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(f'Service /{self.namespace}/pushing_finish (Trigger) not available.')
+        else:
+            self.get_logger().info(f'Service /{self.namespace}/pushing_finish (Trigger) available.')
+
         self.robot_pose_sub = self.create_subscription(
             Odometry, 'pushing/robot_pose', self.robot_pose_callback, 10)
         
@@ -186,6 +194,7 @@ class CmdVelPublisher(Node):
         self.backing_away = False
         self.safe_distance_reached = False
         self.prev_picking_flag = False
+        self.trigger_sent_this_cycle = False # Flag to ensure trigger is sent once per cycle
         
         # Timing control
         self.timer = self.create_timer(timer_period, self.control_loop)
@@ -200,11 +209,13 @@ class CmdVelPublisher(Node):
                 self.get_logger().info(f'Follow controller updated parcel index: {old_index} -> {self.current_parcel_index}')
                 # Reset state flags on new parcel
                 self.pushing_ready_flag = False
-                self.pushing_complete_flag.data = False
+                # Removed self.internal_pushing_status logic
                 self.pushing_complete = False
                 self.backing_away = False
                 self.safe_distance_reached = False
                 self.index = 0  # Reset trajectory index
+                self.trigger_sent_this_cycle = False # Reset trigger flag for new parcel
+                self.pushing_complete_flag_pub.publish(Bool(data=False)) # Reset Pushing_Flag for next robot
                 # Update subscription to the correct parcel
                 self.update_parcel_subscription()
     
@@ -264,13 +275,6 @@ class CmdVelPublisher(Node):
         euler = tf.euler_from_quaternion(quat)
         self.parcel_state[2] = euler[2]
 
-    # Remove pushing_ready_flag_callback
-    # def pushing_ready_flag_callback(self, msg):
-    #     """Update pushing ready flag from external system"""
-    #     old_flag = self.pushing_ready_flag
-    #     self.pushing_ready_flag = msg.data
-    #     if old_flag != self.pushing_ready_flag:
-    #         self.get_logger().info(f'Pushing ready flag changed: {old_flag} -> {self.pushing_ready_flag}')
             
     def start_pushing_callback(self, request, response):
         # self.get_logger().info(f'Start pushing service called for {self.namespace}. Current pushing_ready_flag: {self.pushing_ready_flag}')
@@ -280,14 +284,17 @@ class CmdVelPublisher(Node):
             self.pushing_complete = False
             self.backing_away = False
             self.safe_distance_reached = False
+            self.trigger_sent_this_cycle = False # Reset trigger flag
+            # Removed call related to internal_pushing_status
+            self.pushing_complete_flag_pub.publish(Bool(data=False)) # Ensure Pushing_Flag is False at start
             self.index = 0 # Reset trajectory index
             self.get_logger().info('Pushing task enabled.')
             response.success = True
             response.message = 'Pushing started.'
         else:
-            # self.get_logger().info('Already in pushing ready state.')
-            response.success = True # Still success, just noting it's already ready
-            response.message = 'Already in pushing ready state.'
+            self.get_logger().warn('Pushing task already enabled or in progress.') # Added warning for else case
+            response.success = False
+            response.message = 'Pushing already enabled.'
         return response
 
     def robot_pose_callback(self, msg):
@@ -309,12 +316,42 @@ class CmdVelPublisher(Node):
             self.current_state[3] = msg.twist.twist.linear.x   # Linear velocity
             self.current_state[4] = msg.twist.twist.angular.z  # Angular velocity
 
+    def call_pushing_finish_service(self): # Renamed method
+        if not self.pushing_finish_client.service_is_ready():
+            self.get_logger().warn(f'Service /{self.namespace}/pushing_finish not ready, cannot report completion.')
+            return
+
+        if self.trigger_sent_this_cycle:
+            self.get_logger().info(f'Pushing completion for /{self.namespace}/pushing_finish already triggered this cycle.')
+            return
+
+        request = Trigger.Request()
+        self.get_logger().info(f"Calling /{self.namespace}/pushing_finish (Trigger) service to report completion.")
+        future = self.pushing_finish_client.call_async(request)
+        future.add_done_callback(self.pushing_finish_response_callback) # Renamed callback
+
+    def pushing_finish_response_callback(self, future): # Renamed method
+        self.trigger_sent_this_cycle = True 
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'Successfully reported pushing completion via /{self.namespace}/pushing_finish (Trigger): {response.message}')
+            else:
+                self.get_logger().warn(f'Failed to report pushing completion via /{self.namespace}/pushing_finish (Trigger): {response.message}')
+        except Exception as e:
+            self.get_logger().error(f'Service call to /{self.namespace}/pushing_finish failed: {str(e)}')
 
     def control_loop(self):
         # print(f'Control loop called with index: {self.index}, pushing_ready_flag: {self.pushing_ready_flag}', flush=True)
-        if self.pushing_ready_flag is False:
-            self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
+        if not self.pushing_ready_flag:
+            # No service call or status change needed here if not ready.
+            # Pushing_Flag is managed by start_pushing or parcel_index callbacks.
             return
+        
+        if self.goal is None or self.parcel_state is None:
+            self.get_logger().warn("Goal or parcel state not yet available.")
+            return
+
         try:
             # 1. Update reference trajectory
             distance_error = np.sqrt((self.current_state[0]-self.goal[0])**2+(self.current_state[1]-self.goal[1])**2)
@@ -324,12 +361,10 @@ class CmdVelPublisher(Node):
             # Check if parcel reached the goal position and start backing away immediately
             if object_distance <= 0.06 and not self.pushing_complete:
                 self.get_logger().info(f'Parcel{self.current_parcel_index} reached goal. Distance to goal: {object_distance:.2f}m')
-                # # Update the subscription to track the next parcel
-                # self.update_parcel_subscription()
                 self.pushing_complete = True
                 self.backing_away = True
-                self.pushing_complete_flag.data = True
-                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
+                self.pushing_complete_flag_pub.publish(Bool(data=self.pushing_complete))  # Corrected: Publish Bool message, data is True
+                # Removed internal_pushing_status logic and premature service call
                 
                 # Start backing away immediately without waiting for next loop iteration
                 cmd_msg = Twist()
@@ -343,15 +378,16 @@ class CmdVelPublisher(Node):
             
             if self.backing_away:
                 # Continue backing away from the parcel to a safe distance
-                distance = np.sqrt((self.current_state[0]-self.goal[0])**2 + (self.current_state[1]-self.goal[1])**2)
+                distance_from_goal = np.sqrt((self.current_state[0]-self.goal[0])**2 + (self.current_state[1]-self.goal[1])**2)
                 cmd_msg = Twist()
-                self.pushing_complete_flag.data = True
-                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
-                if distance < 0.35:  # Still need to back up more
+                # Pushing status is still true during backing away
+
+                if distance_from_goal < 0.35:  # Still need to back up more
                     cmd_msg.linear.x = -0.05
                     cmd_msg.angular.z = 0.0
                     self.publisher_.publish(cmd_msg)
-                    self.get_logger().info(f'Backing to safe distance: current={distance:.2f}m, target=0.35m')
+                    self.pushing_complete_flag_pub.publish(Bool(data=self.pushing_complete)) 
+                    self.get_logger().info(f'Backing to safe distance: current={distance_from_goal:.2f}m, target=0.35m')
                     
                 else:
                     # Safe distance reached, stop backing
@@ -360,20 +396,24 @@ class CmdVelPublisher(Node):
                     cmd_msg.linear.x = 0.0
                     cmd_msg.angular.z = 0.0
                     self.publisher_.publish(cmd_msg)
-                    self.get_logger().info('Safe distance reached. Ready for pickup task.')
+                    self.get_logger().info('Safe distance reached. Pushing phase concluded.')
+                    
+                    # Report completion to own State_switch
+                    self.call_pushing_finish_service() # Corrected: No arguments, and renamed method
+                    # Signal this robot's pushing phase for this parcel is over
+                    self.pushing_complete_flag_pub.publish(Bool(data=True)) 
+                    
                     # Reset flags for next cycle
-                    self.pushing_ready_flag = False
-                    self.pushing_complete = False
-                    # self.backing_away = False # Already set
-                    # self.safe_distance_reached = False # Will be reset by service call
+                    self.pushing_ready_flag = False #
                     self.index = 0 # Reset trajectory index
-                return
+                return # Exit control loop iteration as backing away is handled
             
             # Normal path following with MPC
-            if self.index < len(self.data) and not self.pushing_complete_flag.data and not self.backing_away:  
-                # Not in pushing mode and still have trajectory points to follow  
-                self.pushing_complete_flag.data = False
-                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
+            # This part should only run if not pushing_complete (i.e. not backing_away and not safe_distance_reached from this push cycle)
+            if not self.pushing_complete and self.index < len(self.data):  
+                # Ensure status is false if we are in normal path following before pushing starts
+                # Removed internal_pushing_status logic and service call
+
                 # print(f'index: {self.index}, distance_error: {distance_error:.2f}')
                 ref_array = np.zeros((5, self.P_HOR+1))  # N+1 points for reference trajectory
                 self.ref_traj.poses = []  # Clear existing poses
@@ -445,7 +485,6 @@ class CmdVelPublisher(Node):
                     self.get_logger().error(f'Control error: {str(e)}')
             
             elif self.safe_distance_reached:
-                self.pushing_complete_flag_pub.publish(self.pushing_complete_flag)
                 cmd_msg = Twist()
                 cmd_msg.linear.x = 0.0
                 cmd_msg.angular.z = 0.0
