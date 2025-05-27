@@ -11,11 +11,12 @@ import math
 def generate_launch_description():
     ld = LaunchDescription()
     goals = []
-    
-    
+    case='simple_maze'
+    file_path='/root/workspace/data/'+case+'/'
+    N=3
     # Create multiple controllers in different namespaces
-    for i in range(3):
-        with open(f'/root/workspace/data/tb{i}_DiscreteTrajectory.json', 'r') as f:
+    for i in range(N):
+        with open(file_path+f'tb{i}_Trajectory.json', 'r') as f:
             data = json.load(f)
         trajectory_data = data["Trajectory"]
         goal = trajectory_data[-1]
@@ -31,7 +32,9 @@ def generate_launch_description():
                 output='screen',
                 parameters=[
                     {'use_sim_time': True},  # Ensure use_sim_time is passed
-                    {'namespace': namespace}  # Pass namespace as parameter
+                    {'namespace': namespace}, # Pass namespace as parameter
+                    {'case': case},
+                    {'num_robots': N}
                 ],
                 remappings=[
                 (f'/{namespace}/pushing/robot_pose', f'/turtlebot{i}/odom_map'),
@@ -47,7 +50,9 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'use_sim_time': True},  # Ensure use_sim_time is passed
-                {'namespace': namespace}  # Pass namespace as parameter
+                {'namespace': namespace} , # Pass namespace as parameter
+                {'case': case},
+                {'num_robots': N}
             ],
             remappings=[
                 (f'/{namespace}/pickup/robot_pose', f'/turtlebot{i}/odom_map'),

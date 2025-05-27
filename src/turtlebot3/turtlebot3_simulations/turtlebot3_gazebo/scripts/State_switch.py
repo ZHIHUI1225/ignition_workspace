@@ -17,15 +17,15 @@ from nav_msgs.msg import Path, Odometry
 class MobileRobotMPC:
     def __init__(self):
         # MPC parameters
-        self.N = 5          # Prediction horizon
+        self.N = 10         # Extended prediction horizon for smoother approach
         self.dt = 0.1        # Time step
-        self.wx = 1.0        # Position error weight
-        self.wtheta =0.5    # Orientation error weight
-        self.wu = 0.1        # Control effort weight
+        self.wx = 2.0        # Increased position error weight for better position convergence
+        self.wtheta = 1.5    # Increased orientation error weight for better alignment
+        self.wu = 0.08       # Slightly reduced control effort weight for more responsive control
         
-        # Control constraints
-        self.v_max = 0.05     # m/s
-        self.w_max = 1.0     # rad/s
+        # Control constraints - further reduced max velocity for even slower approach
+        self.v_max = 0.02     # m/s (reduced from 0.025)
+        self.w_max = 0.6      # rad/s (reduced from 0.8)
         
         # State and control dimensions
         self.nx = 3          # [x, y, theta]
@@ -49,15 +49,43 @@ class MobileRobotMPC:
         # Cost function
         cost = 0
         for k in range(self.N):
-            # Tracking cost
-            cost += self.wx * ca.sumsqr(self.X[:2, k] - self.x_ref[:2])
-            cost += self.wtheta * (self.X[2, k] - self.x_ref[2])**2
-            # Control effort cost
+            # Tracking cost with increasing weights as we approach the end
+            # Stronger progression factor for more aggressive convergence
+            progress_factor = 1.0 + 2.0 * (k + 1) / self.N  # Increases from 1.0 to 3.0
+            
+            # Position cost - higher weight for xy position tracking
+            pos_error = self.X[:2, k] - self.x_ref[:2]
+            cost += progress_factor * self.wx * ca.sumsqr(pos_error)
+            
+            # Orientation cost with angle normalization to handle wraparound
+            theta_error = self.X[2, k] - self.x_ref[2]
+            # Normalize angle difference to [-pi, pi]
+            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi
+            cost += progress_factor * self.wtheta * theta_error**2
+            
+            # Special emphasis on final portion of trajectory
+            if k >= self.N - 5:  # Last 5 steps
+                # Extra emphasis on final approach
+                cost += 1.5 * self.wx * ca.sumsqr(pos_error)
+                cost += 2.0 * self.wtheta * theta_error**2
+            
+            # Control effort cost with smoother transitions
+            if k > 0:
+                # Penalize control changes for smoother motion
+                control_change = self.U[:, k] - self.U[:, k-1]
+                cost += 0.1 * ca.sumsqr(control_change)
+            
+            # Base control effort penalty
             cost += self.wu * ca.sumsqr(self.U[:, k])
         
-        # Terminal cost
-        cost += 5* self.wx * ca.sumsqr(self.X[:2, self.N] - self.x_ref[:2])
-        cost += 5* self.wtheta * (self.X[2, self.N] - self.x_ref[2])**2
+        # Terminal cost - much stronger to ensure convergence at endpoint
+        terminal_pos_error = self.X[:2, self.N] - self.x_ref[:2]
+        cost += 10.0 * self.wx * ca.sumsqr(terminal_pos_error)
+        
+        # Terminal orientation with normalization for angle wraparound
+        terminal_theta_error = self.X[2, self.N] - self.x_ref[2]
+        terminal_theta_error = ca.fmod(terminal_theta_error + ca.pi, 2*ca.pi) - ca.pi
+        cost += 30.0 * self.wtheta * terminal_theta_error**2
         self.opti.minimize(cost)
         # Dynamics constraints
         for k in range(self.N):
@@ -71,8 +99,28 @@ class MobileRobotMPC:
         self.opti.subject_to(self.opti.bounded(-self.v_max, self.U[0, :], self.v_max))
         self.opti.subject_to(self.opti.bounded(-self.w_max, self.U[1, :], self.w_max))
         
-        # Solver settings
-        opts = {'ipopt.print_level': 0, 'print_time': 0}
+        # Strict terminal constraints to ensure convergence and smooth stopping
+        # Terminal velocity constraints - must approach zero at the end
+        self.opti.subject_to(self.U[0, -1] <= 0.0005)  # Final linear velocity virtually zero
+        self.opti.subject_to(self.U[0, -1] >= 0.0)     # No negative velocity at end
+        self.opti.subject_to(self.U[1, -1] <= 0.0005)  # Final angular velocity virtually zero
+        self.opti.subject_to(self.U[1, -1] >= -0.0005) # Final angular velocity virtually zero
+        
+        # Smooth deceleration in last few steps
+        for k in range(self.N-3, self.N):
+            # Progressive velocity reduction for final steps
+            max_vel_factor = (self.N - k) / 4.0  # Ranges from 0.75 to 0.25
+            self.opti.subject_to(self.U[0, k] <= self.v_max * max_vel_factor)
+        
+        # Solver settings with improved convergence parameters
+        opts = {
+            'ipopt.print_level': 0, 
+            'print_time': 0,
+            'ipopt.tol': 1e-5,           # Even tighter tolerance
+            'ipopt.acceptable_tol': 1e-4, # More precise solution
+            'ipopt.max_iter': 200,       # More iterations allowed
+            'ipopt.warm_start_init_point': 'yes' # Use warm starting for stability
+        }
         self.opti.solver('ipopt', opts)
         
     def robot_model(self, x, u):
@@ -85,6 +133,22 @@ class MobileRobotMPC:
         return dx
         
     def update_control(self, current_state, target_state):
+        # Check how close we are to the target
+        dist_to_target = np.sqrt((current_state[0] - target_state[0])**2 + 
+                                (current_state[1] - target_state[1])**2)
+        
+        # Check orientation alignment
+        angle_diff = abs((current_state[2] - target_state[2] + np.pi) % (2 * np.pi) - np.pi)
+        
+        # If we're very close to the target and well-aligned, stop completely
+        if dist_to_target < 0.015 and angle_diff < 0.05:  # 1.5cm and ~3 degrees
+            return np.array([0.0, 0.0])  # Stop completely
+            
+        # If we're close but not perfectly aligned, prioritize orientation
+        elif dist_to_target < 0.03 and angle_diff > 0.05:
+            # Just rotate to align with target, very slowly
+            return np.array([0.0, 0.1 * np.sign(target_state[2] - current_state[2])])
+        
         # Set initial state and reference
         self.opti.set_value(self.x0, current_state)
         self.opti.set_value(self.x_ref, target_state)
@@ -95,7 +159,8 @@ class MobileRobotMPC:
             x_opt = sol.value(self.X)
             u_opt = sol.value(self.U)
             return u_opt[:, 0]  # Return first control input
-        except:
+        except Exception as e:
+            print(f"Optimization failed: {e}")
             return None
         
 class ProximityChecker(Node):
@@ -115,7 +180,7 @@ class ProximityChecker(Node):
         
         # Each robot has its own parcel index, starting from 0
         self.current_parcel_index = 0
-        
+        self.approaching_target = False
         # Subscribers
         self.parcel_pose = None
         self.target = None #the relay point i+1
@@ -127,11 +192,6 @@ class ProximityChecker(Node):
             'Last_Flag',  # Corrected case to match launch file remapping
             self.last_flag_callback,
             10)
-        # self.pushing_flag_sub=self.create_subscription(
-        #     Bool,
-        #     'Pushing_flag',
-        #     self.pushing_flag_callback,
-        #     10) # Removed subscriber
             
         
         # Dynamic parcel topic subscription based on the current index
@@ -238,7 +298,7 @@ class ProximityChecker(Node):
     def last_flag_callback(self,msg):
         with self.lock:
             self.last_flag = msg.data
-            self.get_logger().info(f'Last flag: {self.last_flag}')
+            # self.get_logger().info(f'Last flag: {self.last_flag}')
             # if self.namespace_number == 0:
             #     self.last_flag = True
 
@@ -351,16 +411,19 @@ class ProximityChecker(Node):
                 target_pos = np.array([self.target_state[0], self.target_state[1]])
                 current_pos = np.array([self.robot.pose.position.x, self.robot.pose.position.y])
                 distance_to_target = np.linalg.norm(target_pos - current_pos)
+                distance_parcel_start= self.calculate_distance(self.parcel_pose, self.start)
+                robot_start= distance_parcel_start <0.3
             else:
                 distance_to_target = float('inf')
             if self.namespace_number == 0:
                 last_robot_away = True
                 self.last_flag = True
+                # self.approaching_target = True
 
             
-            if self.last_flag is True and last_robot_away and not self.pushing_ready_flag and not self.pushing_complete:
+            if self.last_flag is True and last_robot_away and not self.pushing_ready_flag and not self.pushing_complete and robot_start:
                 # Condition 1: Parcel is in relay point range and last robot isn't
-                if dis_robot_parcel > 0.2:  # Robot needs to approach
+                if dis_robot_parcel > 0.25:  # Robot needs to approach
                     print(f"parcel_index: {self.current_parcel_index}, parcel_y: {self.parcel_pose.position.y}, robot_y: {self.robot.pose.position.y}, dist: {dis_robot_parcel}m") # Corrected parcel_pose access
                     self.approaching_target = True
                     # Compute control commands using MPC
@@ -417,11 +480,18 @@ class ProximityChecker(Node):
                 self.pushing_complete = True  
                 
             # After a suitable delay, enable pickup
-            if dis_robot_parcel > 0.2 and self.pushing_complete and not self.picking_ready_flag and not hasattr(self, 'pickup_active_service'):  
+            if self.pushing_complete and not self.picking_ready_flag and not hasattr(self, 'pickup_active_service'):  
                 self.get_logger().info('Robot at safe distance, activating pickup controller')
                 self.picking_ready_flag = True
-                self.pickup_active_service = True  
-                self.call_start_picking_service()
+                self.pickup_active_service = True
+                
+                # Add a small delay before calling pickup service to ensure all flags are properly set
+                self.create_timer(0.5, self.delayed_call_start_picking_service, oneshot=True)
+    
+    def delayed_call_start_picking_service(self):
+        """Call the start_picking service after a short delay to ensure state synchronization"""
+        self.get_logger().info('Calling pickup service after delay to ensure proper state transition')
+        self.call_start_picking_service()
 
 
     def call_start_pushing_service(self):
