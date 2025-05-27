@@ -20,9 +20,14 @@ class SpawnListener(Node):
             self.service_callback  # New service callback method
         )
         self.counter = 0
-         # Load trajectory data
-        json_file_path = '/root/workspace/data/Trajectory_simulation.json'
         
+        # Declare and get parameters
+        self.declare_parameter('json_file_path', '')  # Declare the parameter with a default empty string
+        json_file_path = self.get_parameter('json_file_path').get_parameter_value().string_value
+        
+        self.get_logger().info(f'Using JSON file path: {json_file_path}')
+        
+        # Load trajectory data
         with open(json_file_path, 'r') as json_file:
             data = json.load(json_file)
             relay_points = data['RelayPoints']

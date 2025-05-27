@@ -5,31 +5,31 @@
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/parcel0/pose"
-  gz_topic_name: "/model/parcel0/pose_static"
+  gz_topic_name: "/model/parcel0/pose"
   ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/parcel1/pose"
-  gz_topic_name: "/model/parcel1/pose_static"
+  gz_topic_name: "/model/parcel1/pose"
   ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/parcel2/pose"
-  gz_topic_name: "/model/parcel2/pose_static"
+  gz_topic_name: "/model/parcel2/pose"
   ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/parcel3/pose"
-  gz_topic_name: "/model/parcel3/pose_static"
+  gz_topic_name: "/model/parcel3/pose"
   ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/parcel4/pose"
-  gz_topic_name: "/model/parcel4/pose_static"
+  gz_topic_name: "/model/parcel4/pose"
   ros_type_name: "geometry_msgs/msg/PoseStamped"
   gz_type_name: "ignition.msgs.Pose"
   direction: GZ_TO_ROS

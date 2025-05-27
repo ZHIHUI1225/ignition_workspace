@@ -21,7 +21,12 @@ class PickupController(Node):
         
         # Declare parameters
         self.declare_parameter('namespace', 'tb0')
+        self.declare_parameter('case', 'simple_maze')  # Add case parameter
+        self.declare_parameter('num_robots', 3)        # Add N parameter (num_robots)
+        
         self.namespace = self.get_parameter('namespace').get_parameter_value().string_value
+        self.case = self.get_parameter('case').get_parameter_value().string_value
+        self.num_robots = self.get_parameter('num_robots').get_parameter_value().integer_value
         
         # Initialize flags
         self.pickup_complete_flag = Bool()  # Flag to indicate pickup operation completed
@@ -73,14 +78,17 @@ class PickupController(Node):
         self.pickup_complete = False
         self.waiting_for_next = False
         
-        json_file_path = f'/root/workspace/data/{self.namespace}_DiscreteTrajectory.json'
+        json_file_path = f'/root/workspace/data/{self.case}/{self.namespace}_Trajectory.json'
 
         with open(json_file_path, 'r') as json_file:
             self.data = json.load(json_file)['Trajectory']
-            self.trajectory_data=self.data[::-1][::2]
+            if self.namespace == 'tb0':
+                self.trajectory_data = self.data[::-1]
+            else:
+                self.trajectory_data=self.data[::-1][::2]
         self.goal=self.data[0]
         if self.namespace == 'tb0':
-            waypoint_file_path = '/root/workspace/data/Trajectory_simulation.json'
+            waypoint_file_path = f'/root/workspace/data/{self.case}/Waypoints.json'
             with open(waypoint_file_path, 'r') as waypoint_file:
                 data = json.load(waypoint_file)
                 relay_points = data['RelayPoints']
@@ -355,13 +363,13 @@ class MobileRobotMPC:
         # MPC parameters
         self.N = 10           # Prediction horizon
         self.dt = 0.1         # Time step
-        self.Q = np.diag([10, 10, 2])  # State weights (x, y, theta, v, omega)
+        self.Q = np.diag([10, 10, 1])  # State weights (x, y, theta, v, omega)
         self.R = np.diag([0.1, 0.1])        # Control input weights
         self.F = np.diag([20, 20, 10]) # Terminal cost weights
         
         # Velocity constraints
-        self.max_vel = 0.1     # m/s
-        self.min_vel = -0.1    # m/s 
+        self.max_vel = 0.15     # m/s
+        self.min_vel = 0.0    # m/s 
         self.max_omega = np.pi/4 # rad/s
         self.min_omega = -np.pi/4 # rad/s
         
