@@ -484,14 +484,7 @@ class ProximityChecker(Node):
                 self.get_logger().info('Robot at safe distance, activating pickup controller')
                 self.picking_ready_flag = True
                 self.pickup_active_service = True
-                
-                # Add a small delay before calling pickup service to ensure all flags are properly set
-                self.create_timer(0.5, self.delayed_call_start_picking_service, oneshot=True)
-    
-    def delayed_call_start_picking_service(self):
-        """Call the start_picking service after a short delay to ensure state synchronization"""
-        self.get_logger().info('Calling pickup service after delay to ensure proper state transition')
-        self.call_start_picking_service()
+                self.call_start_picking_service()
 
 
     def call_start_pushing_service(self):

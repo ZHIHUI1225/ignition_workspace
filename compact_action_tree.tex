@@ -24,52 +24,56 @@
   state/.style={draw, ellipse, fill=green!10, align=center, font=\scriptsize}
 ]
 
-% Root node and first level - more vertical structure
+% Root node and first level
 \node[state] {Robot Control}
   child {
     node[state] {State\_switch}
     child {
-      node[decision, text width=15mm] {Proximity Check}
+      node {Check\\Proximity}
       child {
-        node[text width=12mm] {Approach Target}
-        edge from parent node[left, font=\tiny] {Far}
-      }
-      child {
-        node[text width=12mm] {Start Push}
-        edge from parent node[right, font=\tiny] {Near}
+        node[decision] {Parcel\\Ready?}
+        child {
+          node {Approach\\Target}
+          edge from parent node[left, font=\tiny] {No}
+        }
+        child {
+          node {Start\\Pushing}
+          edge from parent node[right, font=\tiny] {Yes}
+        }
+        edge from parent
       }
       edge from parent
     }
     child {
-      node[decision, text width=15mm] {Push Complete?}
+      node[decision] {Pushing\\Complete?}
       child {
-        node[text width=12mm] {Wait}
-        edge from parent node[left, font=\tiny] {No}
+        node {Start\\Pickup}
+        edge from parent node[right, font=\tiny] {Yes}
       }
       child {
-        node[text width=12mm] {Start Pickup}
-        edge from parent node[right, font=\tiny] {Yes}
+        node {Wait}
+        edge from parent node[left, font=\tiny] {No}
       }
       edge from parent
     }
     edge from parent
   }
   child {
-    node[state] {Follow\_controller} 
+    node[state] {Follow\_controller}
     child {
-      node[decision, text width=15mm] {Push Ready?}
+      node[decision] {Pushing\\Ready?}
       child {
-        node[text width=12mm] {No Action}
+        node {No Action}
         edge from parent node[left, font=\tiny] {No}
       }
       child {
-        node[decision, text width=15mm] {Goal Reached?}
+        node[decision] {Goal\\Reached?}
         child {
-          node[text width=12mm] {MPC Path Follow}
+          node {Follow\\Trajectory\\(MPC)}
           edge from parent node[left, font=\tiny] {No}
         }
         child {
-          node[text width=12mm] {Back Away}
+          node {Back Away\\Signal\\Complete}
           edge from parent node[right, font=\tiny] {Yes}
         }
         edge from parent node[right, font=\tiny] {Yes}
@@ -81,23 +85,23 @@
   child {
     node[state] {PickUp\_controller}
     child {
-      node[decision, text width=15mm] {Pickup Ready?}
+      node[decision] {Pickup\\Ready?}
       child {
-        node[text width=12mm] {No Action}
+        node {No Action}
         edge from parent node[left, font=\tiny] {No}
       }
       child {
-        node[decision, text width=15mm] {Dist > Thresh?}
+        node[decision] {Distance >\\Threshold?}
         child {
-          node[text width=12mm] {MPC Path Follow}
+          node {Follow\\Path\\(MPC)}
           edge from parent node[left, font=\tiny] {Yes}
         }
         child {
-          node[text width=12mm] {Stop \& Signal}
+          node {Stop\\Signal\\Complete}
           child {
-            node[decision, text width=10mm] {Is TB0?}
+            node[decision] {Is TB0?}
             child {
-              node[text width=12mm] {Spawn Parcel}
+              node {Spawn\\New Parcel}
               edge from parent node[right, font=\tiny] {Yes}
             }
             edge from parent

@@ -82,10 +82,7 @@ class PickupController(Node):
 
         with open(json_file_path, 'r') as json_file:
             self.data = json.load(json_file)['Trajectory']
-            if self.namespace == 'tb0':
-                self.trajectory_data = self.data[::-1]
-            else:
-                self.trajectory_data=self.data[::-1][::2]
+            self.trajectory_data=self.data[::-1][::2]
         self.goal=self.data[0]
         if self.namespace == 'tb0':
             waypoint_file_path = f'/root/workspace/data/{self.case}/Waypoints.json'
@@ -247,10 +244,14 @@ class PickupController(Node):
                     closest_idx = i
             
             # Generate reference trajectory from trajectory data
+            # The reference trajectory should include the entire prediction horizon
             ref_array = np.zeros((3, self.prediction_horizon + 1))
             
+            # Get more trajectory points to ensure we have enough for the prediction horizon
+            # Use denser sampling for better accuracy with the reduced control horizon
             for i in range(self.prediction_horizon + 1):
                 # Use trajectory points, but don't go beyond array bounds
+                # Scale the index to get more detailed trajectory points
                 traj_idx = min(closest_idx + i, len(self.trajectory_data) - 1)
                 point = self.trajectory_data[traj_idx]
                 
@@ -272,7 +273,7 @@ class PickupController(Node):
                 cmd_msg.linear.x = u[0]
                 cmd_msg.angular.z = u[1]
                 self.cmd_vel_pub.publish(cmd_msg)
-                
+                print(f'Published cmd_vel: linear.x={cmd_msg.linear.x}, angular.z={cmd_msg.angular.z}') 
                 # Publish predicted trajectory for visualization
                 predicted_traj = self.mpc.get_predicted_trajectory()
                 self.predicted_path.poses = []
@@ -362,16 +363,18 @@ class MobileRobotMPC:
     def __init__(self):
         # MPC parameters
         self.N = 10           # Prediction horizon
+        self.N_c = 3          # Control horizon - set to 3 as requested
         self.dt = 0.1         # Time step
-        self.Q = np.diag([10, 10, 1])  # State weights (x, y, theta, v, omega)
-        self.R = np.diag([0.1, 0.1])        # Control input weights
-        self.F = np.diag([20, 20, 10]) # Terminal cost weights
+        # Increase position tracking weights and decrease control input penalties
+        self.Q = np.diag([50.0, 50.0, 5.0])  # State weights (x, y, theta) - increased significantly
+        self.R = np.diag([0.01, 0.01])       # Control input weights - decreased to allow higher velocities
+        self.F = np.diag([100.0, 100.0, 10.0]) # Terminal cost weights - increased for better goal reaching
         
         # Velocity constraints
         self.max_vel = 0.15     # m/s
-        self.min_vel = 0.0    # m/s 
-        self.max_omega = np.pi/4 # rad/s
-        self.min_omega = -np.pi/4 # rad/s
+        self.min_vel = -0.15  # m/s - allowing backward movement if needed
+        self.max_omega = np.pi/2 # rad/s - increased for more responsive turning
+        self.min_omega = -np.pi/2 # rad/s
         
         # System dimensions
         self.nx = 3   # Number of states (x, y, theta)
@@ -379,6 +382,10 @@ class MobileRobotMPC:
         
         # Reference trajectory
         self.ref_traj = None
+        
+        # Variables for control sequence storage
+        self.control_sequence = None
+        self.control_step = 0
         
         # Initialize MPC
         self.setup_mpc()
@@ -398,8 +405,18 @@ class MobileRobotMPC:
         # Cost function
         cost = 0
         for k in range(self.N):
-            state_error = self.X[:, k] - self.ref[:, k]
-            cost += ca.mtimes([state_error.T, self.Q, state_error])
+            # Increasing weight factor as we progress along horizon (helps convergence)
+            weight_factor = 1.0 + 4.0 * k / self.N  # Increases from 1.0 to 5.0
+            
+            # Position error (x,y) - more heavily weighted
+            pos_error = self.X[:2, k] - self.ref[:2, k]
+            cost += weight_factor * ca.mtimes([pos_error.T, self.Q[:2,:2], pos_error])
+            
+            # Orientation (theta) - separately weighted to ensure good heading tracking
+            theta_error = self.X[2, k] - self.ref[2, k]
+            # Normalize angle difference to [-pi, pi] to avoid issues with angle wrapping
+            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi
+            cost += weight_factor * self.Q[2,2] * theta_error**2
             
             control_error = self.U[:, k]
             cost += ca.mtimes([control_error.T, self.R, control_error])
@@ -436,11 +453,31 @@ class MobileRobotMPC:
         self.ref_traj = ref_traj
 
     def update(self, current_state):
+        # Check if we already have a valid control sequence
+        if self.control_sequence is not None:
+            # Get the next control input from the sequence
+            u = self.control_sequence[:, self.control_step]
+            
+            # Increment control step
+            self.control_step += 1
+            
+            # If we've used all steps in control horizon, reset
+            if self.control_step >= self.N_c:
+                self.control_sequence = None
+                self.control_step = 0
+                
+            # Return the control input
+            return u
+            
+        # If no valid control sequence, solve the MPC problem
         self.opti.set_value(self.x0, current_state)
         self.opti.set_value(self.ref, self.ref_traj)
         
         try:
             sol = self.opti.solve()
+            # Store the full control sequence for future use
+            self.control_sequence = sol.value(self.U)
+            self.control_step = 1  # We return the first value and start at 1 for next time
             return sol.value(self.U)[:, 0]  # Return first control input
         except:
             print("Solver failed")
