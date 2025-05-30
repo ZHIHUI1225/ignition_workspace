@@ -53,14 +53,17 @@
     <link name="pushing_board">
       <inertial>
         <pose>0.06 0 0.05 0 0.0 0.0</pose>
-        <mass>0.1</mass>
-          <inertia>
-            <ixx>0.0004167</ixx>
+        <mass>0.1</mass>          <inertia>
+            <!-- For rectangular box 0.02 x 0.2 x 0.1 with mass 0.1 kg -->
+            <!-- Ixx = (1/12) * m * (b² + c²) = (1/12) * 0.1 * (0.2² + 0.1²) = 0.000417 -->
+            <!-- Iyy = (1/12) * m * (a² + c²) = (1/12) * 0.1 * (0.02² + 0.1²) = 0.0000867 -->  
+            <!-- Izz = (1/12) * m * (a² + b²) = (1/12) * 0.1 * (0.02² + 0.2²) = 0.000337 -->
+            <ixx>0.000417</ixx>
             <ixy>0</ixy>
             <iyy>0.0000867</iyy>
             <ixz>0</ixz>
             <iyz>0</iyz>
-            <izz>0.0003367</izz>
+            <izz>0.000337</izz>
           </inertia>
       </inertial>
       <collision name="pushing collision">

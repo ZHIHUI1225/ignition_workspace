@@ -13,106 +13,306 @@ import py_trees_ros.visitors
 import py_trees.display
 from py_trees_ros_interfaces.srv import OpenSnapshotStream, CloseSnapshotStream
 
-
-class ResetFlags(py_trees.behaviour.Behaviour):
-    def __init__(self, name):
-        super().__init__(name)
-    def update(self):
-        print(f"[{self.name}] Resetting flags...")
-        return py_trees.common.Status.SUCCESS
-
-class WaitAction(py_trees.behaviour.Behaviour):
-    """等待动作节点（网页3示例改进版）"""
-    def __init__(self, name, duration):
-        super().__init__(name)
-        self.duration = duration
-        self.start_time = 0
-    
-    def initialise(self):
-        self.start_time = time.time()
-        self.feedback_message = f"Waiting for {self.duration}s"
-        print(f"[{self.name}] Starting wait for {self.duration}s...")
-    
-    def update(self) -> py_trees.common.Status:  # 添加类型注解（网页8建议）
-        elapsed = time.time() - self.start_time
-        if elapsed >= self.duration:
-            print(f"[{self.name}] Wait completed!")
-            return py_trees.common.Status.SUCCESS
-        else:
-            print(f"[{self.name}] Waiting... {elapsed:.1f}/{self.duration}s")
-            return py_trees.common.Status.RUNNING
+# Import all behaviors from the modular structure
+from .behaviors import create_root
 
 class ApproachObject(py_trees.behaviour.Behaviour):
-    """接近物体节点 - 模拟实际的接近过程"""
-    def __init__(self, name, duration=3.0):
+    """接近物体节点 - 集成State_switch逻辑"""
+    def __init__(self, name):
         super().__init__(name)
-        self.duration = duration
         self.start_time = None
+        self.proximity_reached = False
+        self.ros_node = None
+        self.cmd_vel_pub = None
+        self.robot_pose_sub = None
+        self.parcel_pose_sub = None
+        self.current_robot_pose = None
+        self.current_parcel_pose = None
+        self.proximity_threshold = 0.5  # meters
+        self.robot_namespace = "tb0"  # Default, will be updated from blackboard
+        
+    def setup(self, **kwargs):
+        """Setup ROS connections"""
+        if 'node' in kwargs:
+            self.ros_node = kwargs['node']
+            # Get robot namespace from ROS parameters
+            try:
+                self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
+            except:
+                self.robot_namespace = "tb0"
+            
+            # Publishers and subscribers for approach behavior
+            self.cmd_vel_pub = self.ros_node.create_publisher(
+                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            self.robot_pose_sub = self.ros_node.create_subscription(
+                Odometry, f'/turtlebot{self.robot_namespace[-1]}/odom_map', 
+                self.robot_pose_callback, 10)
+            
+            # Subscribe to current parcel pose - get index from blackboard
+            blackboard = self.attach_blackboard_client(name=self.name)
+            blackboard.register_key(key="current_parcel_index", access=py_trees.common.Access.READ)
+            parcel_index = getattr(blackboard, 'current_parcel_index', 0)
+            self.parcel_pose_sub = self.ros_node.create_subscription(
+                PoseStamped, f'/parcel{parcel_index}/pose', 
+                self.parcel_pose_callback, 10)
+    
+    def robot_pose_callback(self, msg):
+        self.current_robot_pose = msg.pose.pose
+        
+    def parcel_pose_callback(self, msg):
+        self.current_parcel_pose = msg.pose
+    
+    def calculate_distance(self, pose1, pose2):
+        if pose1 is None or pose2 is None:
+            return float('inf')
+        dx = pose1.position.x - pose2.position.x
+        dy = pose1.position.y - pose2.position.y
+        return math.sqrt(dx*dx + dy*dy)
+    
+    def quaternion_to_yaw(self, quat):
+        """Convert quaternion to yaw angle"""
+        siny_cosp = 2 * (quat.w * quat.z + quat.x * quat.y)
+        cosy_cosp = 1 - 2 * (quat.y * quat.y + quat.z * quat.z)
+        return math.atan2(siny_cosp, cosy_cosp)
     
     def initialise(self):
         self.start_time = time.time()
-        self.feedback_message = f"Approaching object for {self.duration}s"
+        self.proximity_reached = False
+        self.feedback_message = "Approaching object..."
         print(f"[{self.name}] Starting to approach object...")
     
     def update(self):
         if self.start_time is None:
             self.start_time = time.time()
         
-        elapsed = time.time() - self.start_time
-        progress = min(elapsed / self.duration, 1.0)
-        self.feedback_message = f"Approaching object... {progress*100:.1f}% complete"
+        # Check if we have valid pose data
+        if self.current_robot_pose is None or self.current_parcel_pose is None:
+            self.feedback_message = "Waiting for pose data..."
+            return py_trees.common.Status.RUNNING
         
-        if elapsed >= self.duration:
-            print(f"[{self.name}] Successfully reached object!")
+        # Calculate distance to parcel
+        distance = self.calculate_distance(self.current_robot_pose, self.current_parcel_pose)
+        self.feedback_message = f"Distance to object: {distance:.2f}m"
+        
+        # Check if close enough
+        if distance <= self.proximity_threshold:
+            # Stop the robot
+            if self.cmd_vel_pub:
+                stop_cmd = Twist()
+                self.cmd_vel_pub.publish(stop_cmd)
+            print(f"[{self.name}] Successfully reached object! Distance: {distance:.2f}m")
             return py_trees.common.Status.SUCCESS
+        
+        # Continue approaching - basic proportional control
+        if self.cmd_vel_pub and self.current_robot_pose and self.current_parcel_pose:
+            cmd_vel = Twist()
+            # Simple proportional control
+            max_speed = 0.1  # m/s
+            cmd_vel.linear.x = min(max_speed, distance * 0.2)
+            
+            # Calculate heading error
+            dx = self.current_parcel_pose.position.x - self.current_robot_pose.position.x
+            dy = self.current_parcel_pose.position.y - self.current_robot_pose.position.y
+            target_yaw = math.atan2(dy, dx)
+            
+            # Get current yaw from quaternion
+            current_yaw = self.quaternion_to_yaw(self.current_robot_pose.orientation)
+            yaw_error = target_yaw - current_yaw
+            
+            # Normalize angle
+            while yaw_error > math.pi:
+                yaw_error -= 2 * math.pi
+            while yaw_error < -math.pi:
+                yaw_error += 2 * math.pi
+            
+            cmd_vel.angular.z = yaw_error * 0.5  # Proportional control
+            self.cmd_vel_pub.publish(cmd_vel)
+        
         return py_trees.common.Status.RUNNING
 
 class PushObject(py_trees.behaviour.Behaviour):
-    def __init__(self, name, duration=2.0):
+    """推动物体节点 - 集成Follow_controller逻辑"""
+    def __init__(self, name):
         super().__init__(name)
-        self.duration = duration
         self.start_time = None
+        self.pushing_active = False
+        self.ros_node = None
+        self.start_pushing_client = None
+        self.pushing_finished_client = None
+        self.pushing_complete = False
+        self.robot_namespace = "tb0"  # Default, will be updated from parameters
+        
+    def setup(self, **kwargs):
+        """Setup ROS connections"""
+        if 'node' in kwargs:
+            self.ros_node = kwargs['node']
+            # Get robot namespace from ROS parameters
+            try:
+                self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
+            except:
+                self.robot_namespace = "tb0"
+            
+            # Service clients for pushing operations
+            self.start_pushing_client = self.ros_node.create_client(
+                Trigger, f'/{self.robot_namespace}/start_pushing')
+            self.pushing_finished_client = self.ros_node.create_client(
+                Trigger, f'/{self.robot_namespace}/pushing_finished')
+            
+            # Wait for services (non-blocking)
+            print(f"[{self.name}] Setting up push services for {self.robot_namespace}")
     
     def initialise(self):
         self.start_time = time.time()
-        self.feedback_message = f"Pushing object for {self.duration}s"
+        self.pushing_active = False
+        self.pushing_complete = False
+        self.feedback_message = "Starting push operation..."
         print(f"[{self.name}] Starting to push object...")
+        
+        # Call start pushing service
+        if self.start_pushing_client and self.start_pushing_client.service_is_ready():
+            request = Trigger.Request()
+            future = self.start_pushing_client.call_async(request)
+            # Use a timeout for the service call
+            rclpy.spin_until_future_complete(self.ros_node, future, timeout_sec=1.0)
+            if future.done() and future.result():
+                response = future.result()
+                if response.success:
+                    self.pushing_active = True
+                    print(f"[{self.name}] Push service started successfully")
+                else:
+                    print(f"[{self.name}] Failed to start push service: {response.message}")
+            else:
+                print(f"[{self.name}] Push service call timed out or failed")
+        else:
+            # Simulate push start if service not available
+            self.pushing_active = True
+            print(f"[{self.name}] Push service not available, simulating push start")
     
     def update(self):
         if self.start_time is None:
             self.start_time = time.time()
         
-        elapsed = time.time() - self.start_time
-        progress = min(elapsed / self.duration, 1.0)
-        self.feedback_message = f"Pushing object... {progress*100:.1f}% complete"
+        if not self.pushing_active:
+            return py_trees.common.Status.FAILURE
         
-        if elapsed >= self.duration:
-            print(f"[{self.name}] Successfully pushed object!")
-            return py_trees.common.Status.SUCCESS
+        elapsed = time.time() - self.start_time
+        self.feedback_message = f"Pushing object... {elapsed:.1f}s elapsed"
+        
+        # Check if pushing is complete - simulate completion after 5 seconds
+        if elapsed >= 5.0 and not self.pushing_complete:
+            # Call pushing finished service if available
+            if self.pushing_finished_client and self.pushing_finished_client.service_is_ready():
+                request = Trigger.Request()
+                future = self.pushing_finished_client.call_async(request)
+                rclpy.spin_until_future_complete(self.ros_node, future, timeout_sec=1.0)
+                if future.done() and future.result():
+                    response = future.result()
+                    if response.success:
+                        self.pushing_complete = True
+                        print(f"[{self.name}] Successfully pushed object!")
+                        return py_trees.common.Status.SUCCESS
+                    else:
+                        print(f"[{self.name}] Push completion failed: {response.message}")
+                        return py_trees.common.Status.FAILURE
+            else:
+                # Simulate successful completion
+                self.pushing_complete = True
+                print(f"[{self.name}] Successfully pushed object! (simulated)")
+                return py_trees.common.Status.SUCCESS
+        
+        # Timeout check
+        if elapsed >= 10.0:
+            print(f"[{self.name}] Push operation timed out")
+            return py_trees.common.Status.FAILURE
+        
         return py_trees.common.Status.RUNNING
 
 class MoveBackward(py_trees.behaviour.Behaviour):
-    def __init__(self, name, duration=1.5):
+    """后退节点 - 使用直接速度控制"""
+    def __init__(self, name):
         super().__init__(name)
-        self.duration = duration
+        self.distance = 0.3  # meters to move backward
         self.start_time = None
+        self.ros_node = None
+        self.cmd_vel_pub = None
+        self.robot_pose_sub = None
+        self.start_pose = None
+        self.current_pose = None
+        self.move_speed = -0.1  # negative for backward movement
+        self.robot_namespace = "tb0"  # Default, will be updated from parameters
+        
+    def setup(self, **kwargs):
+        """Setup ROS connections"""
+        if 'node' in kwargs:
+            self.ros_node = kwargs['node']
+            # Get robot namespace from ROS parameters
+            try:
+                self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
+            except:
+                self.robot_namespace = "tb0"
+            
+            # Publisher for cmd_vel
+            self.cmd_vel_pub = self.ros_node.create_publisher(
+                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            # Subscriber for robot pose
+            self.robot_pose_sub = self.ros_node.create_subscription(
+                Odometry, f'/turtlebot{self.robot_namespace[-1]}/odom_map', 
+                self.robot_pose_callback, 10)
+    
+    def robot_pose_callback(self, msg):
+        self.current_pose = msg.pose.pose
+        
+    def calculate_distance_moved(self):
+        if self.start_pose is None or self.current_pose is None:
+            return 0.0
+        dx = self.current_pose.position.x - self.start_pose.position.x
+        dy = self.current_pose.position.y - self.start_pose.position.y
+        return math.sqrt(dx*dx + dy*dy)
     
     def initialise(self):
         self.start_time = time.time()
-        self.feedback_message = f"Moving backward for {self.duration}s"
+        self.start_pose = self.current_pose
+        self.feedback_message = f"Moving backward {self.distance}m"
         print(f"[{self.name}] Starting to move backward...")
     
     def update(self):
         if self.start_time is None:
             self.start_time = time.time()
         
-        elapsed = time.time() - self.start_time
-        progress = min(elapsed / self.duration, 1.0)
-        self.feedback_message = f"Moving backward... {progress*100:.1f}% complete"
+        # Wait for pose data
+        if self.current_pose is None:
+            self.feedback_message = "Waiting for pose data..."
+            return py_trees.common.Status.RUNNING
         
-        if elapsed >= self.duration:
-            print(f"[{self.name}] Successfully moved to safe distance!")
+        # Calculate how far we've moved
+        distance_moved = self.calculate_distance_moved()
+        self.feedback_message = f"Moving backward... {distance_moved:.2f}/{self.distance:.2f}m"
+        
+        # Check if we've moved far enough
+        if distance_moved >= self.distance:
+            # Stop the robot
+            if self.cmd_vel_pub:
+                stop_cmd = Twist()
+                self.cmd_vel_pub.publish(stop_cmd)
+            print(f"[{self.name}] Successfully moved to safe distance! Moved: {distance_moved:.2f}m")
             return py_trees.common.Status.SUCCESS
+        
+        # Continue moving backward
+        if self.cmd_vel_pub:
+            cmd_vel = Twist()
+            cmd_vel.linear.x = self.move_speed
+            cmd_vel.angular.z = 0.0
+            self.cmd_vel_pub.publish(cmd_vel)
+        
+        # Safety timeout
+        elapsed = time.time() - self.start_time
+        if elapsed >= 10.0:  # 10 second timeout
+            if self.cmd_vel_pub:
+                stop_cmd = Twist()
+                self.cmd_vel_pub.publish(stop_cmd)
+            print(f"[{self.name}] Move backward timed out")
+            return py_trees.common.Status.FAILURE
+        
         return py_trees.common.Status.RUNNING
 
 class ReplanPath(py_trees.behaviour.Behaviour):
@@ -140,27 +340,115 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.RUNNING
 
 class PickObject(py_trees.behaviour.Behaviour):
-    def __init__(self, name, duration=2.5):
+    """拾取物体节点 - 集成PickUp_controller逻辑"""
+    def __init__(self, name):
         super().__init__(name)
-        self.duration = duration
         self.start_time = None
+        self.picking_active = False
+        self.ros_node = None
+        self.start_picking_client = None
+        self.picking_finished_client = None
+        self.spawn_parcel_client = None
+        self.picking_complete = False
+        self.robot_namespace = "tb0"  # Default, will be updated from parameters
+        
+    def setup(self, **kwargs):
+        """Setup ROS connections"""
+        if 'node' in kwargs:
+            self.ros_node = kwargs['node']
+            # Get robot namespace from ROS parameters
+            try:
+                self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
+            except:
+                self.robot_namespace = "tb0"
+            
+            # Service clients for picking operations
+            self.start_picking_client = self.ros_node.create_client(
+                Trigger, f'/{self.robot_namespace}/start_picking')
+            self.picking_finished_client = self.ros_node.create_client(
+                Trigger, f'/{self.robot_namespace}/picking_finished')
+            self.spawn_parcel_client = self.ros_node.create_client(
+                Trigger, '/spawn_next_parcel_service')
+            
+            print(f"[{self.name}] Setting up pick services for {self.robot_namespace}")
     
     def initialise(self):
         self.start_time = time.time()
-        self.feedback_message = f"Picking object for {self.duration}s"
+        self.picking_active = False
+        self.picking_complete = False
+        self.feedback_message = "Starting pick operation..."
         print(f"[{self.name}] Starting to pick object...")
+        
+        # Call start picking service
+        if self.start_picking_client and self.start_picking_client.service_is_ready():
+            request = Trigger.Request()
+            future = self.start_picking_client.call_async(request)
+            rclpy.spin_until_future_complete(self.ros_node, future, timeout_sec=1.0)
+            if future.done() and future.result():
+                response = future.result()
+                if response.success:
+                    self.picking_active = True
+                    print(f"[{self.name}] Pick service started successfully")
+                else:
+                    print(f"[{self.name}] Failed to start pick service: {response.message}")
+            else:
+                print(f"[{self.name}] Pick service call timed out or failed")
+        else:
+            # Simulate pick start if service not available
+            self.picking_active = True
+            print(f"[{self.name}] Pick service not available, simulating pick start")
     
     def update(self):
         if self.start_time is None:
             self.start_time = time.time()
         
-        elapsed = time.time() - self.start_time
-        progress = min(elapsed / self.duration, 1.0)
-        self.feedback_message = f"Picking object... {progress*100:.1f}% complete"
+        if not self.picking_active:
+            return py_trees.common.Status.FAILURE
         
-        if elapsed >= self.duration:
+        elapsed = time.time() - self.start_time
+        self.feedback_message = f"Picking object... {elapsed:.1f}s elapsed"
+        
+        # Check if picking is complete - simulate completion after 8 seconds
+        if elapsed >= 8.0 and not self.picking_complete:
+            # Call picking finished service if available
+            if self.picking_finished_client and self.picking_finished_client.service_is_ready():
+                request = Trigger.Request()
+                future = self.picking_finished_client.call_async(request)
+                rclpy.spin_until_future_complete(self.ros_node, future, timeout_sec=1.0)
+                if future.done() and future.result():
+                    response = future.result()
+                    if response.success:
+                        print(f"[{self.name}] Pick operation completed")
+                    else:
+                        print(f"[{self.name}] Pick completion failed: {response.message}")
+            
+            # Spawn next parcel
+            if self.spawn_parcel_client and self.spawn_parcel_client.service_is_ready():
+                spawn_request = Trigger.Request()
+                spawn_future = self.spawn_parcel_client.call_async(spawn_request)
+                rclpy.spin_until_future_complete(self.ros_node, spawn_future, timeout_sec=1.0)
+                if spawn_future.done() and spawn_future.result():
+                    spawn_response = spawn_future.result()
+                    if spawn_response.success:
+                        print(f"[{self.name}] Next parcel spawned successfully")
+                    else:
+                        print(f"[{self.name}] Failed to spawn next parcel: {spawn_response.message}")
+            
+            # Update blackboard with new parcel index
+            blackboard = self.attach_blackboard_client(name=self.name)
+            blackboard.register_key(key="current_parcel_index", access=py_trees.common.Access.WRITE)
+            current_index = getattr(blackboard, 'current_parcel_index', 0)
+            blackboard.current_parcel_index = current_index + 1
+            
+            self.picking_complete = True
             print(f"[{self.name}] Successfully picked object!")
             return py_trees.common.Status.SUCCESS
+        
+        # Timeout check
+        if elapsed >= 15.0:
+            print(f"[{self.name}] Pick operation timed out")
+            return py_trees.common.Status.FAILURE
+        
         return py_trees.common.Status.RUNNING
 
 class StopSystem(py_trees.behaviour.Behaviour):
@@ -223,6 +511,12 @@ def create_root():
             variable_value=0,
             overwrite=True
         ),
+        py_trees.behaviours.SetBlackboardVariable(
+            name="Initialize parcel index",
+            variable_name="current_parcel_index",
+            variable_value=0,
+            overwrite=True
+        ),
         ResetFlags("ResetFlags")
     ])
     
@@ -236,21 +530,21 @@ def create_root():
         memory=True
     )
     
-    # Pushing序列（网页5 XML结构转代码）
+    # Pushing序列（网页5 XML结构转代码）- 直接调用类
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
         WaitAction("WaitingPush", 3.0),
-        ApproachObject("ApproachingPush", 4.0),
-        PushObject("Pushing", 3.0),
-        MoveBackward("BackwardToSafeDistance", 2.0)
+        ApproachObject("ApproachingPush"),
+        PushObject("Pushing"),
+        MoveBackward("BackwardToSafeDistance")
     ])
     
-    # PickingUp序列（网页3巡逻任务参考）
+    # PickingUp序列（网页3巡逻任务参考）- 直接调用类
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitAction("WaitingPick", 2.0),
         ReplanPath("Replanning", 2.0),
-        PickObject("PickingUp", 3.0),
+        PickObject("PickingUp"),
         StopSystem("Stop", 1.5)
     ])
     
@@ -340,7 +634,11 @@ def main():
         print(f"="*80)
         
         # 创建行为树
-        root = create_root()
+        # Convert robot_namespace to the format expected by WaitAction (e.g., "turtlebot0" -> "tb0")
+        import re
+        match = re.search(r'turtlebot(\d+)', robot_namespace)
+        tb_namespace = f"tb{match.group(1)}" if match else "tb0"
+        root = create_root(tb_namespace)
         
         # 打印行为树结构
         print("BEHAVIOR TREE STRUCTURE:")
