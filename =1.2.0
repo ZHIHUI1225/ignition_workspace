@@ -1,0 +1,4 @@
+Requirement already satisfied: py_trees in /opt/ros/humble/lib/python3.10/site-packages (2.3.0)
+Requirement already satisfied: py_trees_ros in /opt/ros/humble/lib/python3.10/site-packages (2.3.0)
+Requirement already satisfied: pydot in /usr/lib/python3/dist-packages (from py_trees) (1.4.2)
+Requirement already satisfied: setuptools in /usr/lib/python3/dist-packages (from py_trees) (59.6.0)

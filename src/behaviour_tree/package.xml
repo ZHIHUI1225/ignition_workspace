@@ -7,10 +7,12 @@
   <maintainer email="hui1225.zhi@connect.polyu.hk">root</maintainer>
   <license>TODO: License declaration</license>
 
-  <depend>rclpy</depend>
-  <depend>py_trees</depend>
-  <depend>behaviortree_py</depend>
-
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>py_trees</exec_depend>
+  <exec_depend>py_trees_ros</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <depend>ros-humble-py-trees-ros-viewer</depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

@@ -1,0 +1,8 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="root_sequence">
+      <Action ID="SayHello"/>
+      <Action ID="WaitForInput"/>
+    </Sequence>
+  </BehaviorTree>
+</root>
