@@ -30,7 +30,7 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument(
         'num_robots',
-        default_value='3',
+        default_value='1',
         description='Number of robots to launch behavior trees for'))
     
     # Use OpaqueFunction to handle dynamic robot count properly
@@ -82,7 +82,22 @@ def generate_launch_description():
     
     # Import OpaqueFunction for dynamic launch configuration handling
     from launch.actions import OpaqueFunction
-    
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=[
+        '-d',
+        # Use absolute path with $(HOME) or package-relative path
+        os.path.join(
+            get_package_share_directory('pushing_controller'),  # Your package name
+            'rviz',
+            'test.rviz'
+            )
+        ],
+        parameters=[{'use_sim_time': True}]  # Ensure simulation time is used
+    )
+    ld.add_action(rviz_node)
     # Add the dynamic robot node creation
     ld.add_action(OpaqueFunction(function=create_robot_nodes))
     return ld

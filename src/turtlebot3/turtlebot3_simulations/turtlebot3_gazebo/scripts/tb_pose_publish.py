@@ -32,7 +32,7 @@ class TurtlebotPose(Node):
             f'/{ns}/odom_map',
             10)
         # Timer to calculate and publish pose periodically
-        self.timer = self.create_timer(1.0, self.calculate_and_publish_pose)
+        self.timer = self.create_timer(0.05, self.calculate_and_publish_pose)
 
     def odom_callback(self, msg: Odometry):
         """Stores the latest odometry message."""

@@ -81,11 +81,8 @@ def main():
         print(f"="*80)
         
         # Create behavior tree
-        # Convert robot_namespace to the format expected by WaitAction (e.g., "turtlebot0" -> "tb0")
-        import re
-        match = re.search(r'turtlebot(\d+)', robot_namespace)
-        tb_namespace = f"tb{match.group(1)}" if match else "tb0"
-        root = create_root(tb_namespace)
+        # Use robot_namespace directly since we now use "turtlebot{i}" format throughout
+        root = create_root(robot_namespace)
         
         # Print behavior tree structure
         print("BEHAVIOR TREE STRUCTURE:")
@@ -108,31 +105,42 @@ def main():
         # Setup behavior tree - pass ROS node to enable snapshot streams
         tree.setup(timeout=15.0, node=ros_node)
         
-        # Setup snapshot streams for PyTrees Viewer
-        snapshot_topic = setup_snapshot_streams(ros_node, robot_namespace)
-        
-        # Add TreeToMsgVisitor for PyTrees Viewer
-        tree_to_msg_visitor = py_trees_ros.visitors.TreeToMsgVisitor()
-        tree.add_visitor(tree_to_msg_visitor)
+        # Setup snapshot streams for PyTrees Viewer (with error handling)
+        try:
+            snapshot_topic = setup_snapshot_streams(ros_node, robot_namespace)
+            
+            # Add TreeToMsgVisitor for PyTrees Viewer
+            tree_to_msg_visitor = py_trees_ros.visitors.TreeToMsgVisitor()
+            tree.add_visitor(tree_to_msg_visitor)
+        except Exception as e:
+            print(f"Warning: Could not setup PyTrees viewer integration: {e}")
+            print("Continuing without viewer integration...")
         
         # Create ROS executor for background ROS topic processing
-        executor = rclpy.executors.SingleThreadedExecutor()
+        # Use MultiThreadedExecutor to avoid blocking between callbacks
+        executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
         executor.add_node(ros_node)
         
         # Use manual ticking loop to ensure ROS topic processing
         iteration_count = 0
+        shutdown_requested = False
         
         # Create background thread for ROS executor
         def spin_ros():
-            while rclpy.ok():
-                executor.spin_once(timeout_sec=0.1)
+            while rclpy.ok() and not shutdown_requested:
+                try:
+                    executor.spin_once(timeout_sec=0.1)
+                except Exception as e:
+                    if rclpy.ok() and not shutdown_requested:
+                        print(f"ROS executor error: {e}")
+                    break
         
         # Start ROS executor thread
         ros_thread = threading.Thread(target=spin_ros)
         ros_thread.daemon = True  # Daemon thread, automatically ends when main thread ends
         ros_thread.start()
         
-        while rclpy.ok():
+        while rclpy.ok() and not shutdown_requested:
             tree.tick()
             
             # Print status every 50 ticks
@@ -155,13 +163,22 @@ def main():
         
     except KeyboardInterrupt:
         print("\nShutting down behavior tree...")
+        shutdown_requested = True
         if 'tree' in locals():
             tree.shutdown()
     except Exception as e:
         print(f"Error running behavior tree: {e}")
         import traceback
         traceback.print_exc()
+        shutdown_requested = True
     finally:
+        # Signal shutdown to background thread
+        shutdown_requested = True
+        
+        # Wait for background thread to finish
+        if 'ros_thread' in locals():
+            ros_thread.join(timeout=2.0)
+        
         # Clean up ROS resources
         try:
             if rclpy.ok():

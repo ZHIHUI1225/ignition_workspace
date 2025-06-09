@@ -568,15 +568,10 @@ class CmdVelPublisher(Node):
                 # Calculate distance to final point for displaying progress
                 final_pos = np.array([self.data[-1][0], self.data[-1][1]])
                 dist_to_final = np.linalg.norm(curr_pos - final_pos)
-                
-                # We should regenerate the trajectory if:
-                # 1. We don't have a control sequence yet, or
-                # 2. We're at the end of our current control sequence, or
-                # 3. The error to the current reference point is large (requiring replanning)
+        
                 needs_replanning = (
                     self.control_sequence is None or 
-                    self.control_step >= self.MPC.N_c - 1 or 
-                    curr_pos_error > 0.1  # Replan if error is significant
+                    self.control_step >= self.MPC.N_c - 1
                 )
                 
                 # For debugging
