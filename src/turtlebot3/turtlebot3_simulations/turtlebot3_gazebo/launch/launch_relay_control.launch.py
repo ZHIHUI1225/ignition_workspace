@@ -14,7 +14,7 @@ def generate_launch_description():
     
     
     # Create multiple controllers in different namespaces
-    for i in range(3):
+    for i in range(5):
         with open(f'/root/workspace/data/tb{i}_DiscreteTrajectory.json', 'r') as f:
             data = json.load(f)
         trajectory_data = data["Trajectory"]

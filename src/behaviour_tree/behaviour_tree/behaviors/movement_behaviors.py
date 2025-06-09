@@ -16,6 +16,12 @@ import threading
 import tf_transformations as tf
 import casadi as ca
 import numpy as np
+import math
+import time
+import threading
+import tf_transformations as tf
+import casadi as ca
+import numpy as np
 
 
 class MobileRobotMPC:
@@ -176,13 +182,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
     Uses MPC controller to make the robot approach the parcel based on the logic from State_switch.py.
     """
 
-    def __init__(self, name="ApproachObject", robot_namespace="tb0", approach_distance=0.12):
+    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.12):
         """
         Initialize the ApproachObject behavior.
         
         Args:
             name: Name of the behavior node
-            robot_namespace: The robot namespace (e.g., 'tb0', 'tb1')
+            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
             approach_distance: Distance to maintain from the parcel (default 0.12m)
         """
         super(ApproachObject, self).__init__(name)
@@ -195,7 +201,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # Pose storage
         self.robot_pose = None
         self.parcel_pose = None
-        self.current_parcel_index = 0
+        
+        # Setup blackboard access for current_parcel_index with namespace
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index", 
+            access=py_trees.common.Access.READ
+        )
         
         # State variables
         self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
@@ -206,11 +218,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.ros_node = None
         self.robot_pose_sub = None
         self.parcel_pose_sub = None
-        self.current_index_sub = None
         self.cmd_vel_pub = None
         
         # MPC controller
         self.mpc = MobileRobotMPC()
+        
+        # Control loop timer
+        self.control_timer = None
+        self.dt = 0.1  # 0.1s timer period for MPC control (10Hz)
+        self.control_active = False
         
         # Threading lock for state protection
         self.lock = threading.Lock()
@@ -239,19 +255,14 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             
             # Create command velocity publisher
             self.cmd_vel_pub = self.ros_node.create_publisher(
-                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+                Twist, f'/turtlebot{self.namespace_number}/cmd_vel', 10)
             
             # Subscribe to robot pose (Odometry)
             self.robot_pose_sub = self.ros_node.create_subscription(
                 Odometry, f'/turtlebot{self.namespace_number}/odom_map',
                 self.robot_pose_callback, 10)
             
-            # Subscribe to current parcel index
-            self.current_index_sub = self.ros_node.create_subscription(
-                Int32, f'/{self.robot_namespace}/current_parcel_index',
-                self.current_index_callback, 10)
-            
-            # Initial parcel subscription (will be updated based on current index)
+            # Get current parcel index from blackboard and subscribe to parcel topic
             self.update_parcel_subscription()
             
             self.ros_node.get_logger().info(
@@ -263,20 +274,26 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             return False
 
     def update_parcel_subscription(self):
-        """Update subscription to the correct parcel topic based on current index"""
+        """Update subscription to the correct parcel topic based on current index from blackboard"""
         if self.ros_node is None:
+            self.ros_node.get_logger().warn(f'[{self.name}] DEBUG: ros_node is None in update_parcel_subscription')
             return
             
+        # Get current parcel index from namespaced blackboard
+        current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+        # self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Retrieved parcel index from blackboard: {current_parcel_index}')
+        
         # Unsubscribe from previous parcel topic if it exists
         if self.parcel_pose_sub is not None:
             self.ros_node.destroy_subscription(self.parcel_pose_sub)
+            self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Destroyed previous parcel subscription')
         
         # Subscribe to current parcel topic
-        parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+        parcel_topic = f'/parcel{current_parcel_index}/pose'
         self.parcel_pose_sub = self.ros_node.create_subscription(
             PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
         
-        self.ros_node.get_logger().info(f'Updated parcel subscription to: {parcel_topic}')
+        self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Updated parcel subscription to: {parcel_topic}')
 
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates (Odometry message)"""
@@ -288,22 +305,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 self.robot_pose.position.y,
                 self.quaternion_to_yaw(self.robot_pose.orientation)
             ])
+            # if self.ros_node:
+            #     self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Received robot pose: x={self.robot_pose.position.x:.3f}, y={self.robot_pose.position.y:.3f}')
 
     def parcel_pose_callback(self, msg):
         """Callback for parcel pose updates (PoseStamped message)"""
         with self.lock:
             self.parcel_pose = msg.pose
-
-    def current_index_callback(self, msg):
-        """Callback for current parcel index updates"""
-        new_index = msg.data
-        if new_index != self.current_parcel_index:
-            with self.lock:
-                old_index = self.current_parcel_index
-                self.current_parcel_index = new_index
-                self.update_parcel_subscription()
-                self.ros_node.get_logger().info(
-                    f'ApproachObject updated parcel index: {old_index} -> {self.current_parcel_index}')
+            # if self.ros_node:
+                # self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Received parcel pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}')
 
     def calculate_distance(self, pose1, pose2):
         """Calculate Euclidean distance between two poses"""
@@ -329,6 +339,91 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         quat_list = [x, y, z, w]
         euler = tf.euler_from_quaternion(quat_list)
         return euler[2]
+
+    def control_timer_callback(self):
+        """ROS timer callback for MPC control loop - runs at 10Hz"""
+        # Add timing debug info
+        current_time = time.time()
+        if not hasattr(self, '_last_timer_time'):
+            self._last_timer_time = current_time
+            self._timer_call_count = 0
+        
+        time_interval = current_time - self._last_timer_time
+        self._timer_call_count += 1
+        self._last_timer_time = current_time
+        
+        # Log timing every 50 calls to avoid spam but verify frequency
+        if self._timer_call_count % 50 == 1:
+            frequency = 1.0 / time_interval if time_interval > 0 else 0
+            print(f"[{self.name}] Timer callback #{self._timer_call_count}, "
+                  f"interval: {time_interval:.3f}s, frequency: {frequency:.1f}Hz")
+        
+        # Only execute control loop if approach is active
+        if self.control_active and self.approaching_target:
+            print(f"[{self.name}] DEBUG: Timer executing control loop - control_active={self.control_active}, approaching_target={self.approaching_target}")
+            self.control_loop()
+        else:
+            # Stop the robot when not actively approaching
+            if self.cmd_vel_pub:
+                cmd = Twist()
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd)
+
+    def control_loop(self):
+        """Main MPC control loop for approach behavior"""
+        with self.lock:
+            # Check if we have the necessary pose data
+            if self.robot_pose is None or self.parcel_pose is None:
+                return
+            
+            # Calculate distance to parcel
+            distance_to_parcel = self.calculate_distance(self.robot_pose, self.parcel_pose)
+            
+            # Check if we should continue approaching
+            if distance_to_parcel > self.approach_distance and self.approaching_target:
+                # Compute target state following State_switch.py logic
+                self.target_state = np.array([
+                    self.parcel_pose.position.x,
+                    self.parcel_pose.position.y,
+                    self.quaternion_to_yaw(self.parcel_pose.orientation)
+                ])
+                
+                # Get optimal direction and apply offset
+                optimal_direction = self.get_direction(
+                    self.current_state[2],
+                    self.target_state[2]
+                )
+                self.target_state[2] = optimal_direction
+                self.target_state[0] = self.target_state[0] - (self.approach_distance - 0.2)* math.cos(optimal_direction)
+                self.target_state[1] = self.target_state[1] - (self.approach_distance-0.2) * math.sin(optimal_direction)
+                
+                # Generate and apply control using MPC
+                u = self.mpc.update_control(self.current_state, self.target_state)
+                
+                if u is not None and self.cmd_vel_pub:
+                    cmd = Twist()
+                    cmd.linear.x = float(u[0])
+                    cmd.angular.z = float(u[1])
+                    self.cmd_vel_pub.publish(cmd)
+                    
+                    # Debug output for control commands
+                    if self._timer_call_count % 20 == 1:  # Log every 2 seconds
+                        print(f"[{self.name}] MPC control: v={cmd.linear.x:.3f}, ω={cmd.angular.z:.3f}, "
+                              f"dist={distance_to_parcel:.3f}m")
+            else:
+                # Stop the robot if we've reached the target or should no longer approach
+                if self.cmd_vel_pub:
+                    cmd = Twist()
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.0
+                    self.cmd_vel_pub.publish(cmd)
+                
+                # If we reached the target, mark approach as complete
+                if distance_to_parcel <= self.approach_distance:
+                    self.approaching_target = False
+                    self.control_active = False
+                    print(f"[{self.name}] Target reached, approach complete. Distance: {distance_to_parcel:.3f}m")
 
     def get_direction(self, robot_theta, parcel_theta):
         """Get optimal approach direction - from State_switch.py"""
@@ -356,73 +451,72 @@ class ApproachObject(py_trees.behaviour.Behaviour):
     def initialise(self):
         """Initialize the behavior when it starts running"""
         self.approaching_target = False
+        self.control_active = False
         self.feedback_message = "Initializing approach behavior"
         
-        # Spin ROS node once to get latest data
+        # Create and start ROS timer for control loop at 10Hz (0.1s)
         if self.ros_node:
-            rclpy.spin_once(self.ros_node, timeout_sec=0.1)
+            # Clean up any existing timer first
+            if self.control_timer:
+                self.control_timer.cancel()
+                self.control_timer = None
+                print(f"[{self.name}] DEBUG: Cancelled existing ROS timer")
+            
+            # Create new timer for 10Hz control frequency
+            self.control_timer = self.ros_node.create_timer(self.dt, self.control_timer_callback)
+            print(f"[{self.name}] DEBUG: Created ROS timer for control loop at {1/self.dt:.1f} Hz (every {self.dt}s)")
+        else:
+            print(f"[{self.name}] WARNING: No ROS node available, cannot create control timer")
+        
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
 
     def update(self):
         """
-        Main update method - implements the approaching_target logic from State_switch.py
+        Main update method - behavior tree logic only, control runs via timer
         """
-        # Spin ROS node to process callbacks
-        if self.ros_node:
-            rclpy.spin_once(self.ros_node, timeout_sec=0.01)
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
+
+        # Check if parcel index changed in blackboard and update subscription if needed
+        current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+        if not hasattr(self, '_last_parcel_index') or self._last_parcel_index != current_parcel_index:
+            self._last_parcel_index = current_parcel_index
+            self.update_parcel_subscription()
+            if self.ros_node:
+                self.ros_node.get_logger().info(
+                    f'ApproachObject tracking parcel{current_parcel_index}')
 
         with self.lock:
             # Check if we have the necessary pose data
             if self.robot_pose is None or self.parcel_pose is None:
+                if self.ros_node:
+                    self.ros_node.get_logger().warn(f'[{self.name}] DEBUG: Missing pose data - robot_pose: {self.robot_pose is not None}, parcel_pose: {self.parcel_pose is not None}')
                 self.feedback_message = "Waiting for pose data..."
                 return py_trees.common.Status.RUNNING
 
             # Calculate distance to parcel
             distance_to_parcel = self.calculate_distance(self.robot_pose, self.parcel_pose)
             
-            # Check if we need to approach (distance > 0.25m as in State_switch.py)
-            if distance_to_parcel > 0.25:
-                self.approaching_target = True
-                self.feedback_message = f"Approaching parcel - Distance: {distance_to_parcel:.2f}m"
+            # Check if we need to approach (distance > approach_distance)
+            if distance_to_parcel > self.approach_distance:
+                if not self.approaching_target:
+                    # Start approaching
+                    self.approaching_target = True
+                    self.control_active = True
+                    print(f"[{self.name}] Starting approach to parcel{current_parcel_index}, distance: {distance_to_parcel:.3f}m")
                 
-                # Compute target state following State_switch.py logic
-                self.target_state = np.array([
-                    self.parcel_pose.position.x,
-                    self.parcel_pose.position.y,
-                    self.quaternion_to_yaw(self.parcel_pose.orientation)
-                ])
-                
-                # Get optimal direction and apply offset (0.12m as in State_switch.py)
-                optimal_direction = self.get_direction(
-                    self.current_state[2],
-                    self.target_state[2]
-                )
-                self.target_state[2] = optimal_direction
-                self.target_state[0] = self.target_state[0] - self.approach_distance * math.cos(optimal_direction)
-                self.target_state[1] = self.target_state[1] - self.approach_distance * math.sin(optimal_direction)
-                
-                # Generate and apply control using MPC
-                u = self.mpc.update_control(self.current_state, self.target_state)
-                
-                if u is not None and self.cmd_vel_pub:
-                    cmd = Twist()
-                    cmd.linear.x = float(u[0])
-                    cmd.angular.z = float(u[1])
-                    self.cmd_vel_pub.publish(cmd)
+                self.feedback_message = f"Approaching parcel{current_parcel_index} - Distance: {distance_to_parcel:.2f}m, parcel pose: {self.parcel_pose.position.x:.2f}, {self.parcel_pose.position.y:.2f}, robot pose: {self.robot_pose.position.x:.2f}, {self.robot_pose.position.y:.2f}"
                 
                 return py_trees.common.Status.RUNNING
                 
             else:
-                # Robot reached target position (distance <= 0.25m)
+                # Robot reached target position (distance <= approach_distance)
                 if self.approaching_target:
                     self.approaching_target = False
+                    self.control_active = False
                     self.feedback_message = "Target position reached, approach complete"
                     
-                    # Stop the robot
-                    if self.cmd_vel_pub:
-                        cmd = Twist()
-                        cmd.linear.x = 0.0
-                        cmd.angular.z = 0.0
-                        self.cmd_vel_pub.publish(cmd)
+                    # The timer callback will handle stopping the robot
+                    print(f"[{self.name}] Approach complete! Final distance: {distance_to_parcel:.3f}m")
                     
                     return py_trees.common.Status.SUCCESS
                 else:
@@ -432,6 +526,10 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
+        # Stop control and mark as inactive
+        self.control_active = False
+        self.approaching_target = False
+        
         # Stop the robot
         if self.cmd_vel_pub:
             cmd = Twist()
@@ -439,81 +537,14 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             cmd.angular.z = 0.0
             self.cmd_vel_pub.publish(cmd)
         
+        # Clean up timer
+        if self.control_timer:
+            self.control_timer.cancel()
+            self.control_timer = None
+            print(f"[{self.name}] DEBUG: Cancelled control timer on terminate")
+        
         self.feedback_message = f"ApproachObject terminated with status: {new_status}"
-    
-    def robot_pose_callback(self, msg):
-        self.current_robot_pose = msg.pose.pose
-        
-    def parcel_pose_callback(self, msg):
-        self.current_parcel_pose = msg.pose
-    
-    def calculate_distance(self, pose1, pose2):
-        if pose1 is None or pose2 is None:
-            return float('inf')
-        dx = pose1.position.x - pose2.position.x
-        dy = pose1.position.y - pose2.position.y
-        return math.sqrt(dx*dx + dy*dy)
-    
-    def quaternion_to_yaw(self, quat):
-        """Convert quaternion to yaw angle"""
-        siny_cosp = 2 * (quat.w * quat.z + quat.x * quat.y)
-        cosy_cosp = 1 - 2 * (quat.y * quat.y + quat.z * quat.z)
-        return math.atan2(siny_cosp, cosy_cosp)
-    
-    def initialise(self):
-        self.start_time = time.time()
-        self.proximity_reached = False
-        self.feedback_message = "Approaching object..."
-        print(f"[{self.name}] Starting to approach object...")
-    
-    def update(self):
-        if self.start_time is None:
-            self.start_time = time.time()
-        
-        # Check if we have valid pose data
-        if self.current_robot_pose is None or self.current_parcel_pose is None:
-            self.feedback_message = "Waiting for pose data..."
-            return py_trees.common.Status.RUNNING
-        
-        # Calculate distance to parcel
-        distance = self.calculate_distance(self.current_robot_pose, self.current_parcel_pose)
-        self.feedback_message = f"Distance to object: {distance:.2f}m"
-        
-        # Check if close enough
-        if distance <= self.proximity_threshold:
-            # Stop the robot
-            if self.cmd_vel_pub:
-                stop_cmd = Twist()
-                self.cmd_vel_pub.publish(stop_cmd)
-            print(f"[{self.name}] Successfully reached object! Distance: {distance:.2f}m")
-            return py_trees.common.Status.SUCCESS
-        
-        # Continue approaching - basic proportional control
-        if self.cmd_vel_pub and self.current_robot_pose and self.current_parcel_pose:
-            cmd_vel = Twist()
-            # Simple proportional control
-            max_speed = 0.1  # m/s
-            cmd_vel.linear.x = min(max_speed, distance * 0.2)
-            
-            # Calculate heading error
-            dx = self.current_parcel_pose.position.x - self.current_robot_pose.position.x
-            dy = self.current_parcel_pose.position.y - self.current_robot_pose.position.y
-            target_yaw = math.atan2(dy, dx)
-            
-            # Get current yaw from quaternion
-            current_yaw = self.quaternion_to_yaw(self.current_robot_pose.orientation)
-            yaw_error = target_yaw - current_yaw
-            
-            # Normalize angle
-            while yaw_error > math.pi:
-                yaw_error -= 2 * math.pi
-            while yaw_error < -math.pi:
-                yaw_error += 2 * math.pi
-            
-            cmd_vel.angular.z = yaw_error * 0.5  # Proportional control
-            self.cmd_vel_pub.publish(cmd_vel)
-        
-        return py_trees.common.Status.RUNNING
+        print(f"[{self.name}] ApproachObject terminated with status: {new_status}")
 
 
 class MoveBackward(py_trees.behaviour.Behaviour):
@@ -529,7 +560,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
         self.start_pose = None
         self.current_pose = None
         self.move_speed = -0.1  # negative for backward movement
-        self.robot_namespace = "tb0"  # Default, will be updated from parameters
+        self.robot_namespace = "turtlebot0"  # Default, will be updated from parameters
         
     def setup(self, **kwargs):
         """Setup ROS connections"""
@@ -539,7 +570,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
             try:
                 self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
             except:
-                self.robot_namespace = "tb0"
+                self.robot_namespace = "turtlebot0"
             
             # Publisher for cmd_vel
             self.cmd_vel_pub = self.ros_node.create_publisher(

@@ -82,7 +82,7 @@ class PickupController(Node):
 
         with open(json_file_path, 'r') as json_file:
             self.data = json.load(json_file)['Trajectory']
-            self.trajectory_data=self.data[::-1][::2]
+            self.trajectory_data=self.data[::-1]
         self.goal=self.data[0]
         if self.namespace == 'tb0':
             waypoint_file_path = f'/root/workspace/data/{self.case}/Waypoints.json'
@@ -96,8 +96,8 @@ class PickupController(Node):
         # Initialize state variables
         self.current_state = np.zeros(3)  # x, y, theta
         self.target_pose = np.zeros(3)    # x, y, theta
-        self.target_pose[0] = self.goal[0]-0.5*np.cos(self.goal[2])
-        self.target_pose[1] = self.goal[1]-0.5*np.sin(self.goal[2])
+        self.target_pose[0] = self.goal[0]-0.4*np.cos(self.goal[2])
+        self.target_pose[1] = self.goal[1]-0.4*np.sin(self.goal[2])
         self.target_pose[2] = self.goal[2]
         # Interpolate between target_pose and goal position
         # This creates a smoother approach to the final position
@@ -111,11 +111,8 @@ class PickupController(Node):
             interp_y = self.target_pose[1] * alpha+ self.goal[1] * (1 - alpha) 
             interp_theta = self.target_pose[2]  # Keep orientation constant for smoother approach
             
-            v = 0.1  # Low linear velocity for final approach
-            omega = 0.0  # No rotation
-            
-            interp_points.append([interp_x, interp_y, interp_theta, v, omega])
-
+            interp_points.append([interp_x, interp_y, interp_theta])
+        print(f"Interpolated points: {interp_points}")
         # Add interpolation points to the beginning of trajectory_data
         # This means they'll be executed last in the reverse trajectory
         self.trajectory_data =  self.trajectory_data +interp_points 
@@ -123,6 +120,10 @@ class PickupController(Node):
         # Create MPC controller
         self.mpc = MobileRobotMPC()
         self.prediction_horizon = self.mpc.N
+        
+        # Initialize convergence tracking variables
+        self.parallel_count = 0  # Count how many times robot is parallel to path
+        self.last_cross_track_error = 0.0  # Track previous cross-track error
         
         # Paths for visualization
         self.target_path = Path()
@@ -231,7 +232,50 @@ class PickupController(Node):
         distance_error = np.sqrt((self.current_state[0] - self.target_pose[0])**2 + 
                                 (self.current_state[1] - self.target_pose[1])**2)
         
-        if distance_error > 0.03 and not self.pickup_complete:
+        # Calculate orientation error
+        angle_error = abs(self.current_state[2] - self.target_pose[2])
+        angle_error = min(angle_error, 2*np.pi - angle_error)  # Normalize to [0, pi]
+        
+        # Define stopping criteria - both position and orientation must be satisfied
+        position_tolerance = 0.05  # 5cm position tolerance
+        orientation_tolerance = 0.1  # ~5.7 degrees orientation tolerance
+        
+        # Check if robot should continue moving or stop
+        position_reached = distance_error <= position_tolerance
+        orientation_reached = angle_error <= orientation_tolerance
+        
+        # Calculate approach phase scaling factors for smooth stopping
+        # Define approach zones for velocity scaling
+        approach_distance = 0.15  # Start slowing down at 15cm
+        fine_approach_distance = 0.08  # Further slow down at 8cm
+        
+        # Position-based velocity scaling
+        if distance_error <= position_tolerance:
+            position_scale = 0.0  # Stop position movement
+        elif distance_error <= fine_approach_distance:
+            # Very fine approach - scale down to 10-20% speed
+            position_scale = 0.1 + 0.1 * (distance_error - position_tolerance) / (fine_approach_distance - position_tolerance)
+        elif distance_error <= approach_distance:
+            # Approach phase - scale down to 20-60% speed
+            position_scale = 0.2 + 0.4 * (distance_error - fine_approach_distance) / (approach_distance - fine_approach_distance)
+        else:
+            # Normal movement - full speed
+            position_scale = 1.0
+            
+        # Orientation-based velocity scaling
+        if angle_error <= orientation_tolerance:
+            orientation_scale = 0.0  # Stop rotational movement
+        elif angle_error <= 0.2:  # ~11.5 degrees
+            # Fine orientation adjustment - scale down to 15-40% speed
+            orientation_scale = 0.15 + 0.25 * (angle_error - orientation_tolerance) / (0.2 - orientation_tolerance)
+        elif angle_error <= 0.4:  # ~23 degrees
+            # Orientation approach - scale down to 40-70% speed
+            orientation_scale = 0.4 + 0.3 * (angle_error - 0.2) / (0.4 - 0.2)
+        else:
+            # Large orientation error - full speed
+            orientation_scale = 1.0
+        
+        if not position_reached and not self.pickup_complete:
             # Find the closest point in the trajectory to the current position
             min_dist = float('inf')
             closest_idx = 0
@@ -277,7 +321,7 @@ class PickupController(Node):
             
             # Add cross-track error correction for the first reference point
             # This helps the robot converge to the path instead of running parallel
-            cross_track_gain = 0.5
+            cross_track_gain = 0.5  # Reduced gain to avoid infeasible reference adjustments
             if closest_idx < len(self.trajectory_data) - 1:
                 # Calculate cross-track error
                 closest_point = self.trajectory_data[closest_idx]
@@ -300,11 +344,32 @@ class PickupController(Node):
                     # Cross-track error (perpendicular distance to path)
                     cross_track_error = robot_dx * (-path_unit_y) + robot_dy * path_unit_x
                     
-                    # Adjust first reference point to reduce cross-track error
-                    ref_array[0, 0] = ref_array[0, 0] - cross_track_gain * cross_track_error * (-path_unit_y)
-                    ref_array[1, 0] = ref_array[1, 0] - cross_track_gain * cross_track_error * path_unit_x
-                
-            
+                    # Check if robot is moving parallel to path (not converging)
+                    if abs(cross_track_error - self.last_cross_track_error) < 0.01:  # More tolerant threshold
+                        self.parallel_count += 1
+                    else:
+                        self.parallel_count = 0
+                    
+                    self.last_cross_track_error = cross_track_error
+                    
+                    # If robot has been parallel for too long, increase convergence slightly
+                    if self.parallel_count > 8:  # Increased threshold
+                        cross_track_gain = 1.0  # Only double the gain
+                        print(f"Robot parallel to path for {self.parallel_count} steps, increasing convergence gain")
+                    
+                    # Limit the cross-track correction to avoid infeasible references
+                    max_correction = 0.1  # Maximum 10cm correction
+                    correction_x = -cross_track_gain * cross_track_error * (-path_unit_y)
+                    correction_y = -cross_track_gain * cross_track_error * path_unit_x
+                    
+                    # Clamp corrections
+                    correction_x = np.clip(correction_x, -max_correction, max_correction)
+                    correction_y = np.clip(correction_y, -max_correction, max_correction)
+                    
+                    # Adjust only the first reference point (less aggressive)
+                    ref_array[0, 0] = ref_array[0, 0] + correction_x
+                    ref_array[1, 0] = ref_array[1, 0] + correction_y
+
             # Apply MPC to get control inputs
             with self.state_lock:
                 current_state = self.current_state.copy()
@@ -313,14 +378,45 @@ class PickupController(Node):
                 self.mpc.set_reference_trajectory(ref_array)
                 u = self.mpc.update(current_state)
                 
+                # Apply velocity scaling for smooth approach to target
+                raw_linear_vel = u[0, 0]
+                raw_angular_vel = u[1, 0]
+                
+                # Scale velocities based on distance to target and orientation error
+                scaled_linear_vel = raw_linear_vel * position_scale
+                scaled_angular_vel = raw_angular_vel * orientation_scale
+                
+                # Apply minimum velocity constraints for very close approach
+                # When both position and orientation are very close, reduce both velocities
+                if distance_error <= fine_approach_distance and angle_error <= 0.2:
+                    # Very close to target - limit both velocities more aggressively
+                    max_approach_linear = 0.02  # 2cm/s max when very close
+                    max_approach_angular = 0.1  # 0.1 rad/s max when very close
+                    
+                    scaled_linear_vel = np.clip(scaled_linear_vel, -max_approach_linear, max_approach_linear)
+                    scaled_angular_vel = np.clip(scaled_angular_vel, -max_approach_angular, max_approach_angular)
+                
                 # Send control commands
                 cmd_msg = Twist()
-                cmd_msg.linear.x = u[0]
-                cmd_msg.angular.z = u[1]
+                cmd_msg.linear.x = scaled_linear_vel
+                cmd_msg.angular.z = scaled_angular_vel
                 self.cmd_vel_pub.publish(cmd_msg)
+                
+                # Debug output for velocity scaling
+                if distance_error < approach_distance or angle_error < 0.4:
+                    print(f'Approach mode: dist={distance_error:.3f}m, angle={angle_error:.3f}rad')
+                    print(f'Scales: pos={position_scale:.2f}, orient={orientation_scale:.2f}')
+                    print(f'Velocities: raw_v={raw_linear_vel:.3f}, scaled_v={scaled_linear_vel:.3f}')
+                    print(f'            raw_w={raw_angular_vel:.3f}, scaled_w={scaled_angular_vel:.3f}')
+                
+                # Get predicted trajectory for error analysis
+                predicted_traj = self.mpc.get_predicted_trajectory()
+                
+                # Calculate and output tracking errors
+                self.calculate_and_output_errors(ref_array, predicted_traj, current_state)
+                
                 print(f'Published cmd_vel: linear.x={cmd_msg.linear.x}, angular.z={cmd_msg.angular.z}') 
                 # Publish predicted trajectory for visualization
-                predicted_traj = self.mpc.get_predicted_trajectory()
                 self.predicted_path.poses = []
                 
                 for i in range(self.prediction_horizon + 1):
@@ -403,24 +499,102 @@ class PickupController(Node):
         except Exception as e:
             self.get_logger().error(f'Service call for parcel spawn failed: {str(e)}')
 
+    def calculate_and_output_errors(self, ref_array, predicted_traj, current_state):
+        """Calculate and output tracking errors for reference vs predicted trajectory"""
+        
+        # Current position error
+        current_pos_error = np.sqrt((current_state[0] - ref_array[0, 0])**2 + 
+                                   (current_state[1] - ref_array[1, 0])**2)
+        current_angle_error = abs(current_state[2] - ref_array[2, 0])
+        # Normalize angle error to [-pi, pi]
+        current_angle_error = min(current_angle_error, 2*np.pi - current_angle_error)
+        
+        # Predicted trajectory errors at different horizons
+        pos_errors = []
+        angle_errors = []
+        
+        for i in range(min(predicted_traj.shape[1], ref_array.shape[1])):
+            pos_err = np.sqrt((predicted_traj[0, i] - ref_array[0, i])**2 + 
+                             (predicted_traj[1, i] - ref_array[1, i])**2)
+            angle_err = abs(predicted_traj[2, i] - ref_array[2, i])
+            # Normalize angle error to [-pi, pi]
+            angle_err = min(angle_err, 2*np.pi - angle_err)
+            
+            pos_errors.append(pos_err)
+            angle_errors.append(angle_err)
+        
+        # Terminal error (at the end of prediction horizon)
+        if len(pos_errors) > 0:
+            terminal_pos_error = pos_errors[-1]
+            terminal_angle_error = angle_errors[-1]
+        else:
+            terminal_pos_error = 0.0
+            terminal_angle_error = 0.0
+        
+        # Average errors over prediction horizon
+        avg_pos_error = np.mean(pos_errors) if pos_errors else 0.0
+        avg_angle_error = np.mean(angle_errors) if angle_errors else 0.0
+        
+        # Output comprehensive error information
+        print("="*60)
+        print(f"TRACKING ERRORS - Parcel {self.current_parcel_index}")
+        print("-"*60)
+        print(f"Current State: pos=({current_state[0]:.3f}, {current_state[1]:.3f}), θ={current_state[2]:.3f}")
+        print(f"Reference[0]: pos=({ref_array[0, 0]:.3f}, {ref_array[1, 0]:.3f}), θ={ref_array[2, 0]:.3f}")
+        print(f"Predicted[0]: pos=({predicted_traj[0, 0]:.3f}, {predicted_traj[1, 0]:.3f}), θ={predicted_traj[2, 0]:.3f}")
+        print("-"*60)
+        print(f"CURRENT ERRORS:")
+        print(f"  Position Error: {current_pos_error:.4f} m")
+        print(f"  Angle Error:    {current_angle_error:.4f} rad ({np.degrees(current_angle_error):.1f}°)")
+        print("-"*60)
+        print(f"PREDICTION HORIZON ERRORS:")
+        print(f"  Avg Position Error:      {avg_pos_error:.4f} m")
+        print(f"  Avg Angle Error:         {avg_angle_error:.4f} rad ({np.degrees(avg_angle_error):.1f}°)")
+        print(f"  Terminal Position Error: {terminal_pos_error:.4f} m")
+        print(f"  Terminal Angle Error:    {terminal_angle_error:.4f} rad ({np.degrees(terminal_angle_error):.1f}°)")
+        
+        # Distance to final target
+        target_distance = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
+                                 (current_state[1] - self.target_pose[1])**2)
+        print(f"  Distance to Target:      {target_distance:.4f} m")
+        print("="*60)
+        
+        # Log critical errors
+        if current_pos_error > 0.1:
+            self.get_logger().warn(f'High position error: {current_pos_error:.3f}m')
+        if current_angle_error > 0.3:  # ~17 degrees
+            self.get_logger().warn(f'High angle error: {np.degrees(current_angle_error):.1f}°')
+        if terminal_pos_error > 0.05:
+            self.get_logger().warn(f'High terminal position error: {terminal_pos_error:.3f}m')
+
 
 class MobileRobotMPC:
     def __init__(self):
+        # Physical parameters from TurtleBot3 model.sdf
+        self.wheel_radius = 0.033      # m - from SDF
+        self.wheel_separation = 0.160  # m - from SDF
+        self.robot_mass = 1.0          # kg - approximate total mass
+        
         # MPC parameters
-        self.N = 10           # Prediction horizon
-        self.N_c = 3          # Control horizon - set to 3 as requested
-        self.dt = 0.1         # Time step
+        self.N = 10         # Prediction horizon for pickup operations
+        self.N_c = 1        # Control horizon - return single control step
+        self.dt = 0.1       # Time step
         
-        # Tuned weights for better tracking performance
-        self.Q = np.diag([30.0, 30.0, 8.0])  # State weights (x, y, theta) - higher for precise tracking
-        self.R = np.diag([0.03, 0.01])          # Control input weights - low to allow necessary movements
-        self.F = np.diag([200.0, 200.0, 20.0])  # Terminal cost weights - very high for final convergence
+        # Weights optimized for pickup operations (position and orientation control)
+        self.Q = np.diag([50.0, 50.0, 15.0])  # State weights (x, y, theta) - balanced for pickup
+        # Control input weights - allow more aggressive control for pickup
+        self.R = np.diag([0.05, 0.02])        # Lower weights for more responsive control
+        # Terminal cost weights - important for precise positioning in pickup
+        self.F = np.diag([100.0, 100.0, 30.0])  # Higher terminal weights for accuracy
         
-        # Velocity constraints - slightly increased for better responsiveness
-        self.max_vel = 0.2      # m/s - increased for faster convergence
-        self.min_vel = -0.2     # m/s - allowing backward movement if needed
-        self.max_omega = 1.0    # rad/s - increased for more responsive turning
-        self.min_omega = -1.0   # rad/s
+        # Velocity constraints for pickup operations (allow backward movement)
+        self.max_vel = 0.15      # m/s - conservative for precise pickup
+        self.min_vel = -0.10     # m/s - allow backward movement for pickup
+        # Angular velocity limit based on wheel constraints
+        max_wheel_speed = self.max_vel / self.wheel_radius  # rad/s
+        max_angular_vel = max_wheel_speed * self.wheel_radius / (self.wheel_separation / 2)
+        self.max_omega = min(np.pi/2, max_angular_vel * 0.8)  # Conservative limit
+        self.min_omega = -self.max_omega
         
         # System dimensions
         self.nx = 3   # Number of states (x, y, theta)
@@ -429,9 +603,8 @@ class MobileRobotMPC:
         # Reference trajectory
         self.ref_traj = None
         
-        # Variables for control sequence storage
-        self.control_sequence = None
-        self.control_step = 0
+        # Solver cache for warm starting
+        self.last_solution = None
         
         # Initialize MPC
         self.setup_mpc()
@@ -441,163 +614,206 @@ class MobileRobotMPC:
         self.opti = ca.Opti()
         
         # Decision variables
-        self.X = self.opti.variable(self.nx, self.N+1)  # State trajectory
+        self.X = self.opti.variable(self.nx, self.N+1)  # State trajectory (N+1 states)
         self.U = self.opti.variable(self.nu, self.N)    # Control trajectory
         
         # Parameters
         self.x0 = self.opti.parameter(self.nx)          # Initial state
         self.ref = self.opti.parameter(self.nx, self.N+1)  # Reference trajectory
 
-        # Cost function
+        # Cost function with increasing weights toward the end (Follow_controller style)
         cost = 0
         for k in range(self.N):
-            # Progressive weight factor that increases towards the end of horizon
-            weight_factor = 1.0 + 2.0 * k / self.N  # Increases from 1.0 to 3.0
+            # Increasing weight factor as we progress along horizon (helps convergence)
+            weight_factor = 1.0 + 3.0 * k / self.N  # Increases from 1.0 to 4.0
             
-            # Position error (x,y) - heavily weighted for precise tracking
+            # Position error (x,y) - heavily weighted for precise pickup
             pos_error = self.X[:2, k] - self.ref[:2, k]
             cost += weight_factor * ca.mtimes([pos_error.T, self.Q[:2,:2], pos_error])
             
-            # Orientation (theta) - separately weighted with angle normalization
+            # Orientation (theta) - separately weighted for good heading tracking
             theta_error = self.X[2, k] - self.ref[2, k]
-            # Normalize angle difference to [-pi, pi] to handle angle wrapping properly
-            theta_error = ca.atan2(ca.sin(theta_error), ca.cos(theta_error))
+            # Normalize angle difference to [-pi, pi] to avoid issues with angle wrapping
+            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi
             cost += weight_factor * self.Q[2,2] * theta_error**2
             
-            # Control effort penalty - small to allow necessary movements
-            control_effort = self.U[:, k]
-            cost += ca.mtimes([control_effort.T, self.R, control_effort])
+            # Control cost (decreased for better tracking)
+            control_error = self.U[:, k]
+            cost += ca.mtimes([control_error.T, self.R, control_error])
             
+            # Penalize large changes in angular velocity for smoother motion
+            if k > 0:
+                omega_change = self.U[1, k] - self.U[1, k-1]
+                cost += 0.1 * omega_change**2
             
             # Dynamics constraints
             x_next = self.robot_model(self.X[:, k], self.U[:, k])
             self.opti.subject_to(self.X[:, k+1] == x_next)
 
-        # Terminal cost - very high weight to ensure convergence to final target
-        terminal_pos_error = self.X[:2, -1] - self.ref[:2, -1]
-        terminal_theta_error = self.X[2, -1] - self.ref[2, -1]
-        terminal_theta_error = ca.atan2(ca.sin(terminal_theta_error), ca.cos(terminal_theta_error))
+        # Strong terminal cost for precise pickup positioning
+        pos_terminal_error = self.X[:2, -1] - self.ref[:2, -1]
+        cost += 5.0 * ca.mtimes([pos_terminal_error.T, self.F[:2,:2], pos_terminal_error])
         
-        cost += 200.0 * ca.mtimes([terminal_pos_error.T, terminal_pos_error])  # Very high position weight
-        cost += 50.0 * terminal_theta_error**2  # High orientation weight
+        # Terminal orientation error with normalization
+        theta_terminal_error = self.X[2, -1] - self.ref[2, -1]
+        theta_terminal_error = ca.fmod(theta_terminal_error + ca.pi, 2*ca.pi) - ca.pi
+        cost += 5.0 * self.F[2,2] * theta_terminal_error**2
 
         # Constraints
         self.opti.subject_to(self.X[:, 0] == self.x0)  # Initial condition
         
-        # Velocity and angular velocity constraints
+        # Velocity and angular velocity constraints (allow backward for pickup)
         self.opti.subject_to(self.opti.bounded(self.min_vel, self.U[0, :], self.max_vel))
         self.opti.subject_to(self.opti.bounded(self.min_omega, self.U[1, :], self.max_omega))
 
-        # Solver settings
+        # Solver settings optimized for pickup operations
         self.opti.minimize(cost)
-        opts = {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.max_iter': 100, 'ipopt.tol': 1e-4}
+        opts = {
+            'ipopt.print_level': 0, 
+            'print_time': 0, 
+            'ipopt.max_iter': 150,
+            'ipopt.tol': 1e-4,
+            'ipopt.acceptable_tol': 1e-3,
+            'ipopt.warm_start_init_point': 'yes',
+            'ipopt.mu_strategy': 'adaptive',
+            'ipopt.hessian_approximation': 'limited-memory',
+            'ipopt.limited_memory_max_history': 5,
+            'ipopt.linear_solver': 'mumps'
+        }
         self.opti.solver('ipopt', opts)
 
     def robot_model(self, x, u):
-        """ System dynamics: x_next = f(x, u) """
+        """ 
+        Simple system dynamics for TurtleBot3 differential drive robot (3-state model)
+        x = [x, y, theta] - robot pose
+        u = [v, omega] - linear and angular velocity commands
+        """
         return ca.vertcat(
             x[0] + u[0] * ca.cos(x[2]) * self.dt,  # x position
             x[1] + u[0] * ca.sin(x[2]) * self.dt,  # y position
-            x[2] + u[1] * self.dt             # theta                                
+            x[2] + u[1] * self.dt,                 # theta
         )
 
+    def validate_and_adjust_reference(self, ref_traj, current_state):
+        """
+        Validate reference trajectory against TurtleBot3 physical constraints
+        and adjust if necessary to ensure feasibility
+        """
+        if ref_traj is None or ref_traj.shape[1] < 2:
+            return ref_traj
+            
+        adjusted_ref = ref_traj.copy()
+        
+        # Check and adjust for maximum velocity constraints
+        for k in range(ref_traj.shape[1] - 1):
+            # Calculate required velocity between consecutive points
+            dx = ref_traj[0, k+1] - ref_traj[0, k]
+            dy = ref_traj[1, k+1] - ref_traj[1, k]
+            dtheta = ref_traj[2, k+1] - ref_traj[2, k]
+            
+            # Required linear velocity
+            required_v = np.sqrt(dx**2 + dy**2) / self.dt
+            # Required angular velocity
+            required_omega = abs(dtheta) / self.dt
+            
+            # If required velocity exceeds limits, adjust the trajectory
+            if required_v > self.max_vel:
+                scale_factor = self.max_vel / required_v
+                adjusted_ref[0, k+1] = ref_traj[0, k] + dx * scale_factor
+                adjusted_ref[1, k+1] = ref_traj[1, k] + dy * scale_factor
+                print(f"Adjusted reference point {k+1} for velocity constraint")
+                
+            if required_omega > self.max_omega:
+                scale_factor = self.max_omega / required_omega
+                angle_diff = dtheta * scale_factor
+                adjusted_ref[2, k+1] = ref_traj[2, k] + angle_diff
+                print(f"Adjusted reference point {k+1} for angular velocity constraint")
+        
+        return adjusted_ref
+
     def set_reference_trajectory(self, ref_traj):
-        self.ref_traj = ref_traj
+        # Validate and adjust reference trajectory before setting
+        if ref_traj is not None:
+            current_state = np.zeros(3)  # Will be set properly in update()
+            self.ref_traj = self.validate_and_adjust_reference(ref_traj, current_state)
+        else:
+            self.ref_traj = ref_traj
 
     def update(self, current_state):
-        # Check if we already have a valid control sequence
-        if self.control_sequence is not None:
-            # Get the next control input from the sequence
-            u = self.control_sequence[:, self.control_step]
-            
-            # Increment control step
-            self.control_step += 1
-            
-            # If we've used all steps in control horizon, reset
-            if self.control_step >= self.N_c:
-                self.control_sequence = None
-                self.control_step = 0
-                
-            # Return the control input
-            return u
-            
-        # If no valid control sequence, solve the MPC problem
         self.opti.set_value(self.x0, current_state)
         self.opti.set_value(self.ref, self.ref_traj)
         
-        # Provide good initial guess for states and controls
-        if hasattr(self, 'last_solution_X') and hasattr(self, 'last_solution_U'):
-            try:
-                # Warm start with shifted previous solution
-                X_guess = np.zeros((3, self.N + 1))
-                U_guess = np.zeros((2, self.N))
-                
-                # Shift previous state solution
-                X_guess[:, :-1] = self.last_solution_X[:, 1:]
-                X_guess[:, -1] = self.last_solution_X[:, -1]  # Hold last state
-                
-                # Shift previous control solution
-                U_guess[:, :-1] = self.last_solution_U[:, 1:]
-                U_guess[:, -1] = self.last_solution_U[:, -1]  # Hold last control
-                
-                self.opti.set_initial(self.X, X_guess)
-                self.opti.set_initial(self.U, U_guess)
-            except:
-                pass  # If warm start fails, proceed without it
+        # Set initial guess for warm starting if available
+        if self.last_solution is not None:
+            # Shift previous solution forward as initial guess
+            u_init = np.zeros((self.nu, self.N))
+            x_init = np.zeros((self.nx, self.N+1))
+            
+            # Copy last N-1 control inputs and append last control input
+            u_init[:, :self.N-1] = self.last_solution['u'][:, 1:]
+            u_init[:, self.N-1] = self.last_solution['u'][:, self.N-1] 
+            
+            # Copy last N states and propagate final state
+            x_init[:, :self.N] = self.last_solution['x'][:, 1:]
+            x_init[:, self.N] = self.robot_model_np(x_init[:, self.N-1], u_init[:, self.N-1])
+            
+            # Set the initial guess
+            self.opti.set_initial(self.X, x_init)
+            self.opti.set_initial(self.U, u_init)
         
         try:
             sol = self.opti.solve()
             
-            # Store solution for warm starting next iteration
-            self.last_solution_X = sol.value(self.X)
-            self.last_solution_U = sol.value(self.U)
+            # Store solution for warm starting next time
+            self.last_solution = {
+                'u': sol.value(self.U),
+                'x': sol.value(self.X)
+            }
             
-            # Store the full control sequence for future use
-            self.control_sequence = sol.value(self.U)
-            self.control_step = 1  # We return the first value and start at 1 for next time
-            
-            # Log tracking performance
-            pos_error = np.linalg.norm(current_state[:2] - self.ref_traj[:2, 0])
-            if pos_error > 0.1:  # Only log if error is significant
-                print(f"MPC tracking - Position error: {pos_error:.3f}m")
-            
-            return sol.value(self.U)[:, 0]  # Return first control input
-            
+            # Return single control step for pickup operations
+            return sol.value(self.U)[:, :self.N_c]
         except Exception as e:
-            print(f"MPC Solver failed: {str(e)}")
-            # Return a safe control input that tries to reduce position error
-            if self.ref_traj is not None:
-                # Simple proportional controller as fallback
-                pos_error = current_state[:2] - self.ref_traj[:2, 0]
-                error_magnitude = np.linalg.norm(pos_error)
+            print(f"Pickup MPC Solver failed: {str(e)}")
+            # Return simple fallback control for pickup
+            if self.ref_traj is not None and self.ref_traj.shape[1] > 0:
+                ref_point = self.ref_traj[:, 0]
+                dx = ref_point[0] - current_state[0]
+                dy = ref_point[1] - current_state[1]
+                dtheta = ref_point[2] - current_state[2]
+                dtheta = np.arctan2(np.sin(dtheta), np.cos(dtheta))
                 
-                if error_magnitude > 0.01:  # Avoid division by zero
-                    # Calculate desired velocity direction
-                    direction = -pos_error / error_magnitude
-                    # Limit velocity magnitude
-                    velocity = min(0.1, error_magnitude * 2.0)
-                    
-                    # Calculate angle to target
-                    target_angle = np.arctan2(direction[1], direction[0])
-                    angle_error = target_angle - current_state[2]
-                    
-                    # Normalize angle error
-                    while angle_error > np.pi:
-                        angle_error -= 2 * np.pi
-                    while angle_error < -np.pi:
-                        angle_error += 2 * np.pi
-                    
-                    # Proportional control for angular velocity
-                    angular_velocity = np.clip(angle_error * 2.0, -0.5, 0.5)
-                    
-                    return np.array([velocity, angular_velocity])
-                else:
-                    return np.zeros(self.nu)
+                distance = np.sqrt(dx**2 + dy**2)
+                desired_heading = np.arctan2(dy, dx)
+                heading_error = desired_heading - current_state[2]
+                heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
+                
+                # Simple P controller for pickup with backward capability
+                if distance > 0.1:  # Far from target
+                    v = 0.8 * distance * np.cos(heading_error)  # Allow backward if needed
+                    v = np.clip(v, self.min_vel, self.max_vel)
+                else:  # Close to target, focus on orientation
+                    v = 0.0
+                
+                omega = 2.0 * heading_error + 1.0 * dtheta  # Combined heading and orientation correction
+                omega = np.clip(omega, self.min_omega, self.max_omega)
+                
+                return np.array([[v], [omega]])
             else:
-                return np.zeros(self.nu)
+                return np.zeros((self.nu, self.N_c))
+    
+    def robot_model_np(self, x, u):
+        """System dynamics in numpy for warm starting (3-state model)"""
+        return np.array([
+            x[0] + u[0] * np.cos(x[2]) * self.dt,  # x position
+            x[1] + u[0] * np.sin(x[2]) * self.dt,  # y position
+            x[2] + u[1] * self.dt,                 # theta
+        ])
 
     def get_predicted_trajectory(self):
-        return self.opti.debug.value(self.X)
+        try:
+            return self.opti.debug.value(self.X)
+        except:
+            return np.zeros((self.nx, self.N+1))
 
 
 def main(args=None):

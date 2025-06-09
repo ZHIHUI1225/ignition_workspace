@@ -29,7 +29,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.current_robot_pose = None
         self.current_parcel_pose = None
         self.proximity_threshold = 0.5  # meters
-        self.robot_namespace = "tb0"  # Default, will be updated from blackboard
+        self.robot_namespace = "turtlebot0"  # Default, will be updated from blackboard
         
     def setup(self, **kwargs):
         """Setup ROS connections"""
@@ -498,7 +498,7 @@ class PrintMessage(py_trees.behaviour.Behaviour):
             print(self.message)
         return py_trees.common.Status.SUCCESS
 
-def create_root():
+def create_root(robot_namespace="tb0"):
     """创建行为树根节点（网页6结构优化版）"""
     root = py_trees.composites.Sequence(name="MainSequence", memory=True)
     
@@ -533,8 +533,8 @@ def create_root():
     # Pushing序列（网页5 XML结构转代码）- 直接调用类
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
-        WaitAction("WaitingPush", 3.0),
-        ApproachObject("ApproachingPush"),
+        WaitAction("WaitingPush", 3.0, robot_namespace),
+        ApproachObject("ApproachingPush", robot_namespace),
         PushObject("Pushing"),
         MoveBackward("BackwardToSafeDistance")
     ])
@@ -542,7 +542,7 @@ def create_root():
     # PickingUp序列（网页3巡逻任务参考）- 直接调用类
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
-        WaitAction("WaitingPick", 2.0),
+        WaitAction("WaitingPick", 2.0, robot_namespace),
         ReplanPath("Replanning", 2.0),
         PickObject("PickingUp"),
         StopSystem("Stop", 1.5)

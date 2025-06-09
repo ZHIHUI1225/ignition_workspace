@@ -4,10 +4,7 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger # Changed from Bool
 import json
 import os
-# spawn_listener.py
-import rclpy
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
-from rclpy.node import Node
 import subprocess
 
 class SpawnListener(Node):

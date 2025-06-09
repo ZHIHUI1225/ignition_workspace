@@ -3,20 +3,22 @@
 Basic behavior classes for the behavior tree system.
 Contains utility behaviors like waiting, resetting, and message printing.
 """
-
 import py_trees
-import time
+import py_trees.behaviour
+import py_trees.common
+import py_trees.blackboard
 import rclpy
+import time
+import math
+import re
+import threading
+import casadi as ca
+import numpy as np
+import tf_transformations
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Int32
-import math
-import threading
-import tf_transformations as tf
-import casadi as ca
-import numpy as np
-import threading
+from std_msgs.msg import Int32, Float64
 
 
 class ResetFlags(py_trees.behaviour.Behaviour):
@@ -30,10 +32,15 @@ class ResetFlags(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
-class WaitAction(py_trees.behaviour.Behaviour):
-    """Wait action behavior - improved version with pose monitoring and proximity checking"""
+class WaitForPush(py_trees.behaviour.Behaviour):
+    """
+    Wait behavior for pushing phase - waits for parcel to be near relay point.
+    Success condition: 
+    1. Parcel is within distance threshold of relay point AND
+    2. For non-turtlebot0 robots: last robot is OUT of relay point range
+    """
     
-    def __init__(self, name, duration, robot_namespace="tb0", distance_threshold=0.08):
+    def __init__(self, name, duration=10.0, robot_namespace="turtlebot0", distance_threshold=0.08):
         super().__init__(name)
         self.duration = duration
         self.start_time = 0
@@ -44,7 +51,408 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.namespace_number = self.extract_namespace_number(robot_namespace)
         self.relay_number = self.namespace_number  # Relay point is tb{i} -> Relaypoint{i}
         
-        # Initialize ROS2 node if not already created
+        # Determine last robot (previous robot in sequence)
+        self.last_robot_number = self.namespace_number - 1 if self.namespace_number > 0 else None
+        self.is_first_robot = (self.robot_namespace == "turtlebot0")
+        
+        # ROS2 components (will be initialized in setup)
+        self.node = None
+        self.robot_pose_sub = None
+        self.relay_pose_sub = None
+        self.parcel_pose_sub = None
+        self.last_robot_pose_sub = None
+        
+        # Pose storage
+        self.robot_pose = None
+        self.relay_pose = None
+        self.parcel_pose = None
+        self.last_robot_pose = None  # New: track last robot position
+        self.current_parcel_index = 0
+        
+        # Setup blackboard access for namespaced current_parcel_index
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index", 
+            access=py_trees.common.Access.READ
+        )
+        
+    def extract_namespace_number(self, namespace):
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
+        return int(match.group(1)) if match else 0
+    
+    def setup_subscriptions(self):
+        """Setup ROS2 subscriptions"""
+        # Robot pose subscription
+        self.robot_pose_sub = self.node.create_subscription(
+            Odometry,
+            f'/turtlebot{self.namespace_number}/odom_map',
+            self.robot_pose_callback,
+            10
+        )
+        
+        # Relay point pose subscription
+        self.relay_pose_sub = self.node.create_subscription(
+            PoseStamped,
+            f'/Relaypoint{self.relay_number}/pose',
+            self.relay_pose_callback,
+            10
+        )
+        
+        # Last robot pose subscription (only for non-turtlebot0 robots)
+        self.last_robot_pose_sub = None
+        if not self.is_first_robot and self.last_robot_number is not None:
+            self.last_robot_pose_sub = self.node.create_subscription(
+                Odometry,
+                f'/turtlebot{self.last_robot_number}/odom_map',
+                self.last_robot_pose_callback,
+                10
+            )
+        
+        # Initial parcel subscription
+        self.parcel_pose_sub = None
+        self.update_parcel_subscription()
+    
+    def robot_pose_callback(self, msg):
+        """Callback for robot pose updates"""
+        self.robot_pose = msg.pose.pose
+    
+    def relay_pose_callback(self, msg):
+        """Callback for relay point pose updates"""
+        self.relay_pose = msg
+    
+    def last_robot_pose_callback(self, msg):
+        """Callback for last robot pose updates"""
+        self.last_robot_pose = msg.pose.pose
+    
+    def parcel_pose_callback(self, msg):
+        """Callback for parcel pose updates"""
+        self.parcel_pose = msg
+        print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
+    
+    def update_parcel_subscription(self):
+        """Update parcel pose subscription based on current index"""
+        # Skip if node is not yet initialized
+        if self.node is None:
+            return
+            
+        # Read current_parcel_index from namespaced blackboard using registered client
+        try:
+            # Use the blackboard client to access the namespaced variable
+            global_blackboard = py_trees.blackboard.Client()
+            current_index = global_blackboard.get(f'{self.robot_namespace}/current_parcel_index')
+        except (KeyError, AttributeError):
+            # If key doesn't exist, use default value 0
+            current_index = 0
+        
+        # Only update subscription if the index has actually changed
+        if current_index != self.current_parcel_index or self.parcel_pose_sub is None:
+            old_index = self.current_parcel_index
+            self.current_parcel_index = current_index
+            print(f"[{self.name}] Updated parcel index from blackboard: {old_index} -> {self.current_parcel_index}")
+            
+            # Destroy old subscription if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                print(f"[{self.name}] DEBUG: Destroyed old parcel subscription")
+            
+            # Create new subscription for the updated index
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped,
+                f'/parcel{self.current_parcel_index}/pose',
+                self.parcel_pose_callback,
+                10
+            )
+            print(f"[{self.name}] DEBUG: Created subscription to /parcel{self.current_parcel_index}/pose")
+    
+    def calculate_distance(self, pose1, pose2):
+        """Calculate Euclidean distance between two poses"""
+        if pose1 is None or pose2 is None:
+            return float('inf')
+        
+        # Handle different pose message types
+        if hasattr(pose1, 'pose'):
+            pos1 = pose1.pose.position
+        else:
+            pos1 = pose1.position
+            
+        if hasattr(pose2, 'pose'):
+            pos2 = pose2.pose.position
+        else:
+            pos2 = pose2.position
+        
+        dx = pos1.x - pos2.x
+        dy = pos1.y - pos2.y
+        return math.sqrt(dx*dx + dy*dy)
+    
+    def check_parcel_in_relay_range(self):
+        """Check if parcel is within range of relay point"""
+        if self.parcel_pose is None or self.relay_pose is None:
+            return False
+        
+        distance = self.calculate_distance(self.parcel_pose, self.relay_pose)
+        return distance <= self.distance_threshold
+    
+    def check_last_robot_out_of_relay_range(self):
+        """Check if last robot is OUT of relay point range"""
+        # For turtlebot0 (first robot), this condition is always satisfied
+        if self.is_first_robot:
+            return True
+        
+        # For other robots, check if last robot is out of range
+        if self.last_robot_pose is None or self.relay_pose is None:
+            return False  # If we can't determine, assume not satisfied
+        
+        distance = self.calculate_distance(self.last_robot_pose, self.relay_pose)
+        is_out_of_range = distance > self.distance_threshold
+        return is_out_of_range
+    
+    def check_success_conditions(self):
+        """Check if all success conditions are met"""
+        parcel_in_range = self.check_parcel_in_relay_range()
+        last_robot_out = self.check_last_robot_out_of_relay_range()
+        
+        return parcel_in_range and last_robot_out
+    
+    def initialise(self):
+        self.start_time = time.time()
+        # Dynamic feedback message that includes current status
+        self.feedback_message = f"PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
+        print(f"[{self.name}] Starting PUSH wait for {self.duration}s...")
+        print(f"[{self.name}] Monitoring parcel{self.current_parcel_index} -> Relaypoint{self.relay_number}")
+        if not self.is_first_robot:
+            print(f"[{self.name}] Also monitoring that last robot (tb{self.last_robot_number}) is out of relay range")
+        
+        # Check current conditions at initialization
+        parcel_in_range = self.check_parcel_in_relay_range()
+        last_robot_out = self.check_last_robot_out_of_relay_range()
+        print(f"[{self.name}] Initial conditions - Parcel in range: {parcel_in_range}, Last robot out: {last_robot_out}")
+    
+    def update(self) -> py_trees.common.Status:
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
+        
+        # Update parcel subscription from blackboard
+        self.update_parcel_subscription()
+        
+        elapsed = time.time() - self.start_time
+        
+        # Check both success conditions
+        if self.check_success_conditions():
+            print(f"[{self.name}] SUCCESS: All conditions met for PUSH!")
+            print(f"[{self.name}] - Parcel{self.current_parcel_index} is near Relaypoint{self.relay_number}")
+            if not self.is_first_robot:
+                print(f"[{self.name}] - Last robot (tb{self.last_robot_number}) is out of relay range")
+            return py_trees.common.Status.SUCCESS
+        
+        # Timeout condition - FAILURE if conditions not met
+        if elapsed >= self.duration:
+            print(f"[{self.name}] TIMEOUT: PUSH wait FAILED - conditions not satisfied")
+            parcel_in_range = self.check_parcel_in_relay_range()
+            last_robot_out = self.check_last_robot_out_of_relay_range()
+            print(f"[{self.name}] - Parcel in range: {parcel_in_range}")
+            print(f"[{self.name}] - Last robot out of range: {last_robot_out}")
+            return py_trees.common.Status.FAILURE
+        
+        # Status update with detailed information
+        parcel_relay_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
+        parcel_in_range = self.check_parcel_in_relay_range()
+        last_robot_out = self.check_last_robot_out_of_relay_range()
+        
+        if elapsed % 1.0 < 0.1:  # Print every second
+            print(f"[{self.name}] PUSH wait... {elapsed:.1f}/{self.duration}s")
+            print(f"[{self.name}] - Parcel to relay dist: {parcel_relay_dist:.3f}m (in range: {parcel_in_range})")
+            if not self.is_first_robot:
+                last_robot_dist = self.calculate_distance(self.last_robot_pose, self.relay_pose) if self.last_robot_pose and self.relay_pose else float('inf')
+                print(f"[{self.name}] - Last robot to relay dist: {last_robot_dist:.3f}m (out of range: {last_robot_out})")
+        
+        return py_trees.common.Status.RUNNING
+    
+    def terminate(self, new_status):
+        """Clean up when behavior terminates"""
+        # Don't destroy the shared node here - it's managed by the behavior tree
+        # Just clean up subscriptions if needed
+        if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub:
+            try:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
+            except:
+                pass
+        if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub:
+            try:
+                self.node.destroy_subscription(self.relay_pose_sub)
+                self.relay_pose_sub = None
+            except:
+                pass
+        if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub:
+            try:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
+            except:
+                pass
+        if hasattr(self, 'last_robot_pose_sub') and self.last_robot_pose_sub:
+            try:
+                self.node.destroy_subscription(self.last_robot_pose_sub)
+                self.last_robot_pose_sub = None
+            except:
+                pass
+        super().terminate(new_status)
+    
+    def setup(self, **kwargs):
+        """
+        Setup ROS2 components using shared node from behavior tree.
+        This method is called when the behavior tree is initialized.
+        """
+        # Get the shared ROS node from kwargs or create one if needed
+        if 'node' in kwargs:
+            self.node = kwargs['node']
+        elif not hasattr(self, 'node') or self.node is None:
+            # Create a shared node if one doesn't exist
+            import rclpy
+            if not rclpy.ok():
+                rclpy.init()
+            self.node = rclpy.create_node(f'wait_push_{self.robot_namespace}')
+        
+        # Setup ROS subscriptions now that we have a node
+        self.setup_subscriptions()
+        
+        # Call parent setup
+        return super().setup(**kwargs)
+
+
+class WaitForPick(py_trees.behaviour.Behaviour):
+    """
+    Wait behavior for picking phase.
+    Success condition: 
+    - For turtlebot0 (first robot): Always succeed immediately
+    - For non-turtlebot0 robots: Success only if estimated time from last robot's pushing task was received
+    """
+    
+    def __init__(self, name, duration=2.0, robot_namespace="turtlebot0"):
+        super().__init__(name)
+        self.duration = duration
+        self.start_time = 0
+        self.robot_namespace = robot_namespace
+        
+        # Extract namespace number
+        self.namespace_number = self.extract_namespace_number(robot_namespace)
+        
+        # Multi-robot coordination logic
+        self.is_first_robot = (self.namespace_number == 0)
+        self.last_robot_number = self.namespace_number - 1 if not self.is_first_robot else None
+        
+        # Initialize ROS2 if needed
+        if not rclpy.ok():
+            rclpy.init()
+        
+        # Create node for subscriptions (only for non-turtlebot0 robots)
+        self.node = None
+        if not self.is_first_robot:
+            self.node = rclpy.create_node(f'wait_pick_{robot_namespace}')
+        
+        # Estimated time tracking for non-turtlebot0 robots
+        self.estimated_time_received = True if self.is_first_robot else False
+        self.last_estimated_time = None
+        
+        # Setup subscriptions
+        self.setup_subscriptions()
+        
+    def extract_namespace_number(self, namespace):
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
+        return int(match.group(1)) if match else 0
+    
+    def setup_subscriptions(self):
+        """Setup ROS2 subscriptions only for non-turtlebot0 robots"""
+        if not self.is_first_robot and self.node is not None:
+            self.estimated_time_sub = self.node.create_subscription(
+                Float64,
+                f'/turtlebot{self.last_robot_number}/estimated_time',
+                self.estimated_time_callback,
+                10
+            )
+    
+    def estimated_time_callback(self, msg):
+        """Callback for estimated time from last robot's pushing task"""
+        self.last_estimated_time = msg.data
+        self.estimated_time_received = True
+        print(f"[{self.name}] Received estimated time from tb{self.last_robot_number}: {msg.data:.2f}s")
+    
+    def check_success_conditions(self):
+        """Check if success conditions are met for pick phase"""
+        # For turtlebot0 (first robot): always succeed
+        if self.is_first_robot:
+            return True
+        
+        # For non-turtlebot0 robots: success only if estimated time was received
+        return self.estimated_time_received
+    
+    def initialise(self):
+        """Initialize the behavior when it starts running"""
+        self.start_time = time.time()
+        self.feedback_message = "Waiting for pick phase"
+        print(f"[{self.name}] Starting PICK wait for {self.duration}s...")
+        
+        if self.is_first_robot:
+            print(f"[{self.name}] turtlebot0: Always ready for PICK")
+        else:
+            print(f"[{self.name}] tb{self.namespace_number}: Waiting for estimated time from tb{self.last_robot_number}")
+    
+    def update(self) -> py_trees.common.Status:
+        """Main update method"""
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
+        
+        elapsed = time.time() - self.start_time
+        
+        # Check success conditions
+        if self.check_success_conditions():
+            if self.is_first_robot:
+                print(f"[{self.name}] SUCCESS: turtlebot0 ready for PICK!")
+            else:
+                print(f"[{self.name}] SUCCESS: Estimated time received from tb{self.last_robot_number}, ready for PICK!")
+            return py_trees.common.Status.SUCCESS
+        
+        # Timeout condition - FAILURE if conditions not met
+        if elapsed >= self.duration:
+            if self.is_first_robot:
+                # This should never happen for turtlebot0, but just in case
+                print(f"[{self.name}] WARNING: turtlebot0 timeout (should not happen)")
+                return py_trees.common.Status.SUCCESS
+            else:
+                print(f"[{self.name}] TIMEOUT: PICK wait FAILED - estimated time not received from tb{self.last_robot_number}")
+                return py_trees.common.Status.FAILURE
+        
+        # Status update every second
+        if elapsed % 1.0 < 0.1:  # Print every second
+            if self.is_first_robot:
+                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | turtlebot0 ready")
+            else:
+                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | Est. time received: {self.estimated_time_received}")
+        
+        return py_trees.common.Status.RUNNING
+    
+    def terminate(self, new_status):
+        """Clean up when behavior terminates"""
+        if hasattr(self, 'node') and self.node is not None:
+            self.node.destroy_node()
+        super().terminate(new_status)
+
+
+# Keep the original WaitAction class for backward compatibility
+class WaitAction(py_trees.behaviour.Behaviour):
+    """Wait action behavior - improved version with pose monitoring and proximity checking"""
+    
+    def __init__(self, name, duration, robot_namespace="turtlebot0", distance_threshold=0.08):
+        super().__init__(name)
+        self.duration = duration
+        self.start_time = 0
+        self.robot_namespace = robot_namespace
+        self.distance_threshold = distance_threshold
+        
+        # Extract namespace number for relay point indexing
+        self.namespace_number = self.extract_namespace_number(robot_namespace)
+        self.relay_number = self.namespace_number  # Relay point is tb{i} -> Relaypoint{i}
+        
+        # Initialize ROS2 if not already created
         if not rclpy.ok():
             rclpy.init()
         
@@ -86,9 +494,8 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.update_parcel_subscription()
         
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'tb0' -> 0, 'tb1' -> 1)"""
-        import re
-        match = re.search(r'tb(\d+)', namespace)
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
     def robot_pose_callback(self, msg):
@@ -169,8 +576,7 @@ class WaitAction(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, relay: Relaypoint{self.relay_number}")
     
     def update(self) -> py_trees.common.Status:
-        # Spin ROS2 node to process callbacks
-        rclpy.spin_once(self.node, timeout_sec=0.01)
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
         
         elapsed = time.time() - self.start_time
         
@@ -262,15 +668,26 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
 class IncrementIndex(py_trees.behaviour.Behaviour):
     """Increment current_parcel_index on blackboard"""
     
-    def __init__(self, name):
+    def __init__(self, name, robot_namespace="turtlebot0"):
         super().__init__(name)
+        self.robot_namespace = robot_namespace
+        
+        # Setup blackboard access for namespaced current_parcel_index
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index", 
+            access=py_trees.common.Access.WRITE
+        )
     
     def update(self):
-        blackboard = py_trees.blackboard.Blackboard()
-        current_index = getattr(blackboard, 'current_parcel_index', 0)
-        blackboard.current_parcel_index = current_index + 1
-        print(f"[{self.name}] Incremented current_parcel_index to: {blackboard.current_parcel_index}")
-        return py_trees.common.Status.SUCCESS
+        try:
+            current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            setattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', current_index + 1)
+            print(f"[{self.name}] Incremented {self.robot_namespace}/current_parcel_index to: {current_index + 1}")
+            return py_trees.common.Status.SUCCESS
+        except Exception as e:
+            print(f"[{self.name}] Error incrementing index: {e}")
+            return py_trees.common.Status.FAILURE
 
 
 class PrintMessage(py_trees.behaviour.Behaviour):
@@ -447,13 +864,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
     Uses MPC controller to make the robot approach the parcel based on the logic from State_switch.py.
     """
 
-    def __init__(self, name="ApproachObject", robot_namespace="tb0", approach_distance=0.12):
+    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.12):
         """
         Initialize the ApproachObject behavior.
         
         Args:
             name: Name of the behavior node
-            robot_namespace: The robot namespace (e.g., 'tb0', 'tb1')
+            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
             approach_distance: Distance to maintain from the parcel (default 0.12m)
         """
         super(ApproachObject, self).__init__(name)
@@ -601,7 +1018,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         z = quat.z
         w = quat.w
         quat_list = [x, y, z, w]
-        euler = tf.euler_from_quaternion(quat_list)
+        euler = tf_transformations.euler_from_quaternion(quat_list)
         return euler[2]
 
     def get_direction(self, robot_theta, parcel_theta):
@@ -632,19 +1049,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.approaching_target = False
         self.feedback_message = "Initializing approach behavior"
         
-        # Spin ROS node once to get latest data
-        if self.ros_node:
-            import rclpy
-            rclpy.spin_once(self.ros_node, timeout_sec=0.1)
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
 
     def update(self):
         """
         Main update method - implements the approaching_target logic from State_switch.py
         """
-        # Spin ROS node to process callbacks
-        if self.ros_node:
-            import rclpy
-            rclpy.spin_once(self.ros_node, timeout_sec=0.01)
+        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
 
         with self.lock:
             # Check if we have the necessary pose data

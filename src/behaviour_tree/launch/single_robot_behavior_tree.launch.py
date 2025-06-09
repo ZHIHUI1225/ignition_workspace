@@ -40,22 +40,13 @@ def generate_launch_description():
         package='behaviour_tree',
         executable='my_behaviour_tree',
         name='tree',  # Keep consistent with snapshot stream namespace
-        namespace=robot_namespace,
+        namespace='turtlebot0',  # Use fixed namespace for simplicity
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
-            'robot_id': robot_id,
-            'robot_namespace': robot_namespace,
-        }],
-        remappings=[
-            # Robot-specific topic remappings
-            ('Ready_flag', f'/{robot_namespace}/Ready_flag'),
-            ('Pushing_flag', f'/{robot_namespace}/Pushing_flag'),
-            ('Pickup_flag', f'/{robot_namespace}/Pickup_flag'),
-            ('PickUpDone', f'/{robot_namespace}/PickUpDone'),
-            ('cmd_vel', f'/{robot_namespace}/cmd_vel'),
-            ('odom', f'/{robot_namespace}/odom')
-        ]
+            'robot_id': '0',
+            'robot_namespace': 'turtlebot0',
+        }]
     )
     ld.add_action(behavior_tree_node)
     
