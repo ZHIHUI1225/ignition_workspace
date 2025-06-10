@@ -15,6 +15,10 @@ import threading
 import casadi as ca
 import numpy as np
 import tf_transformations
+import json
+import os
+import copy
+from scipy.interpolate import CubicSpline
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
@@ -75,6 +79,13 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             key=f"{robot_namespace}/current_parcel_index", 
             access=py_trees.common.Access.READ
         )
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/pushing_estimated_time", 
+            access=py_trees.common.Access.WRITE
+        )
+        
+        # Set default pushing estimated time (45 seconds)
+        setattr(self.blackboard, f"{robot_namespace}/pushing_estimated_time", 45.0)
         
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
@@ -604,30 +615,513 @@ class WaitAction(py_trees.behaviour.Behaviour):
 
 
 class ReplanPath(py_trees.behaviour.Behaviour):
-    """Path replanning behavior"""
+    """Path replanning behavior with trajectory optimization"""
     
-    def __init__(self, name, duration=1.5):
+    def __init__(self, name, duration=1.5, robot_namespace="turtlebot0", case="simple_maze"):
         super().__init__(name)
         self.duration = duration
         self.start_time = None
+        self.robot_namespace = robot_namespace
+        self.case = case
+        
+        # Extract robot ID from namespace for file paths
+        self.robot_id = self.extract_namespace_number(robot_namespace)
+        
+        # Setup blackboard access to read pushing_estimated_time
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/pushing_estimated_time", 
+            access=py_trees.common.Access.READ
+        )
+        
+        # Replanning state
+        self.replanning_complete = False
+        self.replanned_successfully = False
+        
+    def extract_namespace_number(self, namespace):
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
+        return int(match.group(1)) if match else 0
     
     def initialise(self):
         self.start_time = time.time()
+        self.replanning_complete = False
+        self.replanned_successfully = False
         self.feedback_message = f"Replanning path for {self.duration}s"
-        print(f"[{self.name}] Starting to replan path...")
+        print(f"[{self.name}] Starting trajectory replanning for robot {self.robot_id}...")
     
     def update(self):
         if self.start_time is None:
             self.start_time = time.time()
         
         elapsed = time.time() - self.start_time
+        
+        # Perform replanning on first update
+        if not self.replanning_complete:
+            try:
+                # Get target time from blackboard
+                target_time = getattr(self.blackboard, f'{self.robot_namespace}/pushing_estimated_time', 45.0)
+                print(f"[{self.name}] Target time from blackboard: {target_time:.2f}s")
+                
+                # Perform trajectory replanning
+                result = self.replan_trajectory_to_target(
+                    case=self.case,
+                    target_time=target_time,
+                    robot_id=self.robot_id
+                )
+                
+                if result:
+                    print(f"[{self.name}] Trajectory replanning successful!")
+                    self.replanned_successfully = True
+                else:
+                    print(f"[{self.name}] Trajectory replanning failed!")
+                    self.replanned_successfully = False
+                    
+                self.replanning_complete = True
+                
+            except Exception as e:
+                print(f"[{self.name}] Error during replanning: {e}")
+                self.replanning_complete = True
+                self.replanned_successfully = False
+        
+        # Update progress feedback
         progress = min(elapsed / self.duration, 1.0)
         self.feedback_message = f"Replanning path... {progress*100:.1f}% complete"
         
+        # Check if duration has elapsed
         if elapsed >= self.duration:
-            print(f"[{self.name}] Successfully replanned path!")
-            return py_trees.common.Status.SUCCESS
+            if self.replanned_successfully:
+                print(f"[{self.name}] Successfully replanned trajectory!")
+                return py_trees.common.Status.SUCCESS
+            else:
+                print(f"[{self.name}] Trajectory replanning failed!")
+                return py_trees.common.Status.FAILURE
+                
         return py_trees.common.Status.RUNNING
+    
+    def replan_trajectory_to_target(self, case, target_time, robot_id):
+        """
+        Load existing trajectory and replan to achieve target time
+        Works with existing tb{id}_Trajectory.json files
+        """
+        print(f"[{self.name}] Loading trajectory for Robot {robot_id}...")
+        
+        # Load existing trajectory
+        trajectory_data = self.load_existing_trajectory(case, robot_id)
+        
+        if not trajectory_data:
+            print(f"[{self.name}] No trajectory data found for Robot {robot_id}!")
+            return False
+        
+        trajectory_points = trajectory_data.get('Trajectory', [])
+        if not trajectory_points:
+            print(f"[{self.name}] No trajectory points found for Robot {robot_id}!")
+            return False
+        
+        # Calculate current trajectory duration
+        current_duration = len(trajectory_points) * 0.1  # Assuming 0.1s time step
+        
+        print(f"[{self.name}] Current duration: {current_duration:.3f}s, Target: {target_time:.3f}s")
+        print(f"[{self.name}] Original trajectory has {len(trajectory_points)} points")
+        
+        # Create replanned trajectory by time scaling
+        try:
+            scale_factor = target_time / current_duration if current_duration > 0 else 1.0
+            
+            # Generate new trajectory with target duration
+            replanned_trajectory = self.create_time_scaled_trajectory(
+                trajectory_points, target_time, dt=0.1
+            )
+            
+            if not replanned_trajectory:
+                print(f"[{self.name}] Failed to create replanned trajectory")
+                return False
+            
+            # Save replanned trajectory
+            success = self.save_replanned_trajectory_direct(
+                replanned_trajectory, case, robot_id, target_time
+            )
+            
+            if success:
+                print(f"[{self.name}] Trajectory replanning successful!")
+                print(f"[{self.name}] Scaling: {current_duration:.3f}s → {target_time:.3f}s (factor: {scale_factor:.3f})")
+                print(f"[{self.name}] New trajectory has {len(replanned_trajectory)} points")
+                return True
+            else:
+                print(f"[{self.name}] Failed to save replanned trajectory")
+                return False
+            
+        except Exception as e:
+            print(f"[{self.name}] Trajectory replanning failed: {e}")
+            return False
+    
+    def load_trajectory_parameters_individual(self, case, robot_ids):
+        """Load trajectory parameters from individual robot trajectory parameter files"""
+        data_dir = f'/root/workspace/data/{case}/'
+        trajectory_data = {}
+        
+        for robot_id in robot_ids:
+            robot_file = f'{data_dir}robot_{robot_id}_trajectory_parameters_{case}.json'
+            
+            if os.path.exists(robot_file):
+                try:
+                    with open(robot_file, 'r') as f:
+                        data = json.load(f)
+                    trajectory_data[f'robot{robot_id}'] = data
+                    print(f"[{self.name}] Loaded trajectory parameters from {robot_file}")
+                except Exception as e:
+                    print(f"[{self.name}] Error loading {robot_file}: {e}")
+            else:
+                print(f"[{self.name}] Robot trajectory file not found: {robot_file}")
+        
+        return trajectory_data
+    
+    def create_replanned_trajectory_from_optimization(self, original_data, optimized_times, total_time):
+        """Create new trajectory data with optimized times maintaining original structure"""
+        # Deep copy original data
+        replanned_data = copy.deepcopy(original_data)
+        
+        # Update time segments
+        time_segments = replanned_data.get('time_segments', [])
+        
+        for i, segment in enumerate(time_segments):
+            if i < len(optimized_times):
+                # Scale all time values in the segment proportionally
+                original_segment_time = 0.0
+                if 'arc' in segment and isinstance(segment['arc'], list):
+                    original_segment_time += sum(segment['arc'])
+                if 'line' in segment and isinstance(segment['line'], list):
+                    original_segment_time += sum(segment['line'])
+                
+                if original_segment_time > 0:
+                    scale_factor = optimized_times[i] / original_segment_time
+                    
+                    # Scale arc times
+                    if 'arc' in segment and isinstance(segment['arc'], list):
+                        segment['arc'] = [t * scale_factor for t in segment['arc']]
+                    
+                    # Scale line times
+                    if 'line' in segment and isinstance(segment['line'], list):
+                        segment['line'] = [t * scale_factor for t in segment['line']]
+        
+        # Update total time
+        replanned_data['total_time'] = total_time
+        
+        # Update metadata
+        if 'metadata' in replanned_data:
+            replanned_data['metadata']['replanned'] = True
+            replanned_data['metadata']['original_total_time'] = original_data.get('total_time', 0)
+            replanned_data['metadata']['target_time'] = total_time
+        
+        return replanned_data
+    
+    def save_replanned_trajectory(self, replanned_data, case, robot_id):
+        """Save replanned trajectory parameters to file"""
+        try:
+            output_dir = f'/root/workspace/data/{case}/'
+            os.makedirs(output_dir, exist_ok=True)
+            
+            output_file = f'{output_dir}robot_{robot_id}_replanned_trajectory_parameters_{case}.json'
+            
+            with open(output_file, 'w') as f:
+                json.dump(replanned_data, f, indent=2)
+            
+            print(f"[{self.name}] Replanned trajectory saved: {output_file}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error saving replanned trajectory: {e}")
+            return False
+    
+    def generate_discrete_trajectory_from_replanned(self, case, robot_id, dt=0.1):
+        """Generate discrete trajectory from replanned trajectory parameters"""
+        try:
+            # Load replanned trajectory parameters
+            data_dir = f'/root/workspace/data/{case}/'
+            replanned_file = f'{data_dir}robot_{robot_id}_replanned_trajectory_parameters_{case}.json'
+            
+            if not os.path.exists(replanned_file):
+                print(f"[{self.name}] Replanned trajectory file not found: {replanned_file}")
+                return False
+            
+            with open(replanned_file, 'r') as f:
+                replanned_data = json.load(f)
+            
+            # Extract trajectory components
+            waypoints = replanned_data.get('waypoints', [])
+            phi = replanned_data.get('phi', [])
+            r0 = replanned_data.get('r0', [])
+            l = replanned_data.get('l', [])
+            phi_new = replanned_data.get('phi_new', [])
+            time_segments = replanned_data.get('time_segments', [])
+            Flagb = replanned_data.get('Flagb', [])
+            
+            if not all([waypoints, phi, r0, l, phi_new, time_segments, Flagb]):
+                print(f"[{self.name}] Missing trajectory components in replanned data")
+                return False
+            
+            # Generate discrete trajectory points
+            trajectory_points = self.discretize_trajectory_from_parameters(
+                waypoints, phi, r0, l, phi_new, time_segments, Flagb, dt
+            )
+            
+            if not trajectory_points:
+                print(f"[{self.name}] Failed to generate discrete trajectory points")
+                return False
+            
+            # Save discrete trajectory in tb{robot_id}_Trajectory.json format
+            discrete_file = f'{data_dir}tb{robot_id}_Trajectory_replanned.json'
+            trajectory_data = {
+                "Trajectory": trajectory_points
+            }
+            
+            with open(discrete_file, 'w') as f:
+                json.dump(trajectory_data, f, indent=2)
+            
+            print(f"[{self.name}] Discrete replanned trajectory saved: {discrete_file}")
+            print(f"[{self.name}] Generated {len(trajectory_points)} trajectory points")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error generating discrete trajectory: {e}")
+            return False
+    
+    def discretize_trajectory_from_parameters(self, waypoints, phi, r0, l, phi_new, time_segments, Flagb, dt):
+        """
+        Discretize trajectory from parameters using cubic spline interpolation
+        Returns list of trajectory points in format [x, y, theta, v, w]
+        """
+        try:
+            # This is a simplified version - in a full implementation, you would need
+            # to load the reeb graph and use the full discretization logic
+            # For now, create a basic trajectory based on available parameters
+            
+            N = len(waypoints) - 1  # Number of segments
+            all_times = []
+            all_xs = []
+            all_ys = []
+            current_time = 0.0
+            
+            # Simple discretization - assuming linear interpolation between waypoints
+            # In a full implementation, you would use the actual arc/line segments with proper geometry
+            for i in range(N):
+                if i < len(time_segments):
+                    segment_time = 0.0
+                    segment = time_segments[i]
+                    
+                    if 'arc' in segment and isinstance(segment['arc'], list):
+                        segment_time += sum(segment['arc'])
+                    if 'line' in segment and isinstance(segment['line'], list):
+                        segment_time += sum(segment['line'])
+                    
+                    # Create time points for this segment
+                    num_points = max(int(segment_time / dt), 1)
+                    segment_times = np.linspace(0, segment_time, num_points)
+                    
+                    # Simple linear interpolation between waypoints
+                    # In reality, you would use the actual arc/line geometry
+                    for j, seg_time in enumerate(segment_times):
+                        all_times.append(current_time + seg_time)
+                        # Simple interpolation (would need actual waypoint coordinates)
+                        all_xs.append(float(i + j / len(segment_times)))
+                        all_ys.append(float(i * 0.5 + j * 0.1 / len(segment_times)))
+                    
+                    current_time += segment_time
+            
+            # Create uniform time grid
+            total_time = all_times[-1] if all_times else 1.0
+            t_uniform = np.arange(0, total_time, dt)
+            
+            if len(all_times) < 2:
+                print(f"[{self.name}] Insufficient trajectory points for interpolation")
+                return []
+            
+            # Interpolate positions using cubic spline
+            cs_x = CubicSpline(all_times, all_xs)
+            cs_y = CubicSpline(all_times, all_ys)
+            
+            x_uniform = cs_x(t_uniform)
+            y_uniform = cs_y(t_uniform)
+            
+            # Calculate orientations and velocities
+            trajectory_points = []
+            for i in range(len(t_uniform)):
+                if i < len(t_uniform) - 1:
+                    # Calculate velocity
+                    dx = x_uniform[i+1] - x_uniform[i]
+                    dy = y_uniform[i+1] - y_uniform[i]
+                    v = math.sqrt(dx*dx + dy*dy) / dt
+                    
+                    # Calculate orientation
+                    theta = math.atan2(dy, dx)
+                    
+                    # Calculate angular velocity
+                    if i > 0:
+                        prev_theta = trajectory_points[i-1][2]
+                        dtheta = theta - prev_theta
+                        # Normalize angle difference
+                        while dtheta > math.pi:
+                            dtheta -= 2 * math.pi
+                        while dtheta < -math.pi:
+                            dtheta += 2 * math.pi
+                        w = dtheta / dt
+                    else:
+                        w = 0.0
+                else:
+                    # Last point
+                    v = 0.0
+                    w = 0.0
+                    if len(trajectory_points) > 0:
+                        theta = trajectory_points[-1][2]
+                    else:
+                        theta = 0.0
+                
+                trajectory_points.append([
+                    float(x_uniform[i]),
+                    float(y_uniform[i]),
+                    float(theta),
+                    float(v),
+                    float(w)
+                ])
+            
+            return trajectory_points
+            
+        except Exception as e:
+            print(f"[{self.name}] Error in trajectory discretization: {e}")
+            return []
+    
+
+    def load_existing_trajectory(self, case, robot_id):
+        """Load existing trajectory from tb{id}_Trajectory.json files"""
+        try:
+            # Try different possible locations for trajectory files
+            possible_paths = [
+                f'/root/workspace/data/{case}/tb{robot_id}_Trajectory.json',
+                f'/root/workspace/data/tb{robot_id}_Trajectory.json',
+                f'/root/workspace/tb{robot_id}_Trajectory.json'
+            ]
+            
+            for trajectory_file in possible_paths:
+                if os.path.exists(trajectory_file):
+                    with open(trajectory_file, 'r') as f:
+                        data = json.load(f)
+                    print(f"[{self.name}] Loaded trajectory from {trajectory_file}")
+                    return data
+            
+            print(f"[{self.name}] No trajectory file found for robot {robot_id} in any location")
+            return None
+            
+        except Exception as e:
+            print(f"[{self.name}] Error loading trajectory: {e}")
+            return None
+    
+    def create_time_scaled_trajectory(self, original_points, target_time, dt=0.1):
+        """Create a time-scaled trajectory to match target duration"""
+        try:
+            if not original_points:
+                return []
+            
+            original_duration = len(original_points) * dt
+            if original_duration <= 0:
+                return []
+            
+            # Calculate number of points needed for target time
+            target_num_points = max(int(target_time / dt), 1)
+            
+            # Extract x, y, theta from original trajectory
+            original_x = [point[0] for point in original_points]
+            original_y = [point[1] for point in original_points]
+            original_theta = [point[2] for point in original_points]
+            
+            # Create time arrays
+            original_times = np.linspace(0, original_duration, len(original_points))
+            target_times = np.linspace(0, target_time, target_num_points)
+            
+            # Interpolate using cubic spline for smooth trajectory
+            cs_x = CubicSpline(original_times, original_x)
+            cs_y = CubicSpline(original_times, original_y)
+            cs_theta = CubicSpline(original_times, original_theta)
+            
+            # Generate new trajectory points
+            new_x = cs_x(target_times)
+            new_y = cs_y(target_times)
+            new_theta = cs_theta(target_times)
+            
+            # Calculate velocities and angular velocities
+            replanned_trajectory = []
+            for i in range(len(target_times)):
+                if i < len(target_times) - 1:
+                    # Calculate linear velocity
+                    dx = new_x[i+1] - new_x[i]
+                    dy = new_y[i+1] - new_y[i]
+                    v = math.sqrt(dx*dx + dy*dy) / dt
+                    
+                    # Calculate angular velocity
+                    if i > 0:
+                        prev_theta = new_theta[i-1]
+                        current_theta = new_theta[i]
+                        dtheta = current_theta - prev_theta
+                        # Normalize angle difference
+                        while dtheta > math.pi:
+                            dtheta -= 2 * math.pi
+                        while dtheta < -math.pi:
+                            dtheta += 2 * math.pi
+                        w = dtheta / dt
+                    else:
+                        w = 0.0
+                else:
+                    # Last point - zero velocities
+                    v = 0.0
+                    w = 0.0
+                
+                replanned_trajectory.append([
+                    float(new_x[i]),
+                    float(new_y[i]),
+                    float(new_theta[i]),
+                    float(v),
+                    float(w)
+                ])
+            
+            return replanned_trajectory
+            
+        except Exception as e:
+            print(f"[{self.name}] Error creating time-scaled trajectory: {e}")
+            return []
+    
+    def save_replanned_trajectory_direct(self, replanned_trajectory, case, robot_id, target_time):
+        """Save replanned trajectory directly to JSON file"""
+        try:
+            # Create output directory if it doesn't exist
+            output_dir = f'/root/workspace/data/{case}/'
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Create replanned trajectory data structure
+            trajectory_data = {
+                "Trajectory": replanned_trajectory,
+                "metadata": {
+                    "replanned": True,
+                    "target_time": target_time,
+                    "original_points": len(replanned_trajectory),
+                    "dt": 0.1,
+                    "replanning_timestamp": time.time()
+                }
+            }
+            
+            # Save to file
+            output_file = f'{output_dir}tb{robot_id}_Trajectory_replanned.json'
+            with open(output_file, 'w') as f:
+                json.dump(trajectory_data, f, indent=2)
+            
+            print(f"[{self.name}] Replanned trajectory saved to: {output_file}")
+            print(f"[{self.name}] Trajectory contains {len(replanned_trajectory)} points")
+            print(f"[{self.name}] Target duration: {target_time:.3f}s")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error saving replanned trajectory: {e}")
+            return False
 
 
 class StopSystem(py_trees.behaviour.Behaviour):

@@ -208,6 +208,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             key=f"{robot_namespace}/current_parcel_index", 
             access=py_trees.common.Access.READ
         )
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/pushing_estimated_time", 
+            access=py_trees.common.Access.WRITE
+        )
+        
+        # Set default pushing estimated time (45 seconds)
+        setattr(self.blackboard, f"{robot_namespace}/pushing_estimated_time", 45.0)
         
         # State variables
         self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
