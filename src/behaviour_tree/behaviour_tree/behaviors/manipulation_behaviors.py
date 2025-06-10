@@ -239,11 +239,15 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.robot_namespace = robot_namespace  # Use provided namespace
         self.case = "simple_maze"  # Default case
         self.number=extract_namespace_number(robot_namespace)
-        # Setup blackboard access for namespaced current_parcel_index
+        # Setup blackboard access for namespaced current_parcel_index and pushing_estimated_time
         self.blackboard = self.attach_blackboard_client()
         self.blackboard.register_key(
             key=f"{robot_namespace}/current_parcel_index", 
             access=py_trees.common.Access.READ
+        )
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/pushing_estimated_time", 
+            access=py_trees.common.Access.WRITE
         )
         
         # MPC Controller
@@ -356,6 +360,11 @@ class PushObject(py_trees.behaviour.Behaviour):
             data = json.load(json_file)
             self.ref_trajectory = data['Trajectory']
             print(f"[{self.name}] Loaded trajectory with {len(self.ref_trajectory)} points")
+            
+            # Set initial pushing estimated time in blackboard
+            initial_estimated_time = len(self.ref_trajectory) * self.dt
+            setattr(self.blackboard, f"{self.robot_namespace}/pushing_estimated_time", initial_estimated_time)
+            print(f"[{self.name}] Set initial pushing_estimated_time: {initial_estimated_time:.2f}s")
 
     
     def robot_pose_callback(self, msg):
@@ -427,6 +436,14 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         self.current_parcel_index = parcel_index
         print(f"[{self.name}] Updated parcel subscription to parcel{parcel_index}")
+    
+    def _update_pushing_estimated_time(self):
+        """Update pushing estimated time in blackboard based on current trajectory index"""
+        if self.ref_trajectory:
+            remaining_points = len(self.ref_trajectory) - self.trajectory_index
+            estimated_time = remaining_points * self.dt
+            setattr(self.blackboard, f"{self.robot_namespace}/pushing_estimated_time", estimated_time)
+            print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
     
     def _publish_reference_trajectory(self):
         """Publish reference trajectory for visualization"""
@@ -539,6 +556,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         # When using a control step from our sequence, we effectively move forward in our trajectory
         # So we should increment our trajectory index accordingly
         self.trajectory_index += 1
+        
+        # Update pushing estimated time in blackboard
+        self._update_pushing_estimated_time()
         
         # If we've used all our control steps, need a new MPC solve
         if self.control_step >= self.mpc.N_c:
@@ -670,7 +690,10 @@ class PushObject(py_trees.behaviour.Behaviour):
                             self.trajectory_index = best_idx
                             self._initial_index_set = True
                             print(f"[{self.name}] Initial closest reference point found at index {best_idx}, distance: {min_dist:.3f}m")
-                        
+                            
+                            # Update pushing estimated time after trajectory index change
+                            self._update_pushing_estimated_time()
+                        self._update_pushing_estimated_time()
                         # Prepare reference trajectory arrays
                         ref_array = np.zeros((5, self.mpc.N+1))
                         
@@ -728,6 +751,9 @@ class PushObject(py_trees.behaviour.Behaviour):
                             
                             print(f"[{self.name}] Advanced trajectory index to {self.trajectory_index}/{len(self.ref_trajectory)}")
                             
+                            # Update pushing estimated time after trajectory index change
+                            self._update_pushing_estimated_time()
+                            
                             # Publish predicted trajectory
                             self._publish_predicted_trajectory()
                             
@@ -754,6 +780,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.last_time = self.node.get_clock().now() if self.node else None
         self.pushing_active = True
         self.trajectory_index = 0
+        
+        # Update pushing estimated time in blackboard when resetting trajectory index
+        self._update_pushing_estimated_time()
         
         # Reset control sequence state
         self.control_sequence = None

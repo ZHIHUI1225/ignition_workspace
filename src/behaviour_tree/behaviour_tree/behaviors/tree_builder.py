@@ -26,6 +26,12 @@ def create_root(robot_namespace="turtlebot0"):
             variable_value=0,
             overwrite=True
         ),
+        py_trees.behaviours.SetBlackboardVariable(
+            name="Initialize pushing estimated time",
+            variable_name=f"{robot_namespace}/pushing_estimated_time",
+            variable_value=0.0,
+            overwrite=True
+        ),
         ResetFlags("ResetFlags")
     ])
     
