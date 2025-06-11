@@ -139,7 +139,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     def parcel_pose_callback(self, msg):
         """Callback for parcel pose updates"""
         self.parcel_pose = msg
-        print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
+        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
     
     def update_parcel_subscription(self):
         """Update parcel pose subscription based on current index"""
@@ -701,7 +701,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
     
     def replan_trajectory_to_target(self, case, target_time, robot_id):
         """
-        Load existing trajectory and replan to achieve target time
+        Load existing trajectory and replan to achieve target time using optimization
         Works with existing tb{id}_Trajectory.json files
         """
         print(f"[{self.name}] Loading trajectory for Robot {robot_id}...")
@@ -724,28 +724,26 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] Current duration: {current_duration:.3f}s, Target: {target_time:.3f}s")
         print(f"[{self.name}] Original trajectory has {len(trajectory_points)} points")
         
-        # Create replanned trajectory by time scaling
+        # Solve optimization problem to find optimal time allocation
         try:
-            scale_factor = target_time / current_duration if current_duration > 0 else 1.0
-            
-            # Generate new trajectory with target duration
-            replanned_trajectory = self.create_time_scaled_trajectory(
-                trajectory_points, target_time, dt=0.1
+            # Solve optimization problem to replan trajectory
+            optimized_trajectory = self.solve_trajectory_optimization(
+                trajectory_points, target_time
             )
             
-            if not replanned_trajectory:
-                print(f"[{self.name}] Failed to create replanned trajectory")
+            if not optimized_trajectory:
+                print(f"[{self.name}] Failed to solve optimization problem")
                 return False
             
             # Save replanned trajectory
             success = self.save_replanned_trajectory_direct(
-                replanned_trajectory, case, robot_id, target_time
+                optimized_trajectory, case, robot_id, target_time
             )
             
             if success:
                 print(f"[{self.name}] Trajectory replanning successful!")
-                print(f"[{self.name}] Scaling: {current_duration:.3f}s → {target_time:.3f}s (factor: {scale_factor:.3f})")
-                print(f"[{self.name}] New trajectory has {len(replanned_trajectory)} points")
+                print(f"[{self.name}] Optimization: {current_duration:.3f}s → {target_time:.3f}s")
+                print(f"[{self.name}] New trajectory has {len(optimized_trajectory)} points")
                 return True
             else:
                 print(f"[{self.name}] Failed to save replanned trajectory")
@@ -755,6 +753,317 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] Trajectory replanning failed: {e}")
             return False
     
+    def solve_trajectory_optimization(self, original_trajectory, target_time):
+        """
+        Solve optimization problem to replan trajectory for target time
+        Uses CasADi to solve nonlinear optimization problem
+        """
+        try:
+            print(f"[{self.name}] Setting up optimization problem...")
+            
+            # Extract trajectory information
+            n_points = len(original_trajectory)
+            dt_original = 0.1  # Original time step
+            current_duration = n_points * dt_original
+            
+            # Extract positions and velocities from original trajectory
+            x_orig = [pt[0] for pt in original_trajectory]
+            y_orig = [pt[1] for pt in original_trajectory] 
+            theta_orig = [pt[2] for pt in original_trajectory]
+            v_orig = [pt[3] for pt in original_trajectory]
+            w_orig = [pt[4] for pt in original_trajectory]
+            
+            # Segment the trajectory for optimization
+            n_segments = min(10, n_points // 5)  # Limit number of segments for computational efficiency
+            segment_size = n_points // n_segments
+            
+            print(f"[{self.name}] Dividing trajectory into {n_segments} segments of size ~{segment_size}")
+            
+            # Setup CasADi optimization problem
+            opti = ca.Opti()
+            
+            # Decision variables: time allocation for each segment
+            segment_times = opti.variable(n_segments)
+            
+            # Constraints: all segment times must be positive and reasonable
+            min_segment_time = 0.1  # Minimum time per segment
+            max_segment_time = target_time * 0.7  # Maximum time per segment (prevent one segment taking all time)
+            
+            for i in range(n_segments):
+                opti.subject_to(segment_times[i] >= min_segment_time)
+                opti.subject_to(segment_times[i] <= max_segment_time)
+            
+            # Total time constraint
+            opti.subject_to(ca.sum1(segment_times) == target_time)
+            
+            # Smoothness constraints: adjacent segments shouldn't differ too much
+            max_time_ratio = 3.0  # Adjacent segments can differ by at most 3x
+            for i in range(n_segments - 1):
+                opti.subject_to(segment_times[i] <= max_time_ratio * segment_times[i+1])
+                opti.subject_to(segment_times[i+1] <= max_time_ratio * segment_times[i])
+            
+            # Objective: minimize deviation from original velocity profile while maintaining smoothness
+            cost = 0
+            
+            # Cost for deviating from original timing profile (weighted)
+            original_segment_times = [current_duration / n_segments] * n_segments
+            for i in range(n_segments):
+                time_deviation = (segment_times[i] - original_segment_times[i]) ** 2
+                cost += 0.5 * time_deviation  # Reduced weight to allow more flexibility
+            
+            # Smoothness cost: penalize large differences between adjacent segment times
+            for i in range(n_segments - 1):
+                smoothness_cost = (segment_times[i] - segment_times[i+1]) ** 2
+                cost += 0.2 * smoothness_cost  # Increased smoothness weight
+            
+            # Velocity constraint cost: ensure velocities remain feasible
+            max_velocity = 0.8  # m/s - increased maximum velocity
+            max_angular_velocity = 1.5  # rad/s - increased maximum angular velocity
+            
+            for i in range(n_segments):
+                # Calculate segment characteristics
+                start_idx = i * segment_size
+                end_idx = min((i + 1) * segment_size, n_points - 1)
+                
+                if start_idx < len(x_orig) and end_idx < len(x_orig):
+                    # Calculate required velocity for this segment
+                    segment_distance = math.sqrt(
+                        (x_orig[end_idx] - x_orig[start_idx])**2 + 
+                        (y_orig[end_idx] - y_orig[start_idx])**2
+                    )
+                    
+                    if segment_distance > 0:
+                        # Required velocity = distance / time
+                        required_velocity = segment_distance / segment_times[i]
+                        
+                        # Soft constraint for velocity limits
+                        velocity_violation = ca.fmax(0, required_velocity - max_velocity)
+                        cost += 100 * velocity_violation**2  # High penalty for velocity violations
+                        
+                        # Add preference for reasonable velocities (not too slow either)
+                        min_velocity = 0.05  # m/s minimum
+                        slow_penalty = ca.fmax(0, min_velocity - required_velocity)
+                        cost += 10 * slow_penalty**2
+            
+            # Set objective
+            opti.minimize(cost)
+            
+            # Initial guess: proportional to original segment distances
+            initial_times = []
+            total_distance = 0
+            segment_distances = []
+            
+            for i in range(n_segments):
+                start_idx = i * segment_size
+                end_idx = min((i + 1) * segment_size, n_points - 1)
+                
+                if start_idx < len(x_orig) and end_idx < len(x_orig):
+                    segment_distance = math.sqrt(
+                        (x_orig[end_idx] - x_orig[start_idx])**2 + 
+                        (y_orig[end_idx] - y_orig[start_idx])**2
+                    )
+                    segment_distances.append(segment_distance)
+                    total_distance += segment_distance
+                else:
+                    segment_distances.append(1.0)  # Default distance
+                    total_distance += 1.0
+            
+            # Allocate time proportional to distance, but bounded
+            for i in range(n_segments):
+                if total_distance > 0:
+                    proportional_time = (segment_distances[i] / total_distance) * target_time
+                    # Bound the initial guess to reasonable values
+                    bounded_time = max(min_segment_time, min(proportional_time, max_segment_time))
+                    initial_times.append(bounded_time)
+                else:
+                    initial_times.append(target_time / n_segments)
+            
+            # Normalize to ensure total equals target_time
+            time_sum = sum(initial_times)
+            if time_sum > 0:
+                initial_times = [t * target_time / time_sum for t in initial_times]
+            else:
+                initial_times = [target_time / n_segments] * n_segments
+            
+            opti.set_initial(segment_times, initial_times)
+            print(f"[{self.name}] Initial time guess: {[f'{t:.3f}' for t in initial_times]}")
+            
+            # Configure solver
+            opts = {
+                'ipopt.max_iter': 500,
+                'ipopt.tol': 1e-6,
+                'ipopt.print_level': 0,
+                'print_time': False,
+                'ipopt.acceptable_tol': 1e-4,
+                'ipopt.acceptable_obj_change_tol': 1e-6
+            }
+            opti.solver('ipopt', opts)
+            
+            print(f"[{self.name}] Solving optimization problem...")
+            
+            # Solve the optimization problem
+            sol = opti.solve()
+            
+            # Extract optimal segment times
+            optimal_times = sol.value(segment_times)
+            
+            print(f"[{self.name}] Optimization solved successfully!")
+            print(f"[{self.name}] Optimal segment times: {[f'{t:.3f}' for t in optimal_times]}")
+            
+            # Generate new trajectory with optimal timing
+            optimized_trajectory = self.generate_trajectory_from_optimal_times(
+                original_trajectory, optimal_times, target_time
+            )
+            
+            return optimized_trajectory
+            
+        except Exception as e:
+            print(f"[{self.name}] Optimization failed: {e}")
+            # Fallback to simple interpolation if optimization fails
+            return self.create_simple_time_interpolated_trajectory(original_trajectory, target_time)
+    
+    def generate_trajectory_from_optimal_times(self, original_trajectory, optimal_times, target_time):
+        """
+        Generate new trajectory using optimal time allocation
+        """
+        try:
+            n_points = len(original_trajectory)
+            n_segments = len(optimal_times)
+            segment_size = n_points // n_segments
+            
+            # New time step to achieve target duration
+            dt_new = 0.1  # Keep same discretization
+            n_new_points = int(target_time / dt_new)
+            
+            # Extract original trajectory data
+            x_orig = np.array([pt[0] for pt in original_trajectory])
+            y_orig = np.array([pt[1] for pt in original_trajectory])
+            theta_orig = np.array([pt[2] for pt in original_trajectory])
+            
+            # Create cumulative time arrays for original and new trajectories
+            original_times = np.arange(0, len(original_trajectory) * 0.1, 0.1)
+            
+            # Build new time array based on optimal segment times
+            new_times = []
+            current_time = 0.0
+            
+            for i, seg_time in enumerate(optimal_times):
+                start_idx = i * segment_size
+                end_idx = min((i + 1) * segment_size, n_points)
+                segment_points = end_idx - start_idx
+                
+                if segment_points > 0:
+                    segment_dt = seg_time / segment_points
+                    for j in range(segment_points):
+                        new_times.append(current_time + j * segment_dt)
+                    current_time += seg_time
+            
+            # Ensure we have the right number of time points
+            while len(new_times) < n_points:
+                new_times.append(new_times[-1] + dt_new)
+            new_times = new_times[:n_points]
+            
+            # Create uniform output time grid
+            output_times = np.arange(0, target_time, dt_new)
+            
+            # Interpolate trajectory to new timing
+            from scipy.interpolate import interp1d
+            
+            # Create interpolation functions
+            if len(new_times) >= 2 and len(original_times) >= 2:
+                # Map from original times to new times
+                time_mapping = interp1d(original_times[:len(new_times)], new_times, 
+                                      kind='linear', fill_value='extrapolate')
+                
+                # Interpolate positions using the new timing
+                interp_x = interp1d(new_times, x_orig[:len(new_times)], 
+                                  kind='cubic', fill_value='extrapolate')
+                interp_y = interp1d(new_times, y_orig[:len(new_times)], 
+                                  kind='cubic', fill_value='extrapolate')
+                interp_theta = interp1d(new_times, theta_orig[:len(new_times)], 
+                                      kind='linear', fill_value='extrapolate')
+                
+                # Generate new trajectory
+                new_trajectory = []
+                for t in output_times:
+                    x = float(interp_x(t))
+                    y = float(interp_y(t))
+                    theta = float(interp_theta(t))
+                    
+                    # Calculate velocities
+                    if len(new_trajectory) > 0:
+                        prev_x, prev_y, prev_theta = new_trajectory[-1][:3]
+                        dt = dt_new
+                        
+                        # Linear velocity
+                        v = math.sqrt((x - prev_x)**2 + (y - prev_y)**2) / dt
+                        
+                        # Angular velocity
+                        dtheta = theta - prev_theta
+                        while dtheta > math.pi:
+                            dtheta -= 2 * math.pi
+                        while dtheta < -math.pi:
+                            dtheta += 2 * math.pi
+                        w = dtheta / dt
+                    else:
+                        v = 0.0
+                        w = 0.0
+                    
+                    new_trajectory.append([x, y, theta, v, w])
+                
+                print(f"[{self.name}] Generated optimized trajectory with {len(new_trajectory)} points")
+                return new_trajectory
+            else:
+                print(f"[{self.name}] Insufficient points for interpolation")
+                return self.create_simple_time_interpolated_trajectory(original_trajectory, target_time)
+                
+        except Exception as e:
+            print(f"[{self.name}] Error generating trajectory from optimal times: {e}")
+            return self.create_simple_time_interpolated_trajectory(original_trajectory, target_time)
+    
+    def create_simple_time_interpolated_trajectory(self, original_trajectory, target_time):
+        """
+        Fallback method: simple time interpolation of trajectory
+        """
+        try:
+            dt_new = 0.1
+            n_new_points = int(target_time / dt_new)
+            n_orig_points = len(original_trajectory)
+            
+            if n_orig_points < 2:
+                return original_trajectory
+            
+            # Create uniform interpolation
+            new_trajectory = []
+            for i in range(n_new_points):
+                # Map new index to original trajectory
+                orig_index = (i / (n_new_points - 1)) * (n_orig_points - 1)
+                
+                # Linear interpolation between adjacent points
+                idx_low = int(orig_index)
+                idx_high = min(idx_low + 1, n_orig_points - 1)
+                alpha = orig_index - idx_low
+                
+                if idx_low < len(original_trajectory) and idx_high < len(original_trajectory):
+                    pt_low = original_trajectory[idx_low]
+                    pt_high = original_trajectory[idx_high]
+                    
+                    # Interpolate all components
+                    x = pt_low[0] + alpha * (pt_high[0] - pt_low[0])
+                    y = pt_low[1] + alpha * (pt_high[1] - pt_low[1])
+                    theta = pt_low[2] + alpha * (pt_high[2] - pt_low[2])
+                    v = pt_low[3] + alpha * (pt_high[3] - pt_low[3])
+                    w = pt_low[4] + alpha * (pt_high[4] - pt_low[4])
+                    
+                    new_trajectory.append([x, y, theta, v, w])
+            
+            print(f"[{self.name}] Created fallback interpolated trajectory with {len(new_trajectory)} points")
+            return new_trajectory
+            
+        except Exception as e:
+            print(f"[{self.name}] Error in fallback trajectory creation: {e}")
+            return original_trajectory
+
     def load_trajectory_parameters_individual(self, case, robot_ids):
         """Load trajectory parameters from individual robot trajectory parameter files"""
         data_dir = f'/root/workspace/data/{case}/'
@@ -775,45 +1084,6 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] Robot trajectory file not found: {robot_file}")
         
         return trajectory_data
-    
-    def create_replanned_trajectory_from_optimization(self, original_data, optimized_times, total_time):
-        """Create new trajectory data with optimized times maintaining original structure"""
-        # Deep copy original data
-        replanned_data = copy.deepcopy(original_data)
-        
-        # Update time segments
-        time_segments = replanned_data.get('time_segments', [])
-        
-        for i, segment in enumerate(time_segments):
-            if i < len(optimized_times):
-                # Scale all time values in the segment proportionally
-                original_segment_time = 0.0
-                if 'arc' in segment and isinstance(segment['arc'], list):
-                    original_segment_time += sum(segment['arc'])
-                if 'line' in segment and isinstance(segment['line'], list):
-                    original_segment_time += sum(segment['line'])
-                
-                if original_segment_time > 0:
-                    scale_factor = optimized_times[i] / original_segment_time
-                    
-                    # Scale arc times
-                    if 'arc' in segment and isinstance(segment['arc'], list):
-                        segment['arc'] = [t * scale_factor for t in segment['arc']]
-                    
-                    # Scale line times
-                    if 'line' in segment and isinstance(segment['line'], list):
-                        segment['line'] = [t * scale_factor for t in segment['line']]
-        
-        # Update total time
-        replanned_data['total_time'] = total_time
-        
-        # Update metadata
-        if 'metadata' in replanned_data:
-            replanned_data['metadata']['replanned'] = True
-            replanned_data['metadata']['original_total_time'] = original_data.get('total_time', 0)
-            replanned_data['metadata']['target_time'] = total_time
-        
-        return replanned_data
     
     def save_replanned_trajectory(self, replanned_data, case, robot_id):
         """Save replanned trajectory parameters to file"""
@@ -997,9 +1267,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         try:
             # Try different possible locations for trajectory files
             possible_paths = [
-                f'/root/workspace/data/{case}/tb{robot_id}_Trajectory.json',
-                f'/root/workspace/data/tb{robot_id}_Trajectory.json',
-                f'/root/workspace/tb{robot_id}_Trajectory.json'
+                f'/root/workspace/data/{case}/tb{robot_id}_Trajectory.json'
             ]
             
             for trajectory_file in possible_paths:
@@ -1016,78 +1284,6 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] Error loading trajectory: {e}")
             return None
     
-    def create_time_scaled_trajectory(self, original_points, target_time, dt=0.1):
-        """Create a time-scaled trajectory to match target duration"""
-        try:
-            if not original_points:
-                return []
-            
-            original_duration = len(original_points) * dt
-            if original_duration <= 0:
-                return []
-            
-            # Calculate number of points needed for target time
-            target_num_points = max(int(target_time / dt), 1)
-            
-            # Extract x, y, theta from original trajectory
-            original_x = [point[0] for point in original_points]
-            original_y = [point[1] for point in original_points]
-            original_theta = [point[2] for point in original_points]
-            
-            # Create time arrays
-            original_times = np.linspace(0, original_duration, len(original_points))
-            target_times = np.linspace(0, target_time, target_num_points)
-            
-            # Interpolate using cubic spline for smooth trajectory
-            cs_x = CubicSpline(original_times, original_x)
-            cs_y = CubicSpline(original_times, original_y)
-            cs_theta = CubicSpline(original_times, original_theta)
-            
-            # Generate new trajectory points
-            new_x = cs_x(target_times)
-            new_y = cs_y(target_times)
-            new_theta = cs_theta(target_times)
-            
-            # Calculate velocities and angular velocities
-            replanned_trajectory = []
-            for i in range(len(target_times)):
-                if i < len(target_times) - 1:
-                    # Calculate linear velocity
-                    dx = new_x[i+1] - new_x[i]
-                    dy = new_y[i+1] - new_y[i]
-                    v = math.sqrt(dx*dx + dy*dy) / dt
-                    
-                    # Calculate angular velocity
-                    if i > 0:
-                        prev_theta = new_theta[i-1]
-                        current_theta = new_theta[i]
-                        dtheta = current_theta - prev_theta
-                        # Normalize angle difference
-                        while dtheta > math.pi:
-                            dtheta -= 2 * math.pi
-                        while dtheta < -math.pi:
-                            dtheta += 2 * math.pi
-                        w = dtheta / dt
-                    else:
-                        w = 0.0
-                else:
-                    # Last point - zero velocities
-                    v = 0.0
-                    w = 0.0
-                
-                replanned_trajectory.append([
-                    float(new_x[i]),
-                    float(new_y[i]),
-                    float(new_theta[i]),
-                    float(v),
-                    float(w)
-                ])
-            
-            return replanned_trajectory
-            
-        except Exception as e:
-            print(f"[{self.name}] Error creating time-scaled trajectory: {e}")
-            return []
     
     def save_replanned_trajectory_direct(self, replanned_trajectory, case, robot_id, target_time):
         """Save replanned trajectory directly to JSON file"""
