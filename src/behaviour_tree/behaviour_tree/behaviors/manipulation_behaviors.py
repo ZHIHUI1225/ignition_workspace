@@ -28,18 +28,16 @@ def extract_namespace_number(namespace):
     return int(match.group(1)) if match else 0
 class MobileRobotMPC:
     def __init__(self):
-        # MPC parameters - optimized for real-time performance
-        self.N = 8           # Reduced prediction horizon for faster solving (was 12)
-        self.N_c = 3         # Control horizon - now we'll use this for returning multiple control steps
+        # MPC parameters - heavily optimized for fastest computation
+        self.N = 5           # Further reduced prediction horizon for fastest solving
+        self.N_c = 2         # Reduced control horizon for faster computation
         self.dt = 0.1        # Time step
-        # Much higher weights on position (x,y) to force convergence
-        # Increased weights on orientation (theta) and angular velocity (omega) for better tracking
-        self.Q = np.diag([30.0, 30.0, 8.0, 0.8, 3.0])  # State weights (x, y, theta, v, omega)
-        # Lower control input weights for more aggressive control action
-        # Even lower weight on angular control to allow better tracking of reference orientation
-        self.R = np.diag([0.03, 0.01])       # Control input weights - even lower weight on angular control
-        # Higher terminal cost weights for position and orientation
-        self.F = np.diag([60.0, 60.0, 20.0, 1.0, 8.0])  # Terminal cost weights with increased emphasis on orientation
+        # Simplified weights for faster computation
+        self.Q = np.diag([20.0, 20.0, 5.0, 0.5, 2.0])  # State weights (x, y, theta, v, omega)
+        # Higher control input weights to reduce control effort and solver complexity
+        self.R = np.diag([0.1, 0.05])       # Control input weights
+        # Simplified terminal cost weights
+        self.F = np.diag([40.0, 40.0, 10.0, 1.0, 5.0])  # Terminal cost weights
         
         # Velocity constraints
         self.max_vel = 0.25      # m/s
@@ -72,86 +70,62 @@ class MobileRobotMPC:
         self.x0 = self.opti.parameter(self.nx)          # Initial state
         self.ref = self.opti.parameter(self.nx, self.N+1)  # Reference trajectory
 
-        # Cost function with increasing weights toward the end
+        # Cost function - fixed matrix operations and added velocity tracking
         cost = 0
         for k in range(self.N):
-            # Increasing weight factor as we progress along horizon (helps convergence)
-            weight_factor = 1.0 + 4.0 * k / self.N  # Increases from 1.0 to 5.0
-            
-            # Position error (x,y) - more heavily weighted
+            # Position error (x,y) - fixed matrix multiplication
             pos_error = self.X[:2, k] - self.ref[:2, k]
-            cost += weight_factor * ca.mtimes([pos_error.T, self.Q[:2,:2], pos_error])
+            cost += pos_error.T @ self.Q[:2,:2] @ pos_error
             
-            # Orientation (theta) - separately weighted to ensure good heading tracking
+            # Orientation (theta) - scalar operation
             theta_error = self.X[2, k] - self.ref[2, k]
-            # Normalize angle difference to [-pi, pi] to avoid issues with angle wrapping
-            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi
-            cost += weight_factor * self.Q[2,2] * theta_error**2
+            cost += self.Q[2,2] * theta_error**2
             
-            # Velocity errors (v, omega) - weighted for accurate tracking
+            # Velocity states (v, omega) - track reference velocities
             vel_error = self.X[3:, k] - self.ref[3:, k]
-            # cost += ca.mtimes([vel_error.T, self.Q[3:,3:], vel_error])
+            cost += vel_error.T @ self.Q[3:,3:] @ vel_error
             
-            # Special focus on angular velocity tracking
-            angular_vel_error = self.X[4, k] - self.ref[4, k]
-            # cost += 1.5 * weight_factor * self.Q[4,4] * angular_vel_error**2
-            
-            # Control cost (decreased for better tracking)
-            control_error = self.U[:, k]
-            cost += ca.mtimes([control_error.T, self.R, control_error])
-            
-            # Penalize large changes in angular velocity for smoother motion
-            if k > 0:
-                omega_change = self.U[1, k] - self.U[1, k-1]
-                cost += 0.1 * omega_change**2
+            # Control cost - fixed matrix multiplication
+            cost += self.U[:, k].T @ self.R @ self.U[:, k]
             
             # Dynamics constraints
             x_next = self.robot_model(self.X[:, k], self.U[:, k])
             self.opti.subject_to(self.X[:, k+1] == x_next)
 
-        # Much stronger terminal cost for better convergence
-        
-        # Position terminal error gets highest priority
+        # Terminal cost - fixed matrix operations
         pos_term_error = self.X[:2, -1] - self.ref[:2, -1]
-        cost += 10.0 * ca.mtimes([pos_term_error.T, self.F[:2,:2], pos_term_error])
+        cost += pos_term_error.T @ self.F[:2,:2] @ pos_term_error
         
-        # Terminal orientation error with normalization
+        # Terminal orientation error
         theta_term_error = self.X[2, -1] - self.ref[2, -1]
-        # Normalize angle difference to [-pi, pi] to avoid issues with angle wrapping
-        theta_term_error = ca.fmod(theta_term_error + ca.pi, 2*ca.pi) - ca.pi
-        cost += 12.0 * self.F[2,2] * theta_term_error**2
+        cost += self.F[2,2] * theta_term_error**2
+        
+        # Terminal velocity errors
+        vel_term_error = self.X[3:, -1] - self.ref[3:, -1]
+        cost += vel_term_error.T @ self.F[3:,3:] @ vel_term_error
 
         # Constraints
         self.opti.subject_to(self.X[:, 0] == self.x0)  # Initial condition
         
-        # Velocity and angular velocity constraints
-        self.opti.subject_to(self.opti.bounded(self.min_vel, self.U[0, :], self.max_vel))
+        # Control input constraints (velocity and angular velocity)
+        self.opti.subject_to(self.opti.bounded(-0.25, self.U[0, :], self.max_vel))  # Allow reverse
         self.opti.subject_to(self.opti.bounded(self.min_omega, self.U[1, :], self.max_omega))
-        
-        # Terminal constraints: velocity and angular velocity should approach zero at terminal state
-        # This ensures the robot stops at the goal position and doesn't just pass through
-        self.opti.subject_to(self.X[3, -1] <= 0.01)  # Terminal linear velocity close to zero
-        self.opti.subject_to(self.X[3, -1] >= -0.01) # Terminal linear velocity close to zero
-        self.opti.subject_to(self.X[4, -1] <= 0.01)  # Terminal angular velocity close to zero
-        self.opti.subject_to(self.X[4, -1] >= -0.01) # Terminal angular velocity close to zero
 
-        # Solver settings optimized for real-time fast convergence
+        # Solver settings - simplified and robust
         self.opti.minimize(cost)
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
-            'ipopt.max_iter': 50,       # Reduced iterations for faster solving
-            'ipopt.max_cpu_time': 0.08, # Hard limit to 80ms for real-time performance
-            'ipopt.tol': 1e-3,          # More relaxed tolerance for faster solving
-            'ipopt.acceptable_tol': 1e-2, # Much more relaxed tolerance for faster solving
-            'ipopt.acceptable_iter': 3,  # Accept solution after 3 acceptable iterations
-            'ipopt.warm_start_init_point': 'yes', # Use warm starting for faster convergence
-            'ipopt.mu_strategy': 'adaptive', # Use adaptive barrier parameter update strategy
-            'ipopt.hessian_approximation': 'limited-memory', # Limited memory BFGS for faster iterations
-            'ipopt.limited_memory_max_history': 3, # Even smaller history size for faster iterations
-            'ipopt.linear_solver': 'mumps', # Fast linear solver
-            'ipopt.fast_step_computation': 'yes' # Enable fast step computation
+            'ipopt.max_iter': 30,       # Reasonable iterations for convergence
+            'ipopt.max_cpu_time': 0.1,  # Relaxed time limit
+            'ipopt.tol': 1e-3,          # Standard tolerance
+            'ipopt.acceptable_tol': 5e-3, # More reasonable tolerance
+            'ipopt.acceptable_iter': 5,  # Accept solution after 5 iterations
+            'ipopt.warm_start_init_point': 'yes', # Use warm starting
+            'ipopt.hessian_approximation': 'limited-memory', # BFGS approximation
+            'ipopt.linear_solver': 'mumps' # Reliable linear solver
         }
+        
         self.opti.solver('ipopt', opts)
 
     def robot_model(self, x, u):
@@ -168,32 +142,27 @@ class MobileRobotMPC:
         self.ref_traj = ref_traj
 
     def update(self, current_state):
-        print(f"MPC update called with state: {current_state}")
-        print(f"Reference trajectory shape: {self.ref_traj.shape if self.ref_traj is not None else 'None'}")
-        
         self.opti.set_value(self.x0, current_state)
         self.opti.set_value(self.ref, self.ref_traj)
         
-        # Set initial guess for warm starting if available
+        # Simplified warm starting for speed
         if self.last_solution is not None:
-            # Shift previous solution forward as initial guess
+            # Simple shift without expensive propagation
             u_init = np.zeros((self.nu, self.N))
             x_init = np.zeros((self.nx, self.N+1))
             
-            # Copy last N-1 control inputs and append last control input
-            u_init[:, :self.N-1] = self.last_solution['u'][:, 1:]
-            u_init[:, self.N-1] = self.last_solution['u'][:, self.N-1] 
+            # Copy and shift previous solution
+            if self.N > 1:
+                u_init[:, :self.N-1] = self.last_solution['u'][:, 1:]
+                u_init[:, self.N-1] = self.last_solution['u'][:, -1]  # Repeat last control
+                
+                x_init[:, :self.N] = self.last_solution['x'][:, 1:]
+                x_init[:, self.N] = self.last_solution['x'][:, -1]  # Use last state instead of propagation
             
-            # Copy last N states and propagate final state
-            x_init[:, :self.N] = self.last_solution['x'][:, 1:]
-            x_init[:, self.N] = self.robot_model_np(x_init[:, self.N-1], u_init[:, self.N-1])
-            
-            # Set the initial guess
             self.opti.set_initial(self.X, x_init)
             self.opti.set_initial(self.U, u_init)
-            print(f"Using warm start with last solution")
         else:
-            print(f"No previous solution available for warm start")
+            pass  # No previous solution available for warm start
         
         try:
             sol = self.opti.solve()
@@ -203,8 +172,6 @@ class MobileRobotMPC:
                 'u': sol.value(self.U),
                 'x': sol.value(self.X)
             }
-            
-            print(f"MPC solver succeeded - solution shape: {sol.value(self.X).shape}")
             
             # Return all N_c control steps
             return sol.value(self.U)[:, :self.N_c]
@@ -293,6 +260,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # Threading lock for state protection
         self.state_lock = threading.Lock()
+        
+        # Control error tracking
+        self.last_control_errors = {}
     
     def setup(self, **kwargs):
         """Setup ROS connections and load trajectory"""
@@ -440,8 +410,14 @@ class PushObject(py_trees.behaviour.Behaviour):
     def _update_pushing_estimated_time(self):
         """Update pushing estimated time in blackboard based on current trajectory index"""
         if self.ref_trajectory:
-            remaining_points = len(self.ref_trajectory) - self.trajectory_index
-            estimated_time = remaining_points * self.dt
+            if self.trajectory_index < len(self.ref_trajectory):
+                remaining_points = len(self.ref_trajectory) - self.trajectory_index
+                estimated_time = remaining_points * self.dt
+            else:
+                # At end of trajectory, minimal estimated time remaining
+                estimated_time = 0.5  # Small positive value to indicate near completion
+                remaining_points = 0
+            
             setattr(self.blackboard, f"{self.robot_namespace}/pushing_estimated_time", estimated_time)
             print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
     
@@ -534,8 +510,13 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # Fill reference trajectory
         for i in range(self.P_HOR + 1):
-            traj_idx = min(self.trajectory_index + i, len(self.ref_trajectory) - 1)
-            ref_point = self.ref_trajectory[traj_idx]
+            if self.trajectory_index + i < len(self.ref_trajectory):
+                # Use normal trajectory point
+                traj_idx = self.trajectory_index + i
+                ref_point = self.ref_trajectory[traj_idx]
+            else:
+                # Trajectory index has reached the end - use last state as target
+                ref_point = self.ref_trajectory[-1]  # Last state of trajectory
             
             ref_array[0, i] = ref_point[0]  # x
             ref_array[1, i] = ref_point[1]  # y
@@ -554,8 +535,12 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.control_step += 1
         
         # When using a control step from our sequence, we effectively move forward in our trajectory
-        # So we should increment our trajectory index accordingly
-        self.trajectory_index += 1
+        # But don't go beyond the end of the trajectory
+        if self.trajectory_index < len(self.ref_trajectory) - 1:
+            self.trajectory_index += 1
+        else:
+            # At end of trajectory, keep using last state as target
+            print(f"[{self.name}] At end of trajectory in advance_control_step, maintaining last state as target")
         
         # Update pushing estimated time in blackboard
         self._update_pushing_estimated_time()
@@ -635,13 +620,12 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.cmd_vel_pub.publish(cmd_msg)
 
     def control_loop(self):
-        """Main MPC control loop - runs at 10Hz in separate thread"""
+        """Main MPC control loop - optimized with reduced solving frequency"""
         # Check if we have a valid stored control sequence we can use
         if self.control_sequence is not None:
             # Use the stored control sequence if available
             if self.apply_stored_control():
                 self.advance_control_step()
-                print(f"[{self.name}] DEBUG: Used stored control sequence, published command")
                 return
         
         if not self.ref_trajectory:
@@ -659,7 +643,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 pushing_complete = self._check_parcel_in_relay_range()
                 
                 # Only run MPC if not complete and trajectory index is valid
-                if not pushing_complete and self.trajectory_index < len(self.ref_trajectory):
+                if not pushing_complete:
                     print(f"[{self.name}] MPC control - index: {self.trajectory_index}/{len(self.ref_trajectory)}, dist_to_final: {dist_to_final:.3f}m")
                     
                     # Check if we need replanning
@@ -699,8 +683,14 @@ class PushObject(py_trees.behaviour.Behaviour):
                         
                         # Fill reference trajectory directly from original trajectory points
                         for i in range(self.mpc.N + 1):
-                            traj_idx = min(self.trajectory_index + i, len(self.ref_trajectory) - 1)
-                            ref_point = self.ref_trajectory[traj_idx]
+                            if self.trajectory_index + i < len(self.ref_trajectory):
+                                # Use normal trajectory point
+                                traj_idx = self.trajectory_index + i
+                                ref_point = self.ref_trajectory[traj_idx]
+                            else:
+                                # Trajectory index has reached the end - use last state as target
+                                ref_point = self.ref_trajectory[-1]  # Last state of trajectory
+                                print(f"[{self.name}] Using last trajectory state as target for MPC horizon point {i}")
                             
                             ref_array[0, i] = ref_point[0]  # x
                             ref_array[1, i] = ref_point[1]  # y
@@ -714,9 +704,16 @@ class PushObject(py_trees.behaviour.Behaviour):
                             self.mpc.set_reference_trajectory(ref_array)
                             u_sequence = self.mpc.update(current_state)
                             
+                            # Calculate and output detailed control errors
+                            self._calculate_and_output_control_errors(current_state, ref_array)
+                            
                             # Check if controls are valid
                             if u_sequence is None or np.isnan(u_sequence).any():
                                 print(f"[{self.name}] ERROR: MPC returned invalid control values - using safe fallback controls")
+                                print(f"[{self.name}] Control sequence type: {type(u_sequence)}, shape: {u_sequence.shape if u_sequence is not None else 'None'}")
+                                if u_sequence is not None:
+                                    print(f"[{self.name}] Control sequence values: {u_sequence}")
+                                    print(f"[{self.name}] NaN values present: {np.isnan(u_sequence).any()}")
                                 cmd_msg = Twist()
                                 cmd_msg.linear.x = 0.0
                                 cmd_msg.angular.z = 0.0
@@ -746,10 +743,15 @@ class PushObject(py_trees.behaviour.Behaviour):
                             # Log the control action
                             print(f'[{self.name}] MPC control: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f} [PUBLISHED]')
                             
-                            # Ensure we make progress
-                            self.trajectory_index = max(self.trajectory_index + 1, best_idx)
+                            # Ensure we make progress, but don't go beyond trajectory length
+                            # When at the end, keep trajectory_index at the last valid index
+                            if self.trajectory_index < len(self.ref_trajectory) - 1:
+                                self.trajectory_index = max(self.trajectory_index + 1, best_idx)
+                            else:
+                                # At end of trajectory, keep using last state as target
+                                print(f"[{self.name}] At end of trajectory, maintaining last state as target")
                             
-                            print(f"[{self.name}] Advanced trajectory index to {self.trajectory_index}/{len(self.ref_trajectory)}")
+                            print(f"[{self.name}] Trajectory index: {self.trajectory_index}/{len(self.ref_trajectory)} (max: {len(self.ref_trajectory)-1})")
                             
                             # Update pushing estimated time after trajectory index change
                             self._update_pushing_estimated_time()
@@ -772,7 +774,35 @@ class PushObject(py_trees.behaviour.Behaviour):
                     print(f"[{self.name}] Push complete or trajectory finished - stopping robot")
                 
             except Exception as e:
-                print(f"[{self.name}] Error in control loop: {e}")    
+                print(f"[{self.name}] Error in control loop: {e}")
+    
+    def _calculate_and_output_control_errors(self, current_state, ref_array):
+        """Calculate and output control errors between current state and reference state"""
+        try:
+            # Current position error (robot vs reference at current time step)
+            current_pos_error = np.sqrt((current_state[0] - ref_array[0, 0])**2 + 
+                                       (current_state[1] - ref_array[1, 0])**2)
+            current_angle_error = abs(current_state[2] - ref_array[2, 0])
+            # Normalize angle error to [-pi, pi]
+            current_angle_error = min(current_angle_error, 2*np.pi - current_angle_error)
+            
+            # Output only position and angle errors
+            print(f"[{self.name}] Control Errors: pos={current_pos_error:.4f}m, θ={current_angle_error:.4f}rad({np.degrees(current_angle_error):.1f}°)")
+            
+            # Store errors for potential logging or further analysis
+            self.last_control_errors = {
+                'current_pos_error': current_pos_error,
+                'current_angle_error': current_angle_error
+            }
+            
+        except Exception as e:
+            print(f"[{self.name}] Error calculating control errors: {e}")
+            # Set default error values if calculation fails
+            self.last_control_errors = {
+                'current_pos_error': float('inf'),
+                'current_angle_error': float('inf')
+            }
+    
     def initialise(self):
         """Initialize the pushing behavior"""
         print(f"[{self.name}] INITIALISE DEBUG: Called at {time.time()}")
@@ -842,11 +872,8 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.pushing_active = False
             return py_trees.common.Status.SUCCESS
         
-        # If pushing was explicitly stopped but parcel hasn't reached relay, it's a failure
-        if not self.pushing_active:
-            print(f"[{self.name}] FAILURE: Push operation stopped before reaching relay point")
-            return py_trees.common.Status.FAILURE
-        
+        # Always return RUNNING if parcel hasn't reached relay point yet
+        # No FAILURE conditions - keep trying until success
         elapsed = time.time() - self.start_time
         
         # Update feedback with distance information
@@ -869,7 +896,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] RUNNING: Trajectory complete, continuing to push parcel toward relay point")
         
         # Timeout check (adjust based on expected trajectory duration)
-        if elapsed >= 60.0:  # 60 second timeout
+        if elapsed >= 120.0: 
             print(f"[{self.name}] FAILURE: Push operation timed out after {elapsed:.1f} seconds")
             return py_trees.common.Status.FAILURE
         
