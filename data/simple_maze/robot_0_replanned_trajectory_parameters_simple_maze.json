@@ -26,9 +26,9 @@
     {
       "arc": [
         1.693161084978374,
-        1.0427116032700658,
-        0.9176659867196404,
-        0.8737277823608383
+        1.042711603270065,
+        0.9176659867196394,
+        0.8737277823608375
       ],
       "line": [
         0.3453875742500878,
@@ -186,12 +186,12 @@
     "total_segments": 2,
     "start_waypoint_idx": 0,
     "end_waypoint_idx": 2,
-    "save_timestamp": "2025-06-12T13:11:35",
+    "save_timestamp": "2025-06-12T13:26:14",
     "case": "simple_maze",
     "N": 3,
     "replanned": true,
-    "replan_timestamp": "2025-06-12T13:11:35",
-    "original_total_time": 45.05317315060063,
+    "replan_timestamp": "2025-06-12T13:26:14",
+    "original_total_time": 45.05317315060073,
     "replanned_total_time": 45.05317315060073,
     "detailed_optimization": true
   }

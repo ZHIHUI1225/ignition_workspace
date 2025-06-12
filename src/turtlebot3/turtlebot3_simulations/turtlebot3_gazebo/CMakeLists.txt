@@ -100,6 +100,7 @@ install(PROGRAMS
   scripts/ParcelManager.py
   scripts/spawn_listener.py
   scripts/parcel_index_publisher.py
+  scripts/trajectory_visualizer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -224,6 +224,21 @@ def generate_launch_description():
             output='screen'
         ))
 
+        # Add trajectory visualizer for each robot
+        trajectory_file_path = f'/root/workspace/data/{case}/tb{i}_Trajectory.json'
+        ld.add_action(Node(
+            package='turtlebot3_gazebo',
+            executable='trajectory_visualizer.py',
+            name=f'{name}_trajectory_visualizer',
+            namespace=namespace,
+            parameters=[{
+                'robot_namespace': namespace,
+                'trajectory_file': trajectory_file_path,
+                'robot_id': i
+            }],
+            output='screen'
+        ))
+
     # Add model state publisher
     parcel_publisher = Node(
         package="turtlebot3_gazebo",
@@ -278,5 +293,21 @@ def generate_launch_description():
         output='screen'
     )
     ld.add_action(world_frame_publisher)
+
+    # Launch RViz2 for trajectory visualization
+    rviz_config_path = os.path.join(
+        get_package_share_directory('turtlebot3_gazebo'),
+        'rviz',
+        'trajectory_visualization.rviz'
+    )
+    
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config_path] if os.path.exists(rviz_config_path) else [],
+        output='screen'
+    )
+    ld.add_action(rviz_node)
 
     return ld

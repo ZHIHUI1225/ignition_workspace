@@ -8,12 +8,16 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_srvs.srv import Trigger
+from geometry_msgs.msg import Twist, PoseStamped
+from nav_msgs.msg import Odometry, Path
 import time
 import threading
 import json
 import numpy as np
 import casadi as ca
 import os
+import math
+from tf_transformations import euler_from_quaternion
 import re
 import copy
 import tf_transformations as tf
@@ -28,16 +32,16 @@ def extract_namespace_number(namespace):
     return int(match.group(1)) if match else 0
 class MobileRobotMPC:
     def __init__(self):
-        # MPC parameters - heavily optimized for fastest computation
-        self.N = 5           # Further reduced prediction horizon for fastest solving
-        self.N_c = 2         # Reduced control horizon for faster computation
+        # MPC parameters - balanced for tracking accuracy and computation speed
+        self.N = 8           # Increased prediction horizon for better tracking
+        self.N_c = 3         # Increased control horizon for smoother control
         self.dt = 0.1        # Time step
-        # Simplified weights for faster computation
-        self.Q = np.diag([20.0, 20.0, 5.0, 0.5, 2.0])  # State weights (x, y, theta, v, omega)
-        # Higher control input weights to reduce control effort and solver complexity
-        self.R = np.diag([0.1, 0.05])       # Control input weights
-        # Simplified terminal cost weights
-        self.F = np.diag([40.0, 40.0, 10.0, 1.0, 5.0])  # Terminal cost weights
+        # Higher position weights for better tracking precision
+        self.Q = np.diag([100.0, 100.0, 10.0, 0.5, 2.0])  # State weights (x, y, theta, v, omega) - increased position weights
+        # Lower control input weights to allow more aggressive control for better tracking
+        self.R = np.diag([0.05, 0.02])       # Control input weights - reduced for better tracking
+        # Much higher terminal position weights for precise goal reaching
+        self.F = np.diag([200.0, 200.0, 20.0, 1.0, 5.0])  # Terminal cost weights - much higher position weights
         
         # Velocity constraints
         self.max_vel = 0.25      # m/s
@@ -75,7 +79,7 @@ class MobileRobotMPC:
         for k in range(self.N):
             # Position error (x,y) - fixed matrix multiplication
             pos_error = self.X[:2, k] - self.ref[:2, k]
-            cost += pos_error.T @ self.Q[:2,:2] @ pos_error
+            cost += ca.mtimes([pos_error.T, self.Q[:2,:2], pos_error])
             
             # Orientation (theta) - scalar operation
             theta_error = self.X[2, k] - self.ref[2, k]
@@ -83,10 +87,10 @@ class MobileRobotMPC:
             
             # Velocity states (v, omega) - track reference velocities
             vel_error = self.X[3:, k] - self.ref[3:, k]
-            cost += vel_error.T @ self.Q[3:,3:] @ vel_error
+            cost += ca.mtimes([vel_error.T, self.Q[3:,3:], vel_error])
             
             # Control cost - fixed matrix multiplication
-            cost += self.U[:, k].T @ self.R @ self.U[:, k]
+            cost += ca.mtimes([self.U[:, k].T, self.R, self.U[:, k]])
             
             # Dynamics constraints
             x_next = self.robot_model(self.X[:, k], self.U[:, k])
@@ -94,7 +98,7 @@ class MobileRobotMPC:
 
         # Terminal cost - fixed matrix operations
         pos_term_error = self.X[:2, -1] - self.ref[:2, -1]
-        cost += pos_term_error.T @ self.F[:2,:2] @ pos_term_error
+        cost += ca.mtimes([pos_term_error.T, self.F[:2,:2], pos_term_error])
         
         # Terminal orientation error
         theta_term_error = self.X[2, -1] - self.ref[2, -1]
@@ -102,7 +106,7 @@ class MobileRobotMPC:
         
         # Terminal velocity errors
         vel_term_error = self.X[3:, -1] - self.ref[3:, -1]
-        cost += vel_term_error.T @ self.F[3:,3:] @ vel_term_error
+        cost += ca.mtimes([vel_term_error.T, self.F[3:,3:], vel_term_error])
 
         # Constraints
         self.opti.subject_to(self.X[:, 0] == self.x0)  # Initial condition
@@ -239,7 +243,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.relay_pose = None
         self.current_parcel_index = 0
         self.last_parcel_index = -1  # Track changes in parcel index
-        self.distance_threshold = 0.08  # Distance threshold for success condition
+        self.distance_threshold = 0.14  # Distance threshold for success condition
         
         # Path messages for visualization
         self.ref_path = Path()
@@ -924,18 +928,42 @@ class PushObject(py_trees.behaviour.Behaviour):
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name):
+    def __init__(self, name, robot_namespace="turtlebot0"):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
         self.node = None
         self.spawn_parcel_client = None
         self.picking_complete = False
-        self.robot_namespace = "turtlebot0"  # Default, will be updated from parameters
+        self.robot_namespace = robot_namespace  # Use provided robot_namespace
         self.case = "simple_maze"  # Default case
         
+        # MPC and trajectory following variables
+        self.trajectory_data = None
+        self.goal = None
+        self.target_pose = np.zeros(3)  # x, y, theta
+        self.current_state = np.zeros(3)  # x, y, theta
+        self.mpc = None
+        self.prediction_horizon = 10
+        
+        # State lock for thread safety
+        self.state_lock = threading.Lock()
+        
+        # Control variables
+        self.cmd_vel_pub = None
+        self.robot_pose_sub = None
+        
+        # Trajectory following variables
+        self.closest_idx = 0
+        self.current_s = 0
+        self.lookahead_distance = 0.3
+        
+        # Convergence tracking
+        self.parallel_count = 0
+        self.last_cross_track_error = 0.0
+        
     def setup(self, **kwargs):
-        """Setup ROS connections"""
+        """Setup ROS connections and load trajectory data"""
         if 'node' in kwargs:
             self.node = kwargs['node']
             # Get robot namespace and case from ROS parameters
@@ -953,7 +981,160 @@ class PickObject(py_trees.behaviour.Behaviour):
             self.spawn_parcel_client = self.node.create_client(
                 Trigger, '/spawn_next_parcel_service')
             
+            # Setup ROS publishers and subscribers for MPC control
+            self._setup_ros_connections()
+            
+            # Load trajectory data (with replanned trajectory support)
+            self._load_trajectory_data()
+            
+            # Initialize MPC controller
+            self._initialize_mpc_controller()
+            
             print(f"[{self.name}] Setting up pick controller for {self.robot_namespace}, case: {self.case}")
+    
+    def _setup_ros_connections(self):
+        """Setup ROS publishers and subscribers for MPC trajectory following"""
+        try:
+            # Command velocity publisher
+            self.cmd_vel_pub = self.node.create_publisher(
+                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            
+            # Robot pose subscriber 
+            self.robot_pose_sub = self.node.create_subscription(
+                Odometry, f'/{self.robot_namespace}/odom_map', 
+                self._robot_pose_callback, 10)
+                
+            print(f"[{self.name}] ROS connections established for MPC control")
+            
+        except Exception as e:
+            print(f"[{self.name}] Error setting up ROS connections: {e}")
+    
+    def _robot_pose_callback(self, msg):
+        """Update robot state from odometry message"""
+        with self.state_lock:
+            # Position
+            self.current_state[0] = msg.pose.pose.position.x
+            self.current_state[1] = msg.pose.pose.position.y
+            
+            # Orientation (yaw)
+            quat = [
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w
+            ]
+            yaw = euler_from_quaternion(quat)[2]
+            self.current_state[2] = yaw
+    
+    def _load_trajectory_data(self):
+        """Load trajectory data with support for replanned trajectories"""
+        try:
+            # First try to load replanned trajectory
+            replanned_file_path = f'/root/workspace/data/{self.case}/{self.robot_namespace}_Trajectory_replanned.json'
+            
+            trajectory_file_path = None
+            if os.path.exists(replanned_file_path):
+                trajectory_file_path = replanned_file_path
+                print(f"[{self.name}] Loading replanned trajectory from {replanned_file_path}")
+            else:
+                print(f"[{self.name}] ERROR: No trajectory file found for {self.robot_namespace}")
+                return False
+            
+            # Load trajectory data
+            with open(trajectory_file_path, 'r') as json_file:
+                data = json.load(json_file)['Trajectory']
+                # Reverse trajectory for picking operation (approach from end)
+                self.trajectory_data = data[::-1]
+            
+            # Set goal as the first point in original trajectory
+            self.goal = data[0]
+            
+            # Calculate target pose (approach position before final goal)
+            self.target_pose[0] = self.goal[0] - 0.4 * np.cos(self.goal[2])
+            self.target_pose[1] = self.goal[1] - 0.4 * np.sin(self.goal[2])
+            self.target_pose[2] = self.goal[2]
+            
+            # Add interpolation points for smoother approach
+            num_interp_points = 5
+            interp_points = []
+            for i in range(num_interp_points):
+                alpha = i / (num_interp_points - 1)  # Interpolation factor (0 to 1)
+                interp_x = self.target_pose[0] * alpha + self.goal[0] * (1 - alpha)
+                interp_y = self.target_pose[1] * alpha + self.goal[1] * (1 - alpha)
+                interp_theta = self.target_pose[2]  # Keep orientation constant
+                
+                interp_points.append([interp_x, interp_y, interp_theta])
+            
+            # Add interpolation points to the trajectory (executed last in reverse)
+            self.trajectory_data = self.trajectory_data + interp_points
+            
+            print(f"[{self.name}] Loaded {len(self.trajectory_data)} trajectory points for picking")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error loading trajectory data: {e}")
+            return False
+    
+    def _initialize_mpc_controller(self):
+        """Initialize MPC controller for trajectory following"""
+        try:
+            # Import MPC controller similar to PickupController approach
+            # Instead of using GeneralMPCController, use a simple approach like PickupController
+            self._setup_simple_mpc()
+            
+            print(f"[{self.name}] MPC controller initialized for picking")
+            
+        except Exception as e:
+            print(f"[{self.name}] Error initializing MPC controller: {e}")
+            # Fallback - use simple behavior without MPC
+            self.mpc = None
+    
+    def _setup_simple_mpc(self):
+        """Setup a simple MPC-like controller following PickupController pattern"""
+        # Create a simple class to mimic the MPC interface we need
+        class SimpleMPCController:
+            def __init__(self):
+                self.N = 10  # Prediction horizon
+                self.ref_traj = None
+                
+            def set_reference_trajectory(self, ref_array):
+                self.ref_traj = ref_array
+                
+            def update(self, current_state):
+                """Simple proportional controller similar to PickupController fallback"""
+                if self.ref_traj is None or self.ref_traj.shape[1] == 0:
+                    return np.array([[0.0], [0.0]])
+                
+                # Target is first reference point
+                target_x = self.ref_traj[0, 0]
+                target_y = self.ref_traj[1, 0]
+                target_theta = self.ref_traj[2, 0]
+                
+                # Calculate errors
+                dx = target_x - current_state[0]
+                dy = target_y - current_state[1]
+                dtheta = target_theta - current_state[2]
+                dtheta = np.arctan2(np.sin(dtheta), np.cos(dtheta))  # Normalize angle
+                
+                distance = np.sqrt(dx**2 + dy**2)
+                desired_heading = np.arctan2(dy, dx)
+                heading_error = desired_heading - current_state[2]
+                heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
+                
+                # Simple P controller for picking (like PickupController fallback)
+                if distance > 0.1:  # Far from target
+                    v = 0.8 * distance * np.cos(heading_error)  # Allow backward if needed
+                    v = np.clip(v, -0.15, 0.15)  # Velocity limits
+                else:  # Close to target, focus on orientation
+                    v = 0.0
+                
+                omega = 2.0 * heading_error + 1.0 * dtheta  # Combined heading and orientation correction
+                omega = np.clip(omega, -1.0, 1.0)  # Angular velocity limits
+                
+                return np.array([[v], [omega]])
+        
+        self.mpc = SimpleMPCController()
+        self.prediction_horizon = self.mpc.N
     
     def initialise(self):
         """Initialize the picking behavior"""
@@ -964,7 +1145,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] Starting to pick object...")
     
     def update(self):
-        """Update picking behavior status"""
+        """Update picking behavior with MPC trajectory following"""
         if self.start_time is None:
             self.start_time = time.time()
         
@@ -972,7 +1153,190 @@ class PickObject(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
         
         elapsed = time.time() - self.start_time
-        self.feedback_message = f"Picking object... {elapsed:.1f}s elapsed"
+        self.feedback_message = f"Following trajectory to pick object... {elapsed:.1f}s elapsed"
+        
+        # If MPC controller is available, use trajectory following
+        if self.mpc and self.trajectory_data:
+            return self._mpc_trajectory_following()
+        else:
+            # Fallback to simple behavior
+            return self._simple_picking_behavior(elapsed)
+    
+    def _mpc_trajectory_following(self):
+        """MPC-based trajectory following for picking operation"""
+        try:
+            # Calculate distance to target
+            with self.state_lock:
+                current_state = self.current_state.copy()
+            
+            distance_error = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
+                                   (current_state[1] - self.target_pose[1])**2)
+            
+            # Calculate orientation error
+            angle_error = abs(current_state[2] - self.target_pose[2])
+            angle_error = min(angle_error, 2*np.pi - angle_error)  # Normalize to [0, pi]
+            
+            # Define stopping criteria
+            position_tolerance = 0.05  # 5cm position tolerance
+            orientation_tolerance = 0.1  # ~5.7 degrees orientation tolerance
+            
+            # Check if picking is complete
+            position_reached = distance_error <= position_tolerance
+            orientation_reached = angle_error <= orientation_tolerance
+            
+            if position_reached and orientation_reached:
+                # Stop robot
+                cmd_msg = Twist()
+                cmd_msg.linear.x = 0.0
+                cmd_msg.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd_msg)
+                
+                self.picking_complete = True
+                print(f"[{self.name}] Successfully reached pick target and completed picking!")
+                return py_trees.common.Status.SUCCESS
+            
+            # Continue trajectory following if not at target
+            if not self._follow_trajectory_with_mpc():
+                print(f"[{self.name}] MPC trajectory following failed")
+                return py_trees.common.Status.FAILURE
+            
+            # Timeout check
+            elapsed = time.time() - self.start_time
+            if elapsed >= 30.0:  # Extended timeout for trajectory following
+                print(f"[{self.name}] Pick operation timed out")
+                return py_trees.common.Status.FAILURE
+            
+            return py_trees.common.Status.RUNNING
+            
+        except Exception as e:
+            print(f"[{self.name}] Error in MPC trajectory following: {e}")
+            return py_trees.common.Status.FAILURE
+    
+    def _follow_trajectory_with_mpc(self):
+        """Follow trajectory using MPC controller (similar to PickupController pattern)"""
+        try:
+            with self.state_lock:
+                current_state = self.current_state.copy()
+            
+            # Find the closest point in the trajectory to current position
+            min_dist = float('inf')
+            closest_idx = 0
+            
+            for i, point in enumerate(self.trajectory_data):
+                dist = np.sqrt((current_state[0] - point[0])**2 + 
+                             (current_state[1] - point[1])**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            
+            # Look ahead for better trajectory tracking
+            current_s = closest_idx
+            for i in range(closest_idx, len(self.trajectory_data)):
+                point = self.trajectory_data[i]
+                dist_ahead = np.sqrt((current_state[0] - point[0])**2 + 
+                                   (current_state[1] - point[1])**2)
+                if dist_ahead >= self.lookahead_distance:
+                    current_s = i
+                    break
+            
+            # Generate reference trajectory from trajectory data
+            ref_array = np.zeros((3, self.prediction_horizon + 1))
+            
+            # Create reference trajectory with proper spacing
+            for i in range(self.prediction_horizon + 1):
+                # Calculate trajectory index with proper progression
+                traj_idx = min(current_s + i, len(self.trajectory_data) - 1)
+                
+                # Use trajectory point or project final point
+                if traj_idx >= len(self.trajectory_data) - 1:
+                    point = self.trajectory_data[-1]  # Use final point
+                else:
+                    point = self.trajectory_data[traj_idx]
+                
+                ref_array[0, i] = point[0]  # x
+                ref_array[1, i] = point[1]  # y
+                ref_array[2, i] = point[2]  # theta
+            
+            # Apply cross-track error correction (like PickupController)
+            cross_track_gain = 0.5
+            if closest_idx < len(self.trajectory_data) - 1:
+                closest_point = self.trajectory_data[closest_idx]
+                next_point = self.trajectory_data[min(closest_idx + 1, len(self.trajectory_data) - 1)]
+                
+                # Path direction vector
+                path_dx = next_point[0] - closest_point[0]
+                path_dy = next_point[1] - closest_point[1]
+                path_length = np.sqrt(path_dx**2 + path_dy**2)
+                
+                if path_length > 0.01:  # Avoid division by zero
+                    # Normalized path direction
+                    path_dx /= path_length
+                    path_dy /= path_length
+                    
+                    # Vector from path point to robot
+                    robot_dx = current_state[0] - closest_point[0]
+                    robot_dy = current_state[1] - closest_point[1]
+                    
+                    # Cross-track error (perpendicular distance from path)
+                    cross_track_error = robot_dx * (-path_dy) + robot_dy * path_dx
+                    
+                    # Correction vector (perpendicular to path, towards path)
+                    correction_x = -cross_track_error * (-path_dy) * cross_track_gain
+                    correction_y = -cross_track_error * path_dx * cross_track_gain
+                    
+                    # Limit correction magnitude
+                    max_correction = 0.2  # meters
+                    correction_magnitude = np.sqrt(correction_x**2 + correction_y**2)
+                    if correction_magnitude > max_correction:
+                        correction_x *= max_correction / correction_magnitude
+                        correction_y *= max_correction / correction_magnitude
+                    
+                    # Apply correction to first reference point
+                    ref_array[0, 0] += correction_x
+                    ref_array[1, 0] += correction_y
+            
+            # Update MPC with reference and get control
+            self.mpc.set_reference_trajectory(ref_array)
+            control_input = self.mpc.update(current_state)
+            
+            if control_input is not None and not np.isnan(control_input).any():
+                # Apply velocity scaling for approach
+                distance_to_target = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
+                                           (current_state[1] - self.target_pose[1])**2)
+                
+                # Scale velocities based on distance to target
+                approach_distance = 0.15
+                fine_approach_distance = 0.08
+                
+                if distance_to_target <= fine_approach_distance:
+                    scale_factor = 0.1 + 0.1 * (distance_to_target / fine_approach_distance)
+                elif distance_to_target <= approach_distance:
+                    scale_factor = 0.2 + 0.4 * (distance_to_target / approach_distance)
+                else:
+                    scale_factor = 1.0
+                
+                # Create and publish command
+                cmd_msg = Twist()
+                cmd_msg.linear.x = float(control_input[0, 0]) * scale_factor
+                cmd_msg.angular.z = float(control_input[1, 0]) * scale_factor
+                
+                self.cmd_vel_pub.publish(cmd_msg)
+                
+                print(f'[{self.name}] MPC control: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f}, '
+                      f'dist_to_target={distance_to_target:.3f}m')
+                
+                return True
+            else:
+                print(f"[{self.name}] MPC returned invalid control")
+                return False
+                
+        except Exception as e:
+            print(f"[{self.name}] Error in trajectory following: {e}")
+            return False
+    
+    def _simple_picking_behavior(self, elapsed):
+        """Fallback simple picking behavior when MPC is not available"""
+        self.feedback_message = f"Picking object (simple mode)... {elapsed:.1f}s elapsed"
         
         # Simple simulation - complete after 3 seconds
         if elapsed >= 3.0:
@@ -983,7 +1347,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             self._update_parcel_index()
             
             self.picking_complete = True
-            print(f"[{self.name}] Successfully picked object!")
+            print(f"[{self.name}] Successfully picked object (simple mode)!")
             return py_trees.common.Status.SUCCESS
         
         # Timeout check
@@ -1014,10 +1378,11 @@ class PickObject(py_trees.behaviour.Behaviour):
         """Update the current_parcel_index in blackboard"""
         try:
             blackboard = self.attach_blackboard_client(name=self.name)
-            blackboard.register_key(key="current_parcel_index", access=py_trees.common.Access.WRITE)
-            current_index = getattr(blackboard, 'current_parcel_index', 0)
-            blackboard.current_parcel_index = current_index + 1
-            print(f"[{self.name}] Updated current_parcel_index to {blackboard.current_parcel_index}")
+            parcel_index_key = f"{self.robot_namespace}/current_parcel_index"
+            blackboard.register_key(key=parcel_index_key, access=py_trees.common.Access.WRITE)
+            current_index = getattr(blackboard, parcel_index_key, 0)
+            setattr(blackboard, parcel_index_key, current_index + 1)
+            print(f"[{self.name}] Updated {parcel_index_key} to {current_index + 1}")
         except Exception as e:
             print(f"[{self.name}] Failed to update current_parcel_index: {e}")
     
