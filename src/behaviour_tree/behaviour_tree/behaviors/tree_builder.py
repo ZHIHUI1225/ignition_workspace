@@ -6,9 +6,10 @@ Contains the main tree building logic and sequences.
 
 import py_trees
 from .basic_behaviors import (
-    ResetFlags, WaitAction, WaitForPush, WaitForPick, ReplanPath, StopSystem, 
+    ResetFlags, WaitAction, WaitForPush, WaitForPick, StopSystem, 
     CheckPairComplete, IncrementIndex, PrintMessage
 )
+from .ReplanPath_behaviour import ReplanPath
 from .movement_behaviors import ApproachObject, MoveBackward
 from .manipulation_behaviors import PushObject, PickObject
 
@@ -29,7 +30,7 @@ def create_root(robot_namespace="turtlebot0"):
         py_trees.behaviours.SetBlackboardVariable(
             name="Initialize pushing estimated time",
             variable_name=f"{robot_namespace}/pushing_estimated_time",
-            variable_value=0.0,
+            variable_value=45.0,
             overwrite=True
         ),
         ResetFlags("ResetFlags")
@@ -57,8 +58,8 @@ def create_root(robot_namespace="turtlebot0"):
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        ReplanPath("Replanning", 2.0),
-        PickObject("PickingUp"),
+        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze"),
+        PickObject("PickingUp", robot_namespace),
         StopSystem("Stop", 1.5)
     ])
     
@@ -107,7 +108,7 @@ def create_picking_sequence(robot_namespace="turtlebot0"):
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
         ReplanPath("Replanning", 2.0),
-        PickObject("PickingUp"),
+        PickObject("PickingUp", robot_namespace),
         StopSystem("Stop", 1.5)
     ])
     return picking_up_sequence

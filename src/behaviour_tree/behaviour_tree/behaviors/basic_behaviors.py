@@ -3,26 +3,26 @@
 Basic behavior classes for the behavior tree system.
 Contains utility behaviors like waiting, resetting, and message printing.
 """
-import py_trees
-import py_trees.behaviour
-import py_trees.common
-import py_trees.blackboard
-import rclpy
 import time
 import math
 import re
-import threading
-import casadi as ca
-import numpy as np
-import tf_transformations
-import json
 import os
+import json
 import copy
+import numpy as np
+import py_trees
+import rclpy
+import casadi as ca
+import traceback
+import threading
+import tf_transformations
 from scipy.interpolate import CubicSpline
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Int32, Float64
+
+
 
 
 class ResetFlags(py_trees.behaviour.Behaviour):
@@ -614,939 +614,6 @@ class WaitAction(py_trees.behaviour.Behaviour):
         super().terminate(new_status)
 
 
-class ReplanPath(py_trees.behaviour.Behaviour):
-    """Path replanning behavior with trajectory optimization"""
-    
-    def __init__(self, name, duration=1.5, robot_namespace="turtlebot0", case="simple_maze"):
-        super().__init__(name)
-        self.duration = duration
-        self.start_time = None
-        self.robot_namespace = robot_namespace
-        self.case = case
-        
-        # Extract robot ID from namespace for file paths
-        self.robot_id = self.extract_namespace_number(robot_namespace)
-        
-        # Setup blackboard access to read pushing_estimated_time
-        self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/pushing_estimated_time", 
-            access=py_trees.common.Access.READ
-        )
-        
-        # Replanning state
-        self.replanning_complete = False
-        self.replanned_successfully = False
-        
-    def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0)"""
-        match = re.search(r'turtlebot(\d+)', namespace)
-        return int(match.group(1)) if match else 0
-    
-    def initialise(self):
-        self.start_time = time.time()
-        self.replanning_complete = False
-        self.replanned_successfully = False
-        self.feedback_message = f"Replanning path for {self.duration}s"
-        print(f"[{self.name}] Starting trajectory replanning for robot {self.robot_id}...")
-    
-    def update(self):
-        if self.start_time is None:
-            self.start_time = time.time()
-        
-        elapsed = time.time() - self.start_time
-        
-        # Perform replanning on first update
-        if not self.replanning_complete:
-            try:
-                # Get target time from blackboard
-                target_time = getattr(self.blackboard, f'{self.robot_namespace}/pushing_estimated_time', 45.0)
-                print(f"[{self.name}] Target time from blackboard: {target_time:.2f}s")
-                
-                # Perform trajectory replanning
-                result = self.replan_trajectory_to_target(
-                    case=self.case,
-                    target_time=target_time,
-                    robot_id=self.robot_id
-                )
-                
-                if result:
-                    print(f"[{self.name}] Trajectory replanning successful!")
-                    self.replanned_successfully = True
-                else:
-                    print(f"[{self.name}] Trajectory replanning failed!")
-                    self.replanned_successfully = False
-                    
-                self.replanning_complete = True
-                
-            except Exception as e:
-                print(f"[{self.name}] Error during replanning: {e}")
-                self.replanning_complete = True
-                self.replanned_successfully = False
-        
-        # Update progress feedback
-        progress = min(elapsed / self.duration, 1.0)
-        self.feedback_message = f"Replanning path... {progress*100:.1f}% complete"
-        
-        # Check if duration has elapsed
-        if elapsed >= self.duration:
-            if self.replanned_successfully:
-                print(f"[{self.name}] Successfully replanned trajectory!")
-                return py_trees.common.Status.SUCCESS
-            else:
-                print(f"[{self.name}] Trajectory replanning failed!")
-                return py_trees.common.Status.FAILURE
-                
-        return py_trees.common.Status.RUNNING
-    
-    def replan_trajectory_to_target(self, case, target_time, robot_id):
-        """
-        Load existing trajectory and replan to achieve target time using optimization
-        Works with existing tb{id}_Trajectory.json files
-        """
-        print(f"[{self.name}] Loading trajectory for Robot {robot_id}...")
-        
-        # Load existing trajectory
-        trajectory_data = self.load_existing_trajectory(case, robot_id)
-        
-        if not trajectory_data:
-            print(f"[{self.name}] No trajectory data found for Robot {robot_id}!")
-            return False
-        
-        trajectory_points = trajectory_data.get('Trajectory', [])
-        if not trajectory_points:
-            print(f"[{self.name}] No trajectory points found for Robot {robot_id}!")
-            return False
-        
-        # Calculate current trajectory duration
-        current_duration = len(trajectory_points) * 0.1  # Assuming 0.1s time step
-        
-        print(f"[{self.name}] Current duration: {current_duration:.3f}s, Target: {target_time:.3f}s")
-        print(f"[{self.name}] Original trajectory has {len(trajectory_points)} points")
-        
-        # Solve optimization problem to find optimal time allocation
-        try:
-            # Solve optimization problem to replan trajectory
-            optimized_trajectory = self.solve_trajectory_optimization(
-                trajectory_points, target_time
-            )
-            
-            if not optimized_trajectory:
-                print(f"[{self.name}] Failed to solve optimization problem")
-                return False
-            
-            # Save replanned trajectory
-            success = self.save_replanned_trajectory_direct(
-                optimized_trajectory, case, robot_id, target_time
-            )
-            
-            if success:
-                print(f"[{self.name}] Trajectory replanning successful!")
-                print(f"[{self.name}] Optimization: {current_duration:.3f}s → {target_time:.3f}s")
-                print(f"[{self.name}] New trajectory has {len(optimized_trajectory)} points")
-                return True
-            else:
-                print(f"[{self.name}] Failed to save replanned trajectory")
-                return False
-            
-        except Exception as e:
-            print(f"[{self.name}] Trajectory replanning failed: {e}")
-            return False
-    
-    def solve_trajectory_optimization(self, original_trajectory, target_time):
-        """
-        Solve optimization problem to replan trajectory for target time
-        Uses CasADi to solve nonlinear optimization problem
-        """
-        try:
-            print(f"[{self.name}] Setting up optimization problem...")
-            
-            # Extract trajectory information
-            n_points = len(original_trajectory)
-            dt_original = 0.1  # Original time step
-            current_duration = n_points * dt_original
-            
-            # Extract positions and velocities from original trajectory
-            x_orig = [pt[0] for pt in original_trajectory]
-            y_orig = [pt[1] for pt in original_trajectory] 
-            theta_orig = [pt[2] for pt in original_trajectory]
-            v_orig = [pt[3] for pt in original_trajectory]
-            w_orig = [pt[4] for pt in original_trajectory]
-            
-            # Segment the trajectory for optimization
-            n_segments = min(10, n_points // 5)  # Limit number of segments for computational efficiency
-            segment_size = n_points // n_segments
-            
-            print(f"[{self.name}] Dividing trajectory into {n_segments} segments of size ~{segment_size}")
-            
-            # Setup CasADi optimization problem
-            opti = ca.Opti()
-            
-            # Decision variables: time allocation for each segment
-            segment_times = opti.variable(n_segments)
-            
-            # Constraints: all segment times must be positive and reasonable
-            min_segment_time = 0.1  # Minimum time per segment
-            max_segment_time = target_time * 0.7  # Maximum time per segment (prevent one segment taking all time)
-            
-            for i in range(n_segments):
-                opti.subject_to(segment_times[i] >= min_segment_time)
-                opti.subject_to(segment_times[i] <= max_segment_time)
-            
-            # Total time constraint
-            opti.subject_to(ca.sum1(segment_times) == target_time)
-            
-            # Smoothness constraints: adjacent segments shouldn't differ too much
-            max_time_ratio = 3.0  # Adjacent segments can differ by at most 3x
-            for i in range(n_segments - 1):
-                opti.subject_to(segment_times[i] <= max_time_ratio * segment_times[i+1])
-                opti.subject_to(segment_times[i+1] <= max_time_ratio * segment_times[i])
-            
-            # Objective: minimize deviation from original velocity profile while maintaining smoothness
-            cost = 0
-            
-            # Cost for deviating from original timing profile (weighted)
-            original_segment_times = [current_duration / n_segments] * n_segments
-            for i in range(n_segments):
-                time_deviation = (segment_times[i] - original_segment_times[i]) ** 2
-                cost += 0.5 * time_deviation  # Reduced weight to allow more flexibility
-            
-            # Smoothness cost: penalize large differences between adjacent segment times
-            for i in range(n_segments - 1):
-                smoothness_cost = (segment_times[i] - segment_times[i+1]) ** 2
-                cost += 0.2 * smoothness_cost  # Increased smoothness weight
-            
-            # Velocity constraint cost: ensure velocities remain feasible
-            max_velocity = 0.8  # m/s - increased maximum velocity
-            max_angular_velocity = 1.5  # rad/s - increased maximum angular velocity
-            
-            for i in range(n_segments):
-                # Calculate segment characteristics
-                start_idx = i * segment_size
-                end_idx = min((i + 1) * segment_size, n_points - 1)
-                
-                if start_idx < len(x_orig) and end_idx < len(x_orig):
-                    # Calculate required velocity for this segment
-                    segment_distance = math.sqrt(
-                        (x_orig[end_idx] - x_orig[start_idx])**2 + 
-                        (y_orig[end_idx] - y_orig[start_idx])**2
-                    )
-                    
-                    if segment_distance > 0:
-                        # Required velocity = distance / time
-                        required_velocity = segment_distance / segment_times[i]
-                        
-                        # Soft constraint for velocity limits
-                        velocity_violation = ca.fmax(0, required_velocity - max_velocity)
-                        cost += 100 * velocity_violation**2  # High penalty for velocity violations
-                        
-                        # Add preference for reasonable velocities (not too slow either)
-                        min_velocity = 0.05  # m/s minimum
-                        slow_penalty = ca.fmax(0, min_velocity - required_velocity)
-                        cost += 10 * slow_penalty**2
-            
-            # Set objective
-            opti.minimize(cost)
-            
-            # Initial guess: proportional to original segment distances
-            initial_times = []
-            total_distance = 0
-            segment_distances = []
-            
-            for i in range(n_segments):
-                start_idx = i * segment_size
-                end_idx = min((i + 1) * segment_size, n_points - 1)
-                
-                if start_idx < len(x_orig) and end_idx < len(x_orig):
-                    segment_distance = math.sqrt(
-                        (x_orig[end_idx] - x_orig[start_idx])**2 + 
-                        (y_orig[end_idx] - y_orig[start_idx])**2
-                    )
-                    segment_distances.append(segment_distance)
-                    total_distance += segment_distance
-                else:
-                    segment_distances.append(1.0)  # Default distance
-                    total_distance += 1.0
-            
-            # Allocate time proportional to distance, but bounded
-            for i in range(n_segments):
-                if total_distance > 0:
-                    proportional_time = (segment_distances[i] / total_distance) * target_time
-                    # Bound the initial guess to reasonable values
-                    bounded_time = max(min_segment_time, min(proportional_time, max_segment_time))
-                    initial_times.append(bounded_time)
-                else:
-                    initial_times.append(target_time / n_segments)
-            
-            # Normalize to ensure total equals target_time
-            time_sum = sum(initial_times)
-            if time_sum > 0:
-                initial_times = [t * target_time / time_sum for t in initial_times]
-            else:
-                initial_times = [target_time / n_segments] * n_segments
-            
-            opti.set_initial(segment_times, initial_times)
-            print(f"[{self.name}] Initial time guess: {[f'{t:.3f}' for t in initial_times]}")
-            
-            # Configure solver
-            opts = {
-                'ipopt.max_iter': 500,
-                'ipopt.tol': 1e-6,
-                'ipopt.print_level': 0,
-                'print_time': False,
-                'ipopt.acceptable_tol': 1e-4,
-                'ipopt.acceptable_obj_change_tol': 1e-6
-            }
-            opti.solver('ipopt', opts)
-            
-            print(f"[{self.name}] Solving optimization problem...")
-            
-            # Solve the optimization problem
-            sol = opti.solve()
-            
-            # Extract optimal segment times
-            optimal_times = sol.value(segment_times)
-            
-            print(f"[{self.name}] Optimization solved successfully!")
-            print(f"[{self.name}] Optimal segment times: {[f'{t:.3f}' for t in optimal_times]}")
-            
-            # Generate new trajectory with optimal timing
-            optimized_trajectory = self.generate_trajectory_from_optimal_times(
-                original_trajectory, optimal_times, target_time
-            )
-            
-            return optimized_trajectory
-            
-        except Exception as e:
-            print(f"[{self.name}] Optimization failed: {e}")
-            # Fallback to simple interpolation if optimization fails
-            return self.create_simple_time_interpolated_trajectory(original_trajectory, target_time)
-    
-    def generate_trajectory_from_optimal_times(self, original_trajectory, optimal_times, target_time):
-        """
-        Generate new trajectory using optimal time allocation
-        """
-        try:
-            n_points = len(original_trajectory)
-            n_segments = len(optimal_times)
-            segment_size = n_points // n_segments
-            
-            # New time step to achieve target duration
-            dt_new = 0.1  # Keep same discretization
-            n_new_points = int(target_time / dt_new)
-            
-            # Extract original trajectory data
-            x_orig = np.array([pt[0] for pt in original_trajectory])
-            y_orig = np.array([pt[1] for pt in original_trajectory])
-            theta_orig = np.array([pt[2] for pt in original_trajectory])
-            
-            # Create cumulative time arrays for original and new trajectories
-            original_times = np.arange(0, len(original_trajectory) * 0.1, 0.1)
-            
-            # Build new time array based on optimal segment times
-            new_times = []
-            current_time = 0.0
-            
-            for i, seg_time in enumerate(optimal_times):
-                start_idx = i * segment_size
-                end_idx = min((i + 1) * segment_size, n_points)
-                segment_points = end_idx - start_idx
-                
-                if segment_points > 0:
-                    segment_dt = seg_time / segment_points
-                    for j in range(segment_points):
-                        new_times.append(current_time + j * segment_dt)
-                    current_time += seg_time
-            
-            # Ensure we have the right number of time points
-            while len(new_times) < n_points:
-                new_times.append(new_times[-1] + dt_new)
-            new_times = new_times[:n_points]
-            
-            # Create uniform output time grid
-            output_times = np.arange(0, target_time, dt_new)
-            
-            # Interpolate trajectory to new timing
-            from scipy.interpolate import interp1d
-            
-            # Create interpolation functions
-            if len(new_times) >= 2 and len(original_times) >= 2:
-                # Map from original times to new times
-                time_mapping = interp1d(original_times[:len(new_times)], new_times, 
-                                      kind='linear', fill_value='extrapolate')
-                
-                # Interpolate positions using the new timing
-                interp_x = interp1d(new_times, x_orig[:len(new_times)], 
-                                  kind='cubic', fill_value='extrapolate')
-                interp_y = interp1d(new_times, y_orig[:len(new_times)], 
-                                  kind='cubic', fill_value='extrapolate')
-                interp_theta = interp1d(new_times, theta_orig[:len(new_times)], 
-                                      kind='linear', fill_value='extrapolate')
-                
-                # Generate new trajectory
-                new_trajectory = []
-                for t in output_times:
-                    x = float(interp_x(t))
-                    y = float(interp_y(t))
-                    theta = float(interp_theta(t))
-                    
-                    # Calculate velocities
-                    if len(new_trajectory) > 0:
-                        prev_x, prev_y, prev_theta = new_trajectory[-1][:3]
-                        dt = dt_new
-                        
-                        # Linear velocity
-                        v = math.sqrt((x - prev_x)**2 + (y - prev_y)**2) / dt
-                        
-                        # Angular velocity
-                        dtheta = theta - prev_theta
-                        while dtheta > math.pi:
-                            dtheta -= 2 * math.pi
-                        while dtheta < -math.pi:
-                            dtheta += 2 * math.pi
-                        w = dtheta / dt
-                    else:
-                        v = 0.0
-                        w = 0.0
-                    
-                    new_trajectory.append([x, y, theta, v, w])
-                
-                print(f"[{self.name}] Generated optimized trajectory with {len(new_trajectory)} points")
-                return new_trajectory
-            else:
-                print(f"[{self.name}] Insufficient points for interpolation")
-                return self.create_simple_time_interpolated_trajectory(original_trajectory, target_time)
-                
-        except Exception as e:
-            print(f"[{self.name}] Error generating trajectory from optimal times: {e}")
-            return self.create_simple_time_interpolated_trajectory(original_trajectory, target_time)
-    
-    def create_simple_time_interpolated_trajectory(self, original_trajectory, target_time):
-        """
-        Fallback method: simple time interpolation of trajectory
-        """
-        try:
-            dt_new = 0.1
-            n_new_points = int(target_time / dt_new)
-            n_orig_points = len(original_trajectory)
-            
-            if n_orig_points < 2:
-                return original_trajectory
-            
-            # Create uniform interpolation
-            new_trajectory = []
-            for i in range(n_new_points):
-                # Map new index to original trajectory
-                orig_index = (i / (n_new_points - 1)) * (n_orig_points - 1)
-                
-                # Linear interpolation between adjacent points
-                idx_low = int(orig_index)
-                idx_high = min(idx_low + 1, n_orig_points - 1)
-                alpha = orig_index - idx_low
-                
-                if idx_low < len(original_trajectory) and idx_high < len(original_trajectory):
-                    pt_low = original_trajectory[idx_low]
-                    pt_high = original_trajectory[idx_high]
-                    
-                    # Interpolate all components
-                    x = pt_low[0] + alpha * (pt_high[0] - pt_low[0])
-                    y = pt_low[1] + alpha * (pt_high[1] - pt_low[1])
-                    theta = pt_low[2] + alpha * (pt_high[2] - pt_low[2])
-                    v = pt_low[3] + alpha * (pt_high[3] - pt_low[3])
-                    w = pt_low[4] + alpha * (pt_high[4] - pt_low[4])
-                    
-                    new_trajectory.append([x, y, theta, v, w])
-            
-            print(f"[{self.name}] Created fallback interpolated trajectory with {len(new_trajectory)} points")
-            return new_trajectory
-            
-        except Exception as e:
-            print(f"[{self.name}] Error in fallback trajectory creation: {e}")
-            return original_trajectory
-
-    def load_trajectory_parameters_individual(self, case, robot_ids):
-        """Load trajectory parameters from individual robot trajectory parameter files"""
-        data_dir = f'/root/workspace/data/{case}/'
-        trajectory_data = {}
-        
-        for robot_id in robot_ids:
-            robot_file = f'{data_dir}robot_{robot_id}_trajectory_parameters_{case}.json'
-            
-            if os.path.exists(robot_file):
-                try:
-                    with open(robot_file, 'r') as f:
-                        data = json.load(f)
-                    trajectory_data[f'robot{robot_id}'] = data
-                    print(f"[{self.name}] Loaded trajectory parameters from {robot_file}")
-                except Exception as e:
-                    print(f"[{self.name}] Error loading {robot_file}: {e}")
-            else:
-                print(f"[{self.name}] Robot trajectory file not found: {robot_file}")
-        
-        return trajectory_data
-    
-    def save_replanned_trajectory(self, replanned_data, case, robot_id):
-        """Save replanned trajectory parameters to file"""
-        try:
-            output_dir = f'/root/workspace/data/{case}/'
-            os.makedirs(output_dir, exist_ok=True)
-            
-            output_file = f'{output_dir}robot_{robot_id}_replanned_trajectory_parameters_{case}.json'
-            
-            with open(output_file, 'w') as f:
-                json.dump(replanned_data, f, indent=2)
-            
-            print(f"[{self.name}] Replanned trajectory saved: {output_file}")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] Error saving replanned trajectory: {e}")
-            return False
-    
-    def generate_discrete_trajectory_from_replanned(self, case, robot_id, dt=0.1):
-        """Generate discrete trajectory from replanned trajectory parameters"""
-        try:
-            # Load replanned trajectory parameters
-            data_dir = f'/root/workspace/data/{case}/'
-            replanned_file = f'{data_dir}robot_{robot_id}_replanned_trajectory_parameters_{case}.json'
-            
-            if not os.path.exists(replanned_file):
-                print(f"[{self.name}] Replanned trajectory file not found: {replanned_file}")
-                return False
-            
-            with open(replanned_file, 'r') as f:
-                replanned_data = json.load(f)
-            
-            # Extract trajectory components
-            waypoints = replanned_data.get('waypoints', [])
-            phi = replanned_data.get('phi', [])
-            r0 = replanned_data.get('r0', [])
-            l = replanned_data.get('l', [])
-            phi_new = replanned_data.get('phi_new', [])
-            time_segments = replanned_data.get('time_segments', [])
-            Flagb = replanned_data.get('Flagb', [])
-            
-            if not all([waypoints, phi, r0, l, phi_new, time_segments, Flagb]):
-                print(f"[{self.name}] Missing trajectory components in replanned data")
-                return False
-            
-            # Generate discrete trajectory points
-            trajectory_points = self.discretize_trajectory_from_parameters(
-                waypoints, phi, r0, l, phi_new, time_segments, Flagb, dt
-            )
-            
-            if not trajectory_points:
-                print(f"[{self.name}] Failed to generate discrete trajectory points")
-                return False
-            
-            # Save discrete trajectory in tb{robot_id}_Trajectory.json format
-            discrete_file = f'{data_dir}tb{robot_id}_Trajectory_replanned.json'
-            trajectory_data = {
-                "Trajectory": trajectory_points
-            }
-            
-            with open(discrete_file, 'w') as f:
-                json.dump(trajectory_data, f, indent=2)
-            
-            print(f"[{self.name}] Discrete replanned trajectory saved: {discrete_file}")
-            print(f"[{self.name}] Generated {len(trajectory_points)} trajectory points")
-            
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] Error generating discrete trajectory: {e}")
-            return False
-    
-    def discretize_trajectory_from_parameters(self, waypoints, phi, r0, l, phi_new, time_segments, Flagb, dt):
-        """
-        Discretize trajectory from parameters using cubic spline interpolation
-        Returns list of trajectory points in format [x, y, theta, v, w]
-        """
-        try:
-            # This is a simplified version - in a full implementation, you would need
-            # to load the reeb graph and use the full discretization logic
-            # For now, create a basic trajectory based on available parameters
-            
-            N = len(waypoints) - 1  # Number of segments
-            all_times = []
-            all_xs = []
-            all_ys = []
-            current_time = 0.0
-            
-            # Simple discretization - assuming linear interpolation between waypoints
-            # In a full implementation, you would use the actual arc/line segments with proper geometry
-            for i in range(N):
-                if i < len(time_segments):
-                    segment_time = 0.0
-                    segment = time_segments[i]
-                    
-                    if 'arc' in segment and isinstance(segment['arc'], list):
-                        segment_time += sum(segment['arc'])
-                    if 'line' in segment and isinstance(segment['line'], list):
-                        segment_time += sum(segment['line'])
-                    
-                    # Create time points for this segment
-                    num_points = max(int(segment_time / dt), 1)
-                    segment_times = np.linspace(0, segment_time, num_points)
-                    
-                    # Simple linear interpolation between waypoints
-                    # In reality, you would use the actual arc/line geometry
-                    for j, seg_time in enumerate(segment_times):
-                        all_times.append(current_time + seg_time)
-                        # Simple interpolation (would need actual waypoint coordinates)
-                        all_xs.append(float(i + j / len(segment_times)))
-                        all_ys.append(float(i * 0.5 + j * 0.1 / len(segment_times)))
-                    
-                    current_time += segment_time
-            
-            # Create uniform time grid
-            total_time = all_times[-1] if all_times else 1.0
-            t_uniform = np.arange(0, total_time, dt)
-            
-            if len(all_times) < 2:
-                print(f"[{self.name}] Insufficient trajectory points for interpolation")
-                return []
-            
-            # Interpolate positions using cubic spline
-            cs_x = CubicSpline(all_times, all_xs)
-            cs_y = CubicSpline(all_times, all_ys)
-            
-            x_uniform = cs_x(t_uniform)
-            y_uniform = cs_y(t_uniform)
-            
-            # Calculate orientations and velocities
-            trajectory_points = []
-            for i in range(len(t_uniform)):
-                if i < len(t_uniform) - 1:
-                    # Calculate velocity
-                    dx = x_uniform[i+1] - x_uniform[i]
-                    dy = y_uniform[i+1] - y_uniform[i]
-                    v = math.sqrt(dx*dx + dy*dy) / dt
-                    
-                    # Calculate orientation
-                    theta = math.atan2(dy, dx)
-                    
-                    # Calculate angular velocity
-                    if i > 0:
-                        prev_theta = trajectory_points[i-1][2]
-                        dtheta = theta - prev_theta
-                        # Normalize angle difference
-                        while dtheta > math.pi:
-                            dtheta -= 2 * math.pi
-                        while dtheta < -math.pi:
-                            dtheta += 2 * math.pi
-                        w = dtheta / dt
-                    else:
-                        w = 0.0
-                else:
-                    # Last point
-                    v = 0.0
-                    w = 0.0
-                    if len(trajectory_points) > 0:
-                        theta = trajectory_points[-1][2]
-                    else:
-                        theta = 0.0
-                
-                trajectory_points.append([
-                    float(x_uniform[i]),
-                    float(y_uniform[i]),
-                    float(theta),
-                    float(v),
-                    float(w)
-                ])
-            
-            return trajectory_points
-            
-        except Exception as e:
-            print(f"[{self.name}] Error in trajectory discretization: {e}")
-            return []
-    
-
-    def load_existing_trajectory(self, case, robot_id):
-        """Load existing trajectory from tb{id}_Trajectory.json files"""
-        try:
-            # Try different possible locations for trajectory files
-            possible_paths = [
-                f'/root/workspace/data/{case}/tb{robot_id}_Trajectory.json'
-            ]
-            
-            for trajectory_file in possible_paths:
-                if os.path.exists(trajectory_file):
-                    with open(trajectory_file, 'r') as f:
-                        data = json.load(f)
-                    print(f"[{self.name}] Loaded trajectory from {trajectory_file}")
-                    return data
-            
-            print(f"[{self.name}] No trajectory file found for robot {robot_id} in any location")
-            return None
-            
-        except Exception as e:
-            print(f"[{self.name}] Error loading trajectory: {e}")
-            return None
-    
-    
-    def save_replanned_trajectory_direct(self, replanned_trajectory, case, robot_id, target_time):
-        """Save replanned trajectory directly to JSON file"""
-        try:
-            # Create output directory if it doesn't exist
-            output_dir = f'/root/workspace/data/{case}/'
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Create replanned trajectory data structure
-            trajectory_data = {
-                "Trajectory": replanned_trajectory,
-                "metadata": {
-                    "replanned": True,
-                    "target_time": target_time,
-                    "original_points": len(replanned_trajectory),
-                    "dt": 0.1,
-                    "replanning_timestamp": time.time()
-                }
-            }
-            
-            # Save to file
-            output_file = f'{output_dir}tb{robot_id}_Trajectory_replanned.json'
-            with open(output_file, 'w') as f:
-                json.dump(trajectory_data, f, indent=2)
-            
-            print(f"[{self.name}] Replanned trajectory saved to: {output_file}")
-            print(f"[{self.name}] Trajectory contains {len(replanned_trajectory)} points")
-            print(f"[{self.name}] Target duration: {target_time:.3f}s")
-            
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] Error saving replanned trajectory: {e}")
-            return False
-
-
-class StopSystem(py_trees.behaviour.Behaviour):
-    """System stop behavior"""
-    
-    def __init__(self, name, duration=1.0):
-        super().__init__(name)
-        self.duration = duration
-        self.start_time = None
-    
-    def initialise(self):
-        self.start_time = time.time()
-        self.feedback_message = f"Stopping system for {self.duration}s"
-        print(f"[{self.name}] Starting to stop system...")
-    
-    def update(self):
-        if self.start_time is None:
-            self.start_time = time.time()
-        
-        elapsed = time.time() - self.start_time
-        if elapsed >= self.duration:
-            print(f"[{self.name}] System stopped!")
-            return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.RUNNING
-
-
-class CheckPairComplete(py_trees.behaviour.Behaviour):
-    """Check if robot pair operation is complete"""
-    
-    def __init__(self, name):
-        super().__init__(name)
-    
-    def update(self):
-        print(f"[{self.name}] Checking if pair is complete...")
-        return py_trees.common.Status.SUCCESS
-
-
-class IncrementIndex(py_trees.behaviour.Behaviour):
-    """Increment current_parcel_index on blackboard"""
-    
-    def __init__(self, name, robot_namespace="turtlebot0"):
-        super().__init__(name)
-        self.robot_namespace = robot_namespace
-        
-        # Setup blackboard access for namespaced current_parcel_index
-        self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/current_parcel_index", 
-            access=py_trees.common.Access.WRITE
-        )
-    
-    def update(self):
-        try:
-            current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-            setattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', current_index + 1)
-            print(f"[{self.name}] Incremented {self.robot_namespace}/current_parcel_index to: {current_index + 1}")
-            return py_trees.common.Status.SUCCESS
-        except Exception as e:
-            print(f"[{self.name}] Error incrementing index: {e}")
-            return py_trees.common.Status.FAILURE
-
-
-class PrintMessage(py_trees.behaviour.Behaviour):
-    """Print custom message behavior"""
-    
-    def __init__(self, name, message):
-        super().__init__(name)
-        self.message = message
-    
-    def update(self):
-        if callable(self.message):
-            blackboard = py_trees.blackboard.Blackboard()
-            print(self.message(blackboard))
-        else:
-            print(self.message)
-        return py_trees.common.Status.SUCCESS
-
-
-class MobileRobotMPC:
-    """MPC controller for robot approach - based on State_switch.py implementation"""
-    def __init__(self):
-        # MPC parameters
-        self.N = 10         # Extended prediction horizon for smoother approach
-        self.dt = 0.1        # Time step
-        self.wx = 2.0        # Increased position error weight for better position convergence
-        self.wtheta = 1.5    # Increased orientation error weight for better alignment
-        self.wu = 0.08       # Slightly reduced control effort weight for more responsive control
-        
-        # Control constraints - further reduced max velocity for even slower approach
-        self.v_max = 0.02     # m/s (reduced from 0.025)
-        self.w_max = 0.6      # rad/s (reduced from 0.8)
-        
-        # State and control dimensions
-        self.nx = 3          # [x, y, theta]
-        self.nu = 2          # [v, w]
-        
-        # Initialize CasADi optimizer
-        self.setup_optimizer()
-        
-    def setup_optimizer(self):
-        # Define symbolic variables
-        self.opti = ca.Opti()
-        
-        # Decision variables
-        self.X = self.opti.variable(self.nx, self.N+1)
-        self.U = self.opti.variable(self.nu, self.N)
-        
-        # Parameters (initial state and reference)
-        self.x0 = self.opti.parameter(self.nx)
-        self.x_ref = self.opti.parameter(self.nx)
-        
-        # Cost function
-        cost = 0
-        for k in range(self.N):
-            # Tracking cost with increasing weights as we approach the end
-            # Stronger progression factor for more aggressive convergence
-            progress_factor = 1.0 + 2.0 * (k + 1) / self.N  # Increases from 1.0 to 3.0
-            
-            # Position cost - higher weight for xy position tracking
-            pos_error = self.X[:2, k] - self.x_ref[:2]
-            cost += progress_factor * self.wx * ca.sumsqr(pos_error)
-            
-            # Orientation cost with angle normalization to handle wraparound
-            theta_error = self.X[2, k] - self.x_ref[2]
-            # Normalize angle difference to [-pi, pi]
-            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi
-            cost += progress_factor * self.wtheta * theta_error**2
-            
-            # Special emphasis on final portion of trajectory
-            if k >= self.N - 5:  # Last 5 steps
-                # Extra emphasis on final approach
-                cost += 1.5 * self.wx * ca.sumsqr(pos_error)
-                cost += 2.0 * self.wtheta * theta_error**2
-            
-            # Control effort cost with smoother transitions
-            if k > 0:
-                # Penalize control changes for smoother motion
-                control_change = self.U[:, k] - self.U[:, k-1]
-                cost += 0.1 * ca.sumsqr(control_change)
-            
-            # Base control effort penalty
-            cost += self.wu * ca.sumsqr(self.U[:, k])
-        
-        # Terminal cost - much stronger to ensure convergence at endpoint
-        terminal_pos_error = self.X[:2, self.N] - self.x_ref[:2]
-        cost += 10.0 * self.wx * ca.sumsqr(terminal_pos_error)
-        
-        # Terminal orientation with normalization for angle wraparound
-        terminal_theta_error = self.X[2, self.N] - self.x_ref[2]
-        terminal_theta_error = ca.fmod(terminal_theta_error + ca.pi, 2*ca.pi) - ca.pi
-        cost += 30.0 * self.wtheta * terminal_theta_error**2
-        self.opti.minimize(cost)
-        
-        # Dynamics constraints
-        for k in range(self.N):
-            x_next = self.X[:, k] + self.robot_model(self.X[:, k], self.U[:, k]) * self.dt
-            self.opti.subject_to(self.X[:, k+1] == x_next)
-        
-        # Initial condition constraint
-        self.opti.subject_to(self.X[:, 0] == self.x0)
-        
-        # Control constraints
-        self.opti.subject_to(self.opti.bounded(-self.v_max, self.U[0, :], self.v_max))
-        self.opti.subject_to(self.opti.bounded(-self.w_max, self.U[1, :], self.w_max))
-        
-        # Strict terminal constraints to ensure convergence and smooth stopping
-        # Terminal velocity constraints - must approach zero at the end
-        self.opti.subject_to(self.U[0, -1] <= 0.0005)  # Final linear velocity virtually zero
-        self.opti.subject_to(self.U[0, -1] >= 0.0)     # No negative velocity at end
-        self.opti.subject_to(self.U[1, -1] <= 0.0005)  # Final angular velocity virtually zero
-        self.opti.subject_to(self.U[1, -1] >= -0.0005) # Final angular velocity virtually zero
-        
-        # Smooth deceleration in last few steps
-        for k in range(self.N-3, self.N):
-            # Progressive velocity reduction for final steps
-            max_vel_factor = (self.N - k) / 4.0  # Ranges from 0.75 to 0.25
-            self.opti.subject_to(self.U[0, k] <= self.v_max * max_vel_factor)
-        
-        # Solver settings with improved convergence parameters
-        opts = {
-            'ipopt.print_level': 0, 
-            'print_time': 0,
-            'ipopt.tol': 1e-5,           # Even tighter tolerance
-            'ipopt.acceptable_tol': 1e-4, # More precise solution
-            'ipopt.max_iter': 200,       # More iterations allowed
-            'ipopt.warm_start_init_point': 'yes' # Use warm starting for stability
-        }
-        self.opti.solver('ipopt', opts)
-        
-    def robot_model(self, x, u):
-        # Differential drive kinematics
-        dx = ca.vertcat(
-            u[0] * ca.cos(x[2]),
-            u[0] * ca.sin(x[2]),
-            u[1]
-        )
-        return dx
-        
-    def update_control(self, current_state, target_state):
-        # Check how close we are to the target
-        dist_to_target = np.sqrt((current_state[0] - target_state[0])**2 + 
-                                (current_state[1] - target_state[1])**2)
-        
-        # Check orientation alignment
-        angle_diff = abs((current_state[2] - target_state[2] + np.pi) % (2 * np.pi) - np.pi)
-        
-        # If we're very close to the target and well-aligned, stop completely
-        if dist_to_target < 0.015 and angle_diff < 0.05:  # 1.5cm and ~3 degrees
-            return np.array([0.0, 0.0])  # Stop completely
-            
-        # If we're close but not perfectly aligned, prioritize orientation
-        elif dist_to_target < 0.03 and angle_diff > 0.05:
-            # Just rotate to align with target, very slowly
-            return np.array([0.0, 0.1 * np.sign(target_state[2] - current_state[2])])
-        
-        # Set initial state and reference
-        self.opti.set_value(self.x0, current_state)
-        self.opti.set_value(self.x_ref, target_state)
-        
-        # Solve optimization problem
-        try:
-            sol = self.opti.solve()
-            x_opt = sol.value(self.X)
-            u_opt = sol.value(self.U)
-            return u_opt[:, 0]  # Return first control input
-        except Exception as e:
-            print(f"Optimization failed: {e}")
-            return None
-
 
 class ApproachObject(py_trees.behaviour.Behaviour):
     """
@@ -1817,3 +884,159 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             self.cmd_vel_pub.publish(cmd)
         
         self.feedback_message = f"ApproachObject terminated with status: {new_status}"
+
+
+class MobileRobotMPC:
+    """Simple MPC controller for mobile robot"""
+    
+    def __init__(self):
+        self.last_control = [0.0, 0.0]  # [linear_vel, angular_vel]
+    
+    def update_control(self, current_state, target_state):
+        """
+        Update control based on current and target states
+        
+        Args:
+            current_state: [x, y, theta] current robot state
+            target_state: [x, y, theta] target robot state
+            
+        Returns:
+            control: [linear_vel, angular_vel] control commands
+        """
+        try:
+            # Simple proportional controller
+            dx = target_state[0] - current_state[0]
+            dy = target_state[1] - current_state[1]
+            dtheta = target_state[2] - current_state[2]
+            
+            # Normalize angle difference
+            while dtheta > math.pi:
+                dtheta -= 2 * math.pi
+            while dtheta < -math.pi:
+                dtheta += 2 * math.pi
+            
+            # Calculate distance to target
+            distance = math.sqrt(dx**2 + dy**2)
+            
+            # Simple control law
+            if distance > 0.05:  # If not at target
+                # Calculate desired heading
+                desired_theta = math.atan2(dy, dx)
+                heading_error = desired_theta - current_state[2]
+                
+                # Normalize heading error
+                while heading_error > math.pi:
+                    heading_error -= 2 * math.pi
+                while heading_error < -math.pi:
+                    heading_error += 2 * math.pi
+                
+                # Control gains
+                kp_linear = 0.5
+                kp_angular = 1.0
+                
+                # Generate control commands
+                linear_vel = min(kp_linear * distance, 0.3)  # Max 0.3 m/s
+                angular_vel = kp_angular * heading_error
+                
+                # Limit angular velocity
+                angular_vel = max(-1.0, min(1.0, angular_vel))
+                
+                # If heading error is large, prioritize turning
+                if abs(heading_error) > 0.5:
+                    linear_vel *= 0.5
+                
+                self.last_control = [linear_vel, angular_vel]
+                return self.last_control
+            else:
+                # At target, stop
+                self.last_control = [0.0, 0.0]
+                return self.last_control
+                
+        except Exception as e:
+            print(f"MPC error: {e}")
+            return [0.0, 0.0]
+
+
+class StopSystem(py_trees.behaviour.Behaviour):
+    """Stop system behavior - stops the system for a specified duration"""
+    
+    def __init__(self, name, duration=1.0):
+        super().__init__(name)
+        self.duration = duration
+        self.start_time = None
+    
+    def initialise(self):
+        self.start_time = time.time()
+        self.feedback_message = f"Stopping system for {self.duration}s"
+        print(f"[{self.name}] Starting to stop system...")
+    
+    def update(self):
+        if self.start_time is None:
+            self.start_time = time.time()
+        
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.duration:
+            print(f"[{self.name}] System stopped!")
+            return py_trees.common.Status.SUCCESS
+        return py_trees.common.Status.RUNNING
+
+
+class CheckPairComplete(py_trees.behaviour.Behaviour):
+    """Check if a pair operation is complete behavior"""
+    
+    def __init__(self, name):
+        super().__init__(name)
+    
+    def update(self):
+        print(f"[{self.name}] Checking if pair is complete...")
+        return py_trees.common.Status.SUCCESS
+
+
+class IncrementIndex(py_trees.behaviour.Behaviour):
+    """Increment index behavior - increments the current parcel index"""
+    
+    def __init__(self, name, robot_namespace="turtlebot0"):
+        super().__init__(name)
+        self.robot_namespace = robot_namespace
+        
+        # Setup blackboard access
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index", 
+            access=py_trees.common.Access.WRITE
+        )
+    
+    def update(self):
+        try:
+            # Get current index
+            current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            new_index = current_index + 1
+            
+            # Update the index
+            setattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', new_index)
+            
+            print(f"[{self.name}] Incremented index from {current_index} to {new_index}")
+            return py_trees.common.Status.SUCCESS
+        except Exception as e:
+            print(f"[{self.name}] Error incrementing index: {e}")
+            return py_trees.common.Status.FAILURE
+
+
+class PrintMessage(py_trees.behaviour.Behaviour):
+    """Print message behavior - prints a message or lambda function result"""
+    
+    def __init__(self, name, message):
+        super().__init__(name)
+        self.message = message
+    
+    def update(self):
+        try:
+            if callable(self.message):
+                blackboard = py_trees.blackboard.Blackboard()
+                print(self.message(blackboard))
+            else:
+                print(self.message)
+            return py_trees.common.Status.SUCCESS
+        except Exception as e:
+            print(f"[{self.name}] Error printing message: {e}")
+            return py_trees.common.Status.FAILURE

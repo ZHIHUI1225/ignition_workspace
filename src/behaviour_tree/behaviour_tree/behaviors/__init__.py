@@ -7,12 +7,16 @@ Contains all behavior classes organized by functionality.
 from .basic_behaviors import (
     ResetFlags,
     WaitAction,
-    ReplanPath,
+    WaitForPush,
+    WaitForPick,
     StopSystem,
     CheckPairComplete,
     IncrementIndex,
     PrintMessage
 )
+
+# Import ReplanPath from its own module
+from .ReplanPath_behaviour import ReplanPath
 
 # Import all movement behaviors
 from .movement_behaviors import (
@@ -43,7 +47,9 @@ from .tree_builder import (
 __all__ = [
     # Basic behaviors
     'ResetFlags',
-    'WaitAction', 
+    'WaitAction',
+    'WaitForPush',
+    'WaitForPick', 
     'ReplanPath',
     'StopSystem',
     'CheckPairComplete',
