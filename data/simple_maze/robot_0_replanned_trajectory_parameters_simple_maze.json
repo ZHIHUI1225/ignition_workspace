@@ -186,11 +186,11 @@
     "total_segments": 2,
     "start_waypoint_idx": 0,
     "end_waypoint_idx": 2,
-    "save_timestamp": "2025-06-12T13:26:14",
+    "save_timestamp": "2025-06-12T13:11:35",
     "case": "simple_maze",
     "N": 3,
     "replanned": true,
-    "replan_timestamp": "2025-06-12T13:26:14",
+    "replan_timestamp": "2025-06-13T13:52:39",
     "original_total_time": 45.05317315060073,
     "replanned_total_time": 45.05317315060073,
     "detailed_optimization": true

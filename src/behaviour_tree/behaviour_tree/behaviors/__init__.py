@@ -5,14 +5,12 @@ Contains all behavior classes organized by functionality.
 
 # Import all basic behaviors
 from .basic_behaviors import (
-    ResetFlags,
     WaitAction,
     WaitForPush,
     WaitForPick,
     StopSystem,
     CheckPairComplete,
-    IncrementIndex,
-    PrintMessage
+    IncrementIndex
 )
 
 # Import ReplanPath from its own module
@@ -25,11 +23,10 @@ from .movement_behaviors import (
 )
 
 # Import all manipulation behaviors
-from .manipulation_behaviors import (
-    PushObject,
-    PickObject
-)
+from .manipulation_behaviors import PushObject
 
+
+from .Pickup import  PickObject
 # Import MPC controller
 from .mpc_controller import (
     GeneralMPCController,
