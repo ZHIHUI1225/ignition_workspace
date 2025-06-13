@@ -6,12 +6,13 @@ Contains the main tree building logic and sequences.
 
 import py_trees
 from .basic_behaviors import (
-    ResetFlags, WaitAction, WaitForPush, WaitForPick, StopSystem, 
-    CheckPairComplete, IncrementIndex, PrintMessage
+   WaitAction, WaitForPush, WaitForPick, StopSystem, 
+    CheckPairComplete, IncrementIndex
 )
 from .ReplanPath_behaviour import ReplanPath
 from .movement_behaviors import ApproachObject, MoveBackward
-from .manipulation_behaviors import PushObject, PickObject
+from .manipulation_behaviors import PushObject
+from .Pickup import PickObject
 
 
 def create_root(robot_namespace="turtlebot0"):
@@ -32,8 +33,7 @@ def create_root(robot_namespace="turtlebot0"):
             variable_name=f"{robot_namespace}/pushing_estimated_time",
             variable_value=45.0,
             overwrite=True
-        ),
-        ResetFlags("ResetFlags")
+        )
     ])
     
     # Main loop structure with fixed Repeat decorator
@@ -66,13 +66,8 @@ def create_root(robot_namespace="turtlebot0"):
     # Completion check sequence with blackboard variable reset
     completion_sequence = py_trees.composites.Sequence(name="CompletionSequence", memory=True)
     completion_sequence.add_children([
-        CheckPairComplete("CheckPairComplete"),
-        ResetFlags("ResetFlags"),
+        CheckPairComplete("CheckPairComplete", robot_namespace),
         IncrementIndex("IncrementIndex", robot_namespace),
-        PrintMessage(
-            name="PrintCompletedPair",
-            message=lambda blackboard: f"Completed pair, current_parcel_index: {getattr(blackboard, f'{robot_namespace}/current_parcel_index', 0)}"
-        )
     ])
     
     # Combine structure with proper node connections

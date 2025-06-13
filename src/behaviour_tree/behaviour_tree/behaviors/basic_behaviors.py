@@ -25,17 +25,6 @@ from std_msgs.msg import Int32, Float64
 
 
 
-class ResetFlags(py_trees.behaviour.Behaviour):
-    """Reset system flags behavior"""
-    
-    def __init__(self, name):
-        super().__init__(name)
-    
-    def update(self):
-        print(f"[{self.name}] Resetting flags...")
-        return py_trees.common.Status.SUCCESS
-
-
 class WaitForPush(py_trees.behaviour.Behaviour):
     """
     Wait behavior for pushing phase - waits for parcel to be near relay point.
@@ -982,18 +971,199 @@ class StopSystem(py_trees.behaviour.Behaviour):
 
 
 class CheckPairComplete(py_trees.behaviour.Behaviour):
-    """Check if a pair operation is complete behavior"""
+    """Check if a pair operation is complete behavior - both robot and parcel out of relay range"""
     
-    def __init__(self, name):
+    def __init__(self, name, robot_namespace="turtlebot0", distance_threshold=0.25):
         super().__init__(name)
+        self.robot_namespace = robot_namespace
+        self.distance_threshold = distance_threshold
+        
+        # Extract namespace number for relay point indexing
+        self.namespace_number = self.extract_namespace_number(robot_namespace)
+        self.relay_number = self.namespace_number  # Relay point is tb{i} -> Relaypoint{i}
+        
+        # ROS setup
+        self.node = None
+        self.robot_pose_sub = None
+        self.relay_pose_sub = None
+        self.parcel_pose_sub = None
+        
+        # Pose storage
+        self.robot_pose = None
+        self.relay_pose = None
+        self.parcel_pose = None
+        self.current_parcel_index = 0
+        
+        # Thread safety
+        self.lock = threading.Lock()
+        
+        # Setup blackboard access for current_parcel_index
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index", 
+            access=py_trees.common.Access.READ
+        )
+    
+    def extract_namespace_number(self, namespace):
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
+        return int(match.group(1)) if match else 0
+    
+    def setup(self, **kwargs):
+        """Setup ROS node and subscriptions"""
+        try:
+            self.node = kwargs.get('node')
+            if self.node is None:
+                print(f"[{self.name}] No ROS node provided")
+                return False
+            
+            # Subscribe to robot pose (Odometry)
+            self.robot_pose_sub = self.node.create_subscription(
+                Odometry,
+                f'/turtlebot{self.namespace_number}/odom_map',
+                self.robot_pose_callback,
+                10
+            )
+            
+            # Subscribe to relay point pose
+            self.relay_pose_sub = self.node.create_subscription(
+                PoseStamped,
+                f'/Relaypoint{self.relay_number}/pose',
+                self.relay_pose_callback,
+                10
+            )
+            
+            # Create initial parcel subscription for index 0
+            self.update_parcel_subscription()
+            
+            self.node.get_logger().info(f'CheckPairComplete setup complete for {self.robot_namespace}')
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Setup failed: {e}")
+            return False
+    
+    def update_parcel_subscription(self):
+        """Update subscription to the correct parcel topic based on current index"""
+        if self.node is None:
+            return
+            
+        # Unsubscribe from previous parcel topic if it exists
+        if self.parcel_pose_sub is not None:
+            self.node.destroy_subscription(self.parcel_pose_sub)
+        
+        # Subscribe to current parcel topic
+        parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+        self.parcel_pose_sub = self.node.create_subscription(
+            PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+        
+        self.node.get_logger().info(f'[{self.name}] Updated parcel subscription to: {parcel_topic}')
+    
+    def robot_pose_callback(self, msg):
+        """Callback for robot pose updates - handles Odometry message"""
+        with self.lock:
+            self.robot_pose = msg.pose.pose
+    
+    def relay_pose_callback(self, msg):
+        """Callback for relay point pose updates"""
+        with self.lock:
+            self.relay_pose = msg
+    
+    def parcel_pose_callback(self, msg):
+        """Callback for parcel pose updates"""
+        with self.lock:
+            self.parcel_pose = msg
+    
+    def update_parcel_subscription(self):
+        """Update subscription to the correct parcel topic based on current index from blackboard"""
+        if self.node is None:
+            return
+        
+        # Read current_parcel_index from blackboard
+        try:
+            current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+        except (KeyError, AttributeError):
+            current_index = 0
+        
+        # Only update subscription if the index has actually changed
+        if current_index != self.current_parcel_index or self.parcel_pose_sub is None:
+            old_index = self.current_parcel_index
+            self.current_parcel_index = current_index
+            
+            # Unsubscribe from previous parcel topic if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+            
+            # Subscribe to current parcel topic
+            parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+            
+            self.node.get_logger().info(f'[{self.name}] Updated parcel subscription: {old_index} -> {self.current_parcel_index}')
+    
+    def calculate_distance(self, pose1, pose2):
+        """Calculate Euclidean distance between two poses"""
+        if pose1 is None or pose2 is None:
+            return float('inf')
+        
+        # Handle different pose message types
+        if hasattr(pose1, 'pose'):
+            pos1 = pose1.pose.position
+        else:
+            pos1 = pose1.position
+            
+        if hasattr(pose2, 'pose'):
+            pos2 = pose2.pose.position
+        else:
+            pos2 = pose2.position
+        
+        dx = pos1.x - pos2.x
+        dy = pos1.y - pos2.y
+        return math.sqrt(dx*dx + dy*dy)
+    
+    def check_robot_out_of_relay_range(self):
+        """Check if robot is OUT of relay point range"""
+        if self.robot_pose is None or self.relay_pose is None:
+            return False
+        
+        distance = self.calculate_distance(self.robot_pose, self.relay_pose)
+        is_out_of_range = distance > self.distance_threshold
+        return is_out_of_range
+    
+    def check_parcel_out_of_relay_range(self):
+        """Check if parcel is OUT of relay point range"""
+        if self.parcel_pose is None or self.relay_pose is None:
+            return False
+        
+        distance = self.calculate_distance(self.parcel_pose, self.relay_pose)
+        is_out_of_range = distance > self.distance_threshold
+        return is_out_of_range
     
     def update(self):
-        print(f"[{self.name}] Checking if pair is complete...")
-        return py_trees.common.Status.SUCCESS
+        # Update parcel subscription from blackboard
+        self.update_parcel_subscription()
+        
+        with self.lock:
+            # Check if both robot and parcel are out of relay range
+            robot_out = self.check_robot_out_of_relay_range()
+            parcel_out = self.check_parcel_out_of_relay_range()
+            
+            # Calculate distances for debugging
+            robot_dist = self.calculate_distance(self.robot_pose, self.relay_pose) if self.robot_pose and self.relay_pose else float('inf')
+            parcel_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
+            
+            print(f"[{self.name}] Robot dist: {robot_dist:.2f}, Parcel dist: {parcel_dist:.2f}, Threshold: {self.distance_threshold}")
+            print(f"[{self.name}] Robot out: {robot_out}, Parcel out: {parcel_out}")
+            
+            if robot_out and parcel_out:
+                print(f"[{self.name}] Pair operation complete - both out of range")
+                return py_trees.common.Status.SUCCESS
+            else:
+                return py_trees.common.Status.RUNNING
 
 
 class IncrementIndex(py_trees.behaviour.Behaviour):
-    """Increment index behavior - increments the current parcel index"""
+    """Increment index behavior - increments the current parcel index and tracks parcel spawning for turtlebot0"""
     
     def __init__(self, name, robot_namespace="turtlebot0"):
         super().__init__(name)
@@ -1005,6 +1175,59 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             key=f"{robot_namespace}/current_parcel_index", 
             access=py_trees.common.Access.WRITE
         )
+        
+        # Parcel spawning tracking (only for turtlebot0)
+        self.is_first_robot = (robot_namespace == "turtlebot0")
+        self.spawned_parcels = set()  # Track which parcels have been spawned
+        self.max_parcels = 5  # Maximum number of parcels to spawn
+        
+        # Initialize with parcel 0 already spawned (assuming it exists at start)
+        if self.is_first_robot:
+            self.spawned_parcels.add(0)
+            print(f"[{self.name}] Initialized - parcel0 assumed to be already spawned")
+    
+    def _should_spawn_new_parcel(self, new_index):
+        """Check if a new parcel should be spawned"""
+        if not self.is_first_robot:
+            return False
+            
+        # Only spawn if:
+        # 1. We haven't reached max parcels
+        # 2. This parcel hasn't been spawned yet
+        if new_index <= self.max_parcels and new_index not in self.spawned_parcels:
+            return True
+        return False
+    
+    def _spawn_new_parcel(self, parcel_index):
+        """Simulate spawning a new parcel (placeholder for actual spawning logic)"""
+        if not self.is_first_robot:
+            return False
+            
+        try:
+            # Mark parcel as spawned
+            self.spawned_parcels.add(parcel_index)
+            print(f"[{self.name}] Parcel{parcel_index} spawned at relay point 0")
+            
+            # In a real implementation, you would:
+            # 1. Load parcel model from file
+            # 2. Calculate spawn position from relay point data
+            # 3. Use appropriate spawning mechanism (e.g., Gazebo service call)
+            # For now, we just simulate successful spawning
+            
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error spawning parcel{parcel_index}: {e}")
+            return False
+    
+    def _check_parcel_spawned(self, parcel_index):
+        """Check if a parcel has been successfully spawned"""
+        # In a real implementation, you might check:
+        # 1. ROS topic existence (e.g., /parcel{index}/pose)
+        # 2. Gazebo model existence
+        # 3. Service responses
+        # For now, we just check our internal tracking
+        return parcel_index in self.spawned_parcels
     
     def update(self):
         try:
@@ -1012,31 +1235,34 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
             new_index = current_index + 1
             
+            # For turtlebot0, check if we need to spawn a new parcel
+            if self.is_first_robot:
+                if self._should_spawn_new_parcel(new_index):
+                    spawn_success = self._spawn_new_parcel(new_index)
+                    if not spawn_success:
+                        print(f"[{self.name}] Failed to spawn parcel{new_index}, keeping current index")
+                        return py_trees.common.Status.FAILURE
+                
+                # Verify the parcel is available before incrementing
+                if not self._check_parcel_spawned(new_index):
+                    if new_index <= self.max_parcels:
+                        print(f"[{self.name}] Parcel{new_index} not yet spawned, waiting...")
+                        return py_trees.common.Status.RUNNING
+                    else:
+                        print(f"[{self.name}] Reached maximum parcels ({self.max_parcels}), stopping")
+                        return py_trees.common.Status.FAILURE
+            
             # Update the index
             setattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', new_index)
             
             print(f"[{self.name}] Incremented index from {current_index} to {new_index}")
+            
+            if self.is_first_robot:
+                print(f"[{self.name}] Spawned parcels: {sorted(list(self.spawned_parcels))}")
+            
             return py_trees.common.Status.SUCCESS
+            
         except Exception as e:
             print(f"[{self.name}] Error incrementing index: {e}")
             return py_trees.common.Status.FAILURE
 
-
-class PrintMessage(py_trees.behaviour.Behaviour):
-    """Print message behavior - prints a message or lambda function result"""
-    
-    def __init__(self, name, message):
-        super().__init__(name)
-        self.message = message
-    
-    def update(self):
-        try:
-            if callable(self.message):
-                blackboard = py_trees.blackboard.Blackboard()
-                print(self.message(blackboard))
-            else:
-                print(self.message)
-            return py_trees.common.Status.SUCCESS
-        except Exception as e:
-            print(f"[{self.name}] Error printing message: {e}")
-            return py_trees.common.Status.FAILURE
