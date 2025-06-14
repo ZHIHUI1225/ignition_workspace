@@ -536,7 +536,7 @@ def create_root(robot_namespace="tb0"):
         WaitAction("WaitingPush", 3.0, robot_namespace),
         ApproachObject("ApproachingPush", robot_namespace),
         PushObject("Pushing"),
-        MoveBackward("BackwardToSafeDistance")
+        MoveBackward("BackwardToSafeDistance", distance=0.2)
     ])
     
     # PickingUp序列（网页3巡逻任务参考）- 直接调用类

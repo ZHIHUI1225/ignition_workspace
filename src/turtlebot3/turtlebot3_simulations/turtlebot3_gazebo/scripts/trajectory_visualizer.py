@@ -44,7 +44,7 @@ class TrajectoryVisualizer(Node):
             self.case = self.get_parameter('case').get_parameter_value().string_value
             self.robot_count = self.get_parameter('robot_count').get_parameter_value().integer_value
             self.data_path = self.get_parameter('data_path').get_parameter_value().string_value
-            self.get_logger().info(f"Trajectory Visualizer started for case: {self.case}")
+            # self.get_logger().info(f"Trajectory Visualizer started for case: {self.case}")
         
         # Publishers for trajectories
         self.path_publishers = {}

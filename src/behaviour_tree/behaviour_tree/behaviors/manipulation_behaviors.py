@@ -203,7 +203,7 @@ class MobileRobotMPC:
 class PushObject(py_trees.behaviour.Behaviour):
     """Push object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name="PushObject", robot_namespace="turtlebot0"):
+    def __init__(self, name="PushObject", robot_namespace="turtlebot0", distance_threshold=0.14):
         super().__init__(name)
         self.node = None
         self.robot_namespace = robot_namespace  # Use provided namespace
@@ -241,8 +241,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.parcel_pose = None
         self.relay_pose = None
         self.current_parcel_index = 0
-        self.last_parcel_index = -1  # Track changes in parcel index
-        self.distance_threshold = 0.14  # Distance threshold for success condition
+        self.distance_threshold = distance_threshold  # Distance threshold for success condition
         
         # Path messages for visualization
         self.ref_path = Path()
@@ -301,10 +300,9 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.robot_pose_sub = self.node.create_subscription(
                 Odometry, robot_odom_topic, self.robot_pose_callback, 10)
             
-            # Subscribe to parcel pose
-            self.parcel_pose_sub = self.node.create_subscription(
-                PoseStamped, f'/parcel{self.current_parcel_index}/pose', 
-                self.parcel_pose_callback, 10)
+            # Subscribe to parcel pose - defer until behavior starts running
+            # We'll create the subscription in initialise() when blackboard is available
+            self.parcel_pose_sub = None
             
             # Subscribe to relay point pose
             relay_number = self._extract_namespace_number()+1  #  Relaypoint{i+1}
@@ -393,23 +391,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         return is_in_range
     
-    def _update_parcel_subscription(self, parcel_index):
-        """Update subscription to track the correct parcel"""
-        if self.node is None:
-            return
-        
-        # Destroy existing subscription if it exists
-        if self.parcel_pose_sub is not None:
-            self.node.destroy_subscription(self.parcel_pose_sub)
-        
-        # Create new subscription for the specified parcel
-        self.parcel_pose_sub = self.node.create_subscription(
-            PoseStamped, f'/parcel{parcel_index}/pose',
-            self.parcel_pose_callback, 10)
-        
-        self.current_parcel_index = parcel_index
-        print(f"[{self.name}] Updated parcel subscription to parcel{parcel_index}")
-    
     def _update_pushing_estimated_time(self):
         """Update pushing estimated time in blackboard based on current trajectory index"""
         if self.ref_trajectory:
@@ -422,7 +403,17 @@ class PushObject(py_trees.behaviour.Behaviour):
                 remaining_points = 0
             
             setattr(self.blackboard, f"{self.robot_namespace}/pushing_estimated_time", estimated_time)
-            print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
+            
+            # Only print updates every 20 calls
+            if not hasattr(self, '_print_call_count'):
+                self._print_call_count = 0
+                # Print immediately on first call
+                print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
+            
+            self._print_call_count += 1
+            if self._print_call_count >= 20:  # Print every 20 calls
+                print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
+                self._print_call_count = 0
     
     def _publish_reference_trajectory(self):
         """Publish reference trajectory for visualization"""
@@ -574,8 +565,8 @@ class PushObject(py_trees.behaviour.Behaviour):
             
         self.cmd_vel_pub.publish(cmd_msg)
         
-        print(f"[{self.name}] Applied stored control step {self.control_step+1}/{self.mpc.N_c}: "
-              f"v={cmd_msg.linear.x:.2f}, ω={cmd_msg.angular.z:.2f} [PUBLISHED]")
+        # print(f"[{self.name}] Applied stored control step {self.control_step+1}/{self.mpc.N_c}: "
+        #       f"v={cmd_msg.linear.x:.2f}, ω={cmd_msg.angular.z:.2f} [PUBLISHED]")
         return True
     
     def control_timer_callback(self):
@@ -593,9 +584,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # Log timing every single call to see frequency clearly
         frequency = 1.0 / time_interval if time_interval > 0 else 0
-        print(f"[{self.name}] Timer callback #{self._timer_call_count}, "
-              f"interval: {time_interval:.3f}s, frequency: {frequency:.1f}Hz, "
-              f"expected_freq: {1/self.dt:.1f}Hz")
+        # print(f"[{self.name}] Timer callback #{self._timer_call_count}, "
+        #       f"interval: {time_interval:.3f}s, frequency: {frequency:.1f}Hz, "
+        #       f"expected_freq: {1/self.dt:.1f}Hz")
         
         # Only execute control loop if pushing is active
         if self.pushing_active:
@@ -647,7 +638,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 
                 # Only run MPC if not complete and trajectory index is valid
                 if not pushing_complete:
-                    print(f"[{self.name}] MPC control - index: {self.trajectory_index}/{len(self.ref_trajectory)}, dist_to_final: {dist_to_final:.3f}m")
+                    # print(f"[{self.name}] MPC control - index: {self.trajectory_index}/{len(self.ref_trajectory)}, dist_to_final: {dist_to_final:.3f}m")
                     
                     # Check if we need replanning
                     needs_replanning = (
@@ -693,7 +684,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                             else:
                                 # Trajectory index has reached the end - use last state as target
                                 ref_point = self.ref_trajectory[-1]  # Last state of trajectory
-                                print(f"[{self.name}] Using last trajectory state as target for MPC horizon point {i}")
+                                # print(f"[{self.name}] Using last trajectory state as target for MPC horizon point {i}")
                             
                             ref_array[0, i] = ref_point[0]  # x
                             ref_array[1, i] = ref_point[1]  # y
@@ -744,7 +735,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                             self.cmd_vel_pub.publish(cmd_msg)
                             
                             # Log the control action
-                            print(f'[{self.name}] MPC control: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f} [PUBLISHED]')
+                            # print(f'[{self.name}] MPC control: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f} [PUBLISHED]')
                             
                             # Ensure we make progress, but don't go beyond trajectory length
                             # When at the end, keep trajectory_index at the last valid index
@@ -754,7 +745,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                                 # At end of trajectory, keep using last state as target
                                 print(f"[{self.name}] At end of trajectory, maintaining last state as target")
                             
-                            print(f"[{self.name}] Trajectory index: {self.trajectory_index}/{len(self.ref_trajectory)} (max: {len(self.ref_trajectory)-1})")
+                            # print(f"[{self.name}] Trajectory index: {self.trajectory_index}/{len(self.ref_trajectory)} (max: {len(self.ref_trajectory)-1})")
                             
                             # Update pushing estimated time after trajectory index change
                             self._update_pushing_estimated_time()
@@ -814,6 +805,23 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.pushing_active = True
         self.trajectory_index = 0
         
+        # Create parcel subscription now that blackboard is available
+        if self.node and self.parcel_pose_sub is None:
+            try:
+                # Try to get the current parcel index from blackboard
+                global_blackboard = py_trees.blackboard.Client()
+                current_parcel_index = global_blackboard.get(f'{self.robot_namespace}/current_parcel_index')
+            except (KeyError, AttributeError):
+                # If key doesn't exist, use default value 0
+                current_parcel_index = 0
+                print(f"[{self.name}] Blackboard key '{self.robot_namespace}/current_parcel_index' not found, using default value 0")
+            
+            self.current_parcel_index = current_parcel_index
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped, f'/parcel{current_parcel_index}/pose', 
+                self.parcel_pose_callback, 10)
+            print(f"[{self.name}] Created parcel subscription to /parcel{current_parcel_index}/pose")
+        
         # Update pushing estimated time in blackboard when resetting trajectory index
         self._update_pushing_estimated_time()
         
@@ -856,16 +864,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
         # which handles all callbacks including our timer automatically
-        
-        # Check if parcel index changed in blackboard and update subscription if needed
-        try:
-            blackboard_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-            if self.last_parcel_index != blackboard_parcel_index:
-                self.last_parcel_index = blackboard_parcel_index
-                self._update_parcel_subscription(blackboard_parcel_index)
-                print(f"[{self.name}] Updated parcel tracking to parcel{blackboard_parcel_index}")
-        except Exception as e:
-            print(f"[{self.name}] Failed to check blackboard parcel index: {e}")
         
         # PRIMARY SUCCESS CONDITION: Check if parcel has reached relay point
         # This is the ONLY condition for SUCCESS - the push is successful when the parcel
