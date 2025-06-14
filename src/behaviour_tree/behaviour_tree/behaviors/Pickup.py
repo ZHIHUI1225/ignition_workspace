@@ -625,7 +625,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             angle_error = min(angle_error, 2*np.pi - angle_error)  # Normalize to [0, pi]
             
             # Define stopping criteria
-            position_tolerance = 0.05  # 5cm position tolerance
+            position_tolerance = 0.015  # 5cm position tolerance
             orientation_tolerance = 0.1  # ~5.7 degrees orientation tolerance
             
             # Check if picking is complete

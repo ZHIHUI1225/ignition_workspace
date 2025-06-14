@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Behavior tree structure and creation functions.
-Contains the main tree building logic and sequences.
+Contains the main tree building sequences and modular functions.
 """
 
 import py_trees
@@ -45,20 +45,28 @@ def create_root(robot_namespace="turtlebot0"):
         memory=True
     )
     
-    # Pushing sequence - direct class calls
+    # Pushing sequence - without MoveBackward (moved to parallel section)
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
-        WaitForPush("WaitingPush", 30.0, robot_namespace),
+        WaitForPush("WaitingPush", 30.0, robot_namespace, distance_threshold=0.14),
         ApproachObject("ApproachingPush", robot_namespace),
-        PushObject("Pushing", robot_namespace),
-        MoveBackward("BackwardToSafeDistance")
+        PushObject("Pushing", robot_namespace, distance_threshold=0.14)
     ])
     
-    # PickingUp sequence - direct class calls
+    # Parallel execution: MoveBackward and ReplanPath run simultaneously
+    parallel_move_replan = py_trees.composites.Parallel(
+        name="ParallelMoveReplan",
+        policy=py_trees.common.ParallelPolicy.SuccessOnAll()  # Both must succeed
+    )
+    parallel_move_replan.add_children([
+        MoveBackward("BackwardToSafeDistance", distance=0.2),
+        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze")
+    ])
+    
+    # PickingUp sequence - only pick and stop (wait and replan moved to parallel section)
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze"),
         PickObject("PickingUp", robot_namespace),
         StopSystem("Stop", 1.5)
     ])
@@ -70,8 +78,8 @@ def create_root(robot_namespace="turtlebot0"):
         IncrementIndex("IncrementIndex", robot_namespace),
     ])
     
-    # Combine structure with proper node connections
-    action_execution.add_children([pushing_sequence, picking_up_sequence])
+    # Combine structure with proper node connections - sequential execution with parallel middle section
+    action_execution.add_children([pushing_sequence, parallel_move_replan, picking_up_sequence])
     pair_sequence.add_children([action_execution, completion_sequence])
     
     # Main loop decorator with correct usage
@@ -89,10 +97,9 @@ def create_pushing_sequence(robot_namespace="turtlebot0"):
     """Create just the pushing sequence for modular testing"""
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
-        WaitForPush("WaitingPush", 30.0, robot_namespace),
+        WaitForPush("WaitingPush", 30.0, robot_namespace, distance_threshold=0.15),
         ApproachObject("ApproachingPush", robot_namespace),
-        PushObject("Pushing", robot_namespace),
-        MoveBackward("BackwardToSafeDistance")
+        PushObject("Pushing", robot_namespace, distance_threshold=0.14)
     ])
     return pushing_sequence
 
@@ -102,18 +109,29 @@ def create_picking_sequence(robot_namespace="turtlebot0"):
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        ReplanPath("Replanning", 2.0),
         PickObject("PickingUp", robot_namespace),
         StopSystem("Stop", 1.5)
     ])
     return picking_up_sequence
 
 
+def create_parallel_move_replan_sequence(robot_namespace="turtlebot0"):
+    """Create the parallel MoveBackward and ReplanPath sequence for modular testing"""
+    parallel_move_replan = py_trees.composites.Parallel(
+        name="ParallelMoveReplan",
+        policy=py_trees.common.ParallelPolicy.SuccessOnAll()  # Both must succeed
+    )
+    parallel_move_replan.add_children([
+        MoveBackward("BackwardToSafeDistance", distance=0.2),
+        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze")
+    ])
+    return parallel_move_replan
+
+
 def create_simple_test_tree(robot_namespace="turtlebot0"):
     """Create a simple test tree for debugging"""
     root = py_trees.composites.Sequence(name="TestSequence", memory=True)
     root.add_children([
-        WaitAction("TestWait", 2.0, robot_namespace),
-        PrintMessage("TestMessage", "Simple test completed!")
+        WaitAction("TestWait", 2.0, robot_namespace)
     ])
     return root

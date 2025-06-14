@@ -21,6 +21,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Int32, Float64
+from std_srvs.srv import Trigger
 
 
 
@@ -33,7 +34,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     2. For non-turtlebot0 robots: last robot is OUT of relay point range
     """
     
-    def __init__(self, name, duration=10.0, robot_namespace="turtlebot0", distance_threshold=0.08):
+    def __init__(self, name, duration=60.0, robot_namespace="turtlebot0", distance_threshold=0.14):
         super().__init__(name)
         self.duration = duration
         self.start_time = 0
@@ -109,17 +110,24 @@ class WaitForPush(py_trees.behaviour.Behaviour):
                 10
             )
         
-        # Initial parcel subscription
+        # Initialize parcel subscription as None - will be set up in initialise() when blackboard is ready
         self.parcel_pose_sub = None
-        self.update_parcel_subscription()
+        print(f"[{self.name}] DEBUG: Parcel subscription will be created in initialise() when blackboard is ready")
     
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates"""
         self.robot_pose = msg.pose.pose
+        # Only print occasionally to avoid spam
+        if not hasattr(self, '_robot_pose_count'):
+            self._robot_pose_count = 0
+        self._robot_pose_count += 1
+        if self._robot_pose_count % 50 == 1:  # Print every 50 callbacks
+            print(f"[{self.name}] DEBUG: Robot pose updated: ({self.robot_pose.position.x:.3f}, {self.robot_pose.position.y:.3f})")
     
     def relay_pose_callback(self, msg):
         """Callback for relay point pose updates"""
         self.relay_pose = msg
+        # print(f"[{self.name}] DEBUG: Relay{self.relay_number} pose updated: ({msg.position.x:.3f}, {msg.position.y:.3f})")
     
     def last_robot_pose_callback(self, msg):
         """Callback for last robot pose updates"""
@@ -128,42 +136,39 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     def parcel_pose_callback(self, msg):
         """Callback for parcel pose updates"""
         self.parcel_pose = msg
-        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
+        print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
     
-    def update_parcel_subscription(self):
-        """Update parcel pose subscription based on current index"""
-        # Skip if node is not yet initialized
+    def setup_parcel_subscription(self):
+        """Set up parcel subscription when blackboard is ready"""
         if self.node is None:
-            return
+            print(f"[{self.name}] WARNING: Cannot setup parcel subscription - no ROS node")
+            return False
             
-        # Read current_parcel_index from namespaced blackboard using registered client
         try:
-            # Use the blackboard client to access the namespaced variable
-            global_blackboard = py_trees.blackboard.Client()
-            current_index = global_blackboard.get(f'{self.robot_namespace}/current_parcel_index')
-        except (KeyError, AttributeError):
-            # If key doesn't exist, use default value 0
-            current_index = 0
-        
-        # Only update subscription if the index has actually changed
-        if current_index != self.current_parcel_index or self.parcel_pose_sub is None:
-            old_index = self.current_parcel_index
-            self.current_parcel_index = current_index
-            print(f"[{self.name}] Updated parcel index from blackboard: {old_index} -> {self.current_parcel_index}")
+            # Get current parcel index from blackboard (with safe fallback)
+            current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            self.current_parcel_index = current_parcel_index
+            print(f"[{self.name}] DEBUG: Retrieved parcel index from blackboard: {current_parcel_index}")
             
-            # Destroy old subscription if it exists
+            # Clean up existing subscription if it exists
             if self.parcel_pose_sub is not None:
                 self.node.destroy_subscription(self.parcel_pose_sub)
-                print(f"[{self.name}] DEBUG: Destroyed old parcel subscription")
-            
-            # Create new subscription for the updated index
+                print(f"[{self.name}] DEBUG: Destroyed existing parcel subscription")
+                
+            # Create new parcel subscription
+            parcel_topic = f'/parcel{current_parcel_index}/pose'
             self.parcel_pose_sub = self.node.create_subscription(
                 PoseStamped,
-                f'/parcel{self.current_parcel_index}/pose',
+                parcel_topic,
                 self.parcel_pose_callback,
                 10
             )
-            print(f"[{self.name}] DEBUG: Created subscription to /parcel{self.current_parcel_index}/pose")
+            print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup parcel subscription: {e}")
+            return False
     
     def calculate_distance(self, pose1, pose2):
         """Calculate Euclidean distance between two poses"""
@@ -216,6 +221,12 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     
     def initialise(self):
         self.start_time = time.time()
+        
+        # Set up parcel subscription now that blackboard should be ready
+        if not self.setup_parcel_subscription():
+            print(f"[{self.name}] WARNING: Failed to setup parcel subscription, using default index 0")
+            self.current_parcel_index = 0
+        
         # Dynamic feedback message that includes current status
         self.feedback_message = f"PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
         print(f"[{self.name}] Starting PUSH wait for {self.duration}s...")
@@ -230,9 +241,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     
     def update(self) -> py_trees.common.Status:
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
-        
-        # Update parcel subscription from blackboard
-        self.update_parcel_subscription()
         
         elapsed = time.time() - self.start_time
         
@@ -257,13 +265,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         parcel_relay_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
         parcel_in_range = self.check_parcel_in_relay_range()
         last_robot_out = self.check_last_robot_out_of_relay_range()
-        
-        if elapsed % 1.0 < 0.1:  # Print every second
-            print(f"[{self.name}] PUSH wait... {elapsed:.1f}/{self.duration}s")
-            print(f"[{self.name}] - Parcel to relay dist: {parcel_relay_dist:.3f}m (in range: {parcel_in_range})")
-            if not self.is_first_robot:
-                last_robot_dist = self.calculate_distance(self.last_robot_pose, self.relay_pose) if self.last_robot_pose and self.relay_pose else float('inf')
-                print(f"[{self.name}] - Last robot to relay dist: {last_robot_dist:.3f}m (out of range: {last_robot_out})")
         
         return py_trees.common.Status.RUNNING
     
@@ -324,7 +325,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
     Wait behavior for picking phase.
     Success condition: 
     - For turtlebot0 (first robot): Always succeed immediately
-    - For non-turtlebot0 robots: Success only if estimated time from last robot's pushing task was received
+    - For non-turtlebot0 robots: Success only if replanned trajectory file exists from last robot
     """
     
     def __init__(self, name, duration=2.0, robot_namespace="turtlebot0"):
@@ -340,42 +341,34 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         self.is_first_robot = (self.namespace_number == 0)
         self.last_robot_number = self.namespace_number - 1 if not self.is_first_robot else None
         
-        # Initialize ROS2 if needed
-        if not rclpy.ok():
-            rclpy.init()
+        # File-based coordination instead of ROS messages
+        self.case_name = "simple_maze"  # Default case name
+        self.replanned_file_exists = True if self.is_first_robot else False
         
-        # Create node for subscriptions (only for non-turtlebot0 robots)
+        # No ROS node needed for file-based coordination
         self.node = None
-        if not self.is_first_robot:
-            self.node = rclpy.create_node(f'wait_pick_{robot_namespace}')
-        
-        # Estimated time tracking for non-turtlebot0 robots
-        self.estimated_time_received = True if self.is_first_robot else False
-        self.last_estimated_time = None
-        
-        # Setup subscriptions
-        self.setup_subscriptions()
         
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
-    def setup_subscriptions(self):
-        """Setup ROS2 subscriptions only for non-turtlebot0 robots"""
-        if not self.is_first_robot and self.node is not None:
-            self.estimated_time_sub = self.node.create_subscription(
-                Float64,
-                f'/turtlebot{self.last_robot_number}/estimated_time',
-                self.estimated_time_callback,
-                10
-            )
-    
-    def estimated_time_callback(self, msg):
-        """Callback for estimated time from last robot's pushing task"""
-        self.last_estimated_time = msg.data
-        self.estimated_time_received = True
-        print(f"[{self.name}] Received estimated time from tb{self.last_robot_number}: {msg.data:.2f}s")
+    def check_replanned_file_exists(self):
+        """Check if the replanned trajectory file exists from the last robot"""
+        if self.is_first_robot:
+            return True  # First robot doesn't need to wait for files
+        
+        # Construct the expected file path for the last robot's replanned trajectory
+        import os
+        replanned_file_path = f"/root/workspace/data/{self.case_name}/tb{self.last_robot_number}_Trajectory_replanned.json"
+        
+        file_exists = os.path.exists(replanned_file_path)
+        if file_exists and not self.replanned_file_exists:
+            # First time detecting the file
+            print(f"[{self.name}] Found replanned file: {replanned_file_path}")
+            self.replanned_file_exists = True
+        
+        return file_exists
     
     def check_success_conditions(self):
         """Check if success conditions are met for pick phase"""
@@ -383,8 +376,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         if self.is_first_robot:
             return True
         
-        # For non-turtlebot0 robots: success only if estimated time was received
-        return self.estimated_time_received
+        # For non-turtlebot0 robots: success only if replanned file exists
+        return self.check_replanned_file_exists()
     
     def initialise(self):
         """Initialize the behavior when it starts running"""
@@ -395,7 +388,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         if self.is_first_robot:
             print(f"[{self.name}] turtlebot0: Always ready for PICK")
         else:
-            print(f"[{self.name}] tb{self.namespace_number}: Waiting for estimated time from tb{self.last_robot_number}")
+            print(f"[{self.name}] tb{self.namespace_number}: Waiting for replanned file from tb{self.last_robot_number}")
     
     def update(self) -> py_trees.common.Status:
         """Main update method"""
@@ -408,7 +401,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
             if self.is_first_robot:
                 print(f"[{self.name}] SUCCESS: turtlebot0 ready for PICK!")
             else:
-                print(f"[{self.name}] SUCCESS: Estimated time received from tb{self.last_robot_number}, ready for PICK!")
+                print(f"[{self.name}] SUCCESS: Replanned file found from tb{self.last_robot_number}, ready for PICK!")
             return py_trees.common.Status.SUCCESS
         
         # Timeout condition - FAILURE if conditions not met
@@ -418,7 +411,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] WARNING: turtlebot0 timeout (should not happen)")
                 return py_trees.common.Status.SUCCESS
             else:
-                print(f"[{self.name}] TIMEOUT: PICK wait FAILED - estimated time not received from tb{self.last_robot_number}")
+                print(f"[{self.name}] TIMEOUT: PICK wait FAILED - replanned file not found from tb{self.last_robot_number}")
                 return py_trees.common.Status.FAILURE
         
         # Status update every second
@@ -426,7 +419,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
             if self.is_first_robot:
                 print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | turtlebot0 ready")
             else:
-                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | Est. time received: {self.estimated_time_received}")
+                file_exists = self.check_replanned_file_exists()
+                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | Replanned file exists: {file_exists}")
         
         return py_trees.common.Status.RUNNING
     
@@ -1163,7 +1157,7 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
 
 
 class IncrementIndex(py_trees.behaviour.Behaviour):
-    """Increment index behavior - increments the current parcel index and tracks parcel spawning for turtlebot0"""
+    """Increment index behavior - increments the current parcel index and spawns new parcel via service for turtlebot0"""
     
     def __init__(self, name, robot_namespace="turtlebot0"):
         super().__init__(name)
@@ -1176,15 +1170,49 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             access=py_trees.common.Access.WRITE
         )
         
-        # Parcel spawning tracking (only for turtlebot0)
+        # ROS setup for service client (only for turtlebot0)
         self.is_first_robot = (robot_namespace == "turtlebot0")
+        self.node = None
+        self.spawn_service_client = None
+        
+        # Parcel spawning tracking
         self.spawned_parcels = set()  # Track which parcels have been spawned
         self.max_parcels = 5  # Maximum number of parcels to spawn
+        self.pending_spawn_requests = {}  # Track pending service calls
         
         # Initialize with parcel 0 already spawned (assuming it exists at start)
         if self.is_first_robot:
             self.spawned_parcels.add(0)
             print(f"[{self.name}] Initialized - parcel0 assumed to be already spawned")
+    
+    def setup(self, **kwargs):
+        """Setup ROS node and service client"""
+        if not self.is_first_robot:
+            return True  # No setup needed for non-turtlebot0 robots
+            
+        try:
+            self.node = kwargs.get('node')
+            if self.node is None:
+                print(f"[{self.name}] No ROS node provided")
+                return False
+            
+            # Create service client for spawning parcels
+            self.spawn_service_client = self.node.create_client(
+                Trigger, 
+                '/spawn_next_parcel_service'
+            )
+            
+            # Wait for service to be available
+            if not self.spawn_service_client.wait_for_service(timeout_sec=5.0):
+                print(f"[{self.name}] Spawn service not available")
+                return False
+            
+            print(f"[{self.name}] Spawn service client ready")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Setup failed: {e}")
+            return False
     
     def _should_spawn_new_parcel(self, new_index):
         """Check if a new parcel should be spawned"""
@@ -1194,43 +1222,65 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
         # Only spawn if:
         # 1. We haven't reached max parcels
         # 2. This parcel hasn't been spawned yet
-        if new_index <= self.max_parcels and new_index not in self.spawned_parcels:
+        # 3. We don't have a pending request for this parcel
+        if (new_index <= self.max_parcels and 
+            new_index not in self.spawned_parcels and 
+            new_index not in self.pending_spawn_requests):
             return True
         return False
     
     def _spawn_new_parcel(self, parcel_index):
-        """Simulate spawning a new parcel (placeholder for actual spawning logic)"""
-        if not self.is_first_robot:
+        """Spawn a new parcel using the spawn_next_parcel_service"""
+        if not self.is_first_robot or self.spawn_service_client is None:
             return False
             
         try:
-            # Mark parcel as spawned
-            self.spawned_parcels.add(parcel_index)
-            print(f"[{self.name}] Parcel{parcel_index} spawned at relay point 0")
+            # Create service request
+            request = Trigger.Request()
             
-            # In a real implementation, you would:
-            # 1. Load parcel model from file
-            # 2. Calculate spawn position from relay point data
-            # 3. Use appropriate spawning mechanism (e.g., Gazebo service call)
-            # For now, we just simulate successful spawning
+            # Call service asynchronously
+            future = self.spawn_service_client.call_async(request)
+            self.pending_spawn_requests[parcel_index] = future
             
+            print(f"[{self.name}] Requesting spawn for parcel{parcel_index} via service")
             return True
             
         except Exception as e:
-            print(f"[{self.name}] Error spawning parcel{parcel_index}: {e}")
+            print(f"[{self.name}] Error calling spawn service for parcel{parcel_index}: {e}")
             return False
+    
+    def _check_spawn_requests(self):
+        """Check status of pending spawn requests"""
+        completed_requests = []
+        
+        for parcel_index, future in self.pending_spawn_requests.items():
+            if future.done():
+                try:
+                    response = future.result()
+                    if response.success:
+                        self.spawned_parcels.add(parcel_index)
+                        print(f"[{self.name}] Successfully spawned parcel{parcel_index}: {response.message}")
+                    else:
+                        print(f"[{self.name}] Failed to spawn parcel{parcel_index}: {response.message}")
+                except Exception as e:
+                    print(f"[{self.name}] Service call failed for parcel{parcel_index}: {e}")
+                
+                completed_requests.append(parcel_index)
+        
+        # Remove completed requests
+        for parcel_index in completed_requests:
+            del self.pending_spawn_requests[parcel_index]
     
     def _check_parcel_spawned(self, parcel_index):
         """Check if a parcel has been successfully spawned"""
-        # In a real implementation, you might check:
-        # 1. ROS topic existence (e.g., /parcel{index}/pose)
-        # 2. Gazebo model existence
-        # 3. Service responses
-        # For now, we just check our internal tracking
         return parcel_index in self.spawned_parcels
     
     def update(self):
         try:
+            # Check status of any pending spawn requests
+            if self.is_first_robot:
+                self._check_spawn_requests()
+            
             # Get current index
             current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
             new_index = current_index + 1
@@ -1240,8 +1290,13 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
                 if self._should_spawn_new_parcel(new_index):
                     spawn_success = self._spawn_new_parcel(new_index)
                     if not spawn_success:
-                        print(f"[{self.name}] Failed to spawn parcel{new_index}, keeping current index")
+                        print(f"[{self.name}] Failed to request spawn for parcel{new_index}, keeping current index")
                         return py_trees.common.Status.FAILURE
+                
+                # Check if we have a pending request for this parcel
+                if new_index in self.pending_spawn_requests:
+                    print(f"[{self.name}] Waiting for parcel{new_index} spawn service to complete...")
+                    return py_trees.common.Status.RUNNING
                 
                 # Verify the parcel is available before incrementing
                 if not self._check_parcel_spawned(new_index):

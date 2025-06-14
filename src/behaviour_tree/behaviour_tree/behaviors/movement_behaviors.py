@@ -35,8 +35,8 @@ class MobileRobotMPC:
         self.wu = 0.08       # Slightly reduced control effort weight for more responsive control
         
         # Control constraints - further reduced max velocity for even slower approach
-        self.v_max = 0.02     # m/s (reduced from 0.025)
-        self.w_max = 0.6      # rad/s (reduced from 0.8)
+        self.v_max = 0.08     # m/s 
+        self.w_max = 0.6      # rad/s
         
         # State and control dimensions
         self.nx = 3          # [x, y, theta]
@@ -269,8 +269,9 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 Odometry, f'/turtlebot{self.namespace_number}/odom_map',
                 self.robot_pose_callback, 10)
             
-            # Get current parcel index from blackboard and subscribe to parcel topic
-            self.update_parcel_subscription()
+            # Initialize parcel subscription as None - will be set up in update() method
+            self.parcel_pose_sub = None
+            self._last_parcel_index = None
             
             self.ros_node.get_logger().info(
                 f'ApproachObject setup complete for {self.robot_namespace}')
@@ -280,27 +281,24 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             print(f"ApproachObject setup failed: {e}")
             return False
 
-    def update_parcel_subscription(self):
-        """Update subscription to the correct parcel topic based on current index from blackboard"""
+    def setup_parcel_subscription(self, parcel_index):
+        """Set up subscription to the correct parcel topic"""
         if self.ros_node is None:
-            self.ros_node.get_logger().warn(f'[{self.name}] DEBUG: ros_node is None in update_parcel_subscription')
-            return
+            return False
             
-        # Get current parcel index from namespaced blackboard
-        current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-        # self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Retrieved parcel index from blackboard: {current_parcel_index}')
-        
-        # Unsubscribe from previous parcel topic if it exists
+        # Clean up existing subscription if it exists
         if self.parcel_pose_sub is not None:
             self.ros_node.destroy_subscription(self.parcel_pose_sub)
-            self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Destroyed previous parcel subscription')
+            self.parcel_pose_sub = None
         
-        # Subscribe to current parcel topic
-        parcel_topic = f'/parcel{current_parcel_index}/pose'
+        # Create new subscription to the correct parcel topic
+        parcel_topic = f'/parcel{parcel_index}/pose'
         self.parcel_pose_sub = self.ros_node.create_subscription(
             PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
         
-        self.ros_node.get_logger().info(f'[{self.name}] DEBUG: Updated parcel subscription to: {parcel_topic}')
+        self.ros_node.get_logger().info(
+            f'[{self.name}] Subscribed to {parcel_topic}')
+        return True
 
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates (Odometry message)"""
@@ -367,7 +365,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         
         # Only execute control loop if approach is active
         if self.control_active and self.approaching_target:
-            print(f"[{self.name}] DEBUG: Timer executing control loop - control_active={self.control_active}, approaching_target={self.approaching_target}")
+            # print(f"[{self.name}] DEBUG: Timer executing control loop - control_active={self.control_active}, approaching_target={self.approaching_target}")
             self.control_loop()
         else:
             # Stop the robot when not actively approaching
@@ -483,14 +481,17 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         """
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
 
-        # Check if parcel index changed in blackboard and update subscription if needed
+        # Get current parcel index and set up subscription if needed
         current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-        if not hasattr(self, '_last_parcel_index') or self._last_parcel_index != current_parcel_index:
-            self._last_parcel_index = current_parcel_index
-            self.update_parcel_subscription()
-            if self.ros_node:
-                self.ros_node.get_logger().info(
-                    f'ApproachObject tracking parcel{current_parcel_index}')
+        
+        # Set up parcel subscription if not done yet or if parcel index changed
+        if (self.parcel_pose_sub is None or 
+            self._last_parcel_index != current_parcel_index):
+            
+            success = self.setup_parcel_subscription(current_parcel_index)
+            if success:
+                self._last_parcel_index = current_parcel_index
+                print(f"[{self.name}] Now tracking parcel{current_parcel_index}")
 
         with self.lock:
             # Check if we have the necessary pose data
@@ -557,9 +558,9 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 class MoveBackward(py_trees.behaviour.Behaviour):
     """Move backward behavior - using direct velocity control"""
     
-    def __init__(self, name):
+    def __init__(self, name, distance=0.2):
         super().__init__(name)
-        self.distance = 0.3  # meters to move backward
+        self.distance = distance  # meters to move backward
         self.start_time = None
         self.ros_node = None
         self.cmd_vel_pub = None

@@ -144,12 +144,17 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     
                 print(f"[{self.name}] Target time for replanning: {target_time:.2f}s")
                 
-                # Perform trajectory replanning
+                # Perform trajectory replanning with overall timing
+                print(f"[{self.name}] === Starting Complete Trajectory Replanning Process ===")
+                replan_start_time = time.time()
                 result = self.replan_trajectory_to_target(
                     case=self.case,
                     target_time=target_time,
                     robot_id=self.robot_id
                 )
+                replan_end_time = time.time()
+                replan_total_duration = replan_end_time - replan_start_time
+                print(f"[{self.name}] ✓ Complete replanning process finished in {replan_total_duration:.3f} seconds")
                 
                 self.replanning_complete = True
                 self.replanned_successfully = result
@@ -187,28 +192,40 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         Combines the functionality of the original replan_trajectory_to_target and 
         replan_trajectory_parameters_to_target_full functions.
         """
+        # Start overall timing for the method
+        method_start_time = time.time()
+        
         print(f"[{self.name}] === Replanning Trajectory Parameters for {case} ===")
         print(f"[{self.name}] Robot ID: {robot_id}")
         print(f"[{self.name}] Target time: {target_time:.3f}s")
         
-        # Load trajectory parameters
+        # Load trajectory parameters with timing
+        print(f"[{self.name}] Loading trajectory parameters...")
+        load_start_time = time.time()
         data_dir = f'/root/workspace/data/{case}/'
         robot_file = f'{data_dir}robot_{robot_id}_trajectory_parameters_{case}.json'
         
         if not os.path.exists(robot_file):
-            print(f"[{self.name}] Trajectory parameters file not found: {robot_file}")
+            load_end_time = time.time()
+            load_duration = load_end_time - load_start_time
+            print(f"[{self.name}] ✗ Trajectory parameters file not found: {robot_file} (checked in {load_duration:.3f}s)")
             return False
             
         try:
             with open(robot_file, 'r') as f:
                 trajectory_data = json.load(f)
-            print(f"[{self.name}] Loaded trajectory parameters from {robot_file}")
+            load_end_time = time.time()
+            load_duration = load_end_time - load_start_time
+            print(f"[{self.name}] ✓ Loaded trajectory parameters in {load_duration:.3f}s")
         except Exception as e:
-            print(f"[{self.name}] Error loading {robot_file}: {e}")
+            load_end_time = time.time()
+            load_duration = load_end_time - load_start_time
+            print(f"[{self.name}] ✗ Error loading trajectory data: {e} (after {load_duration:.3f}s)")
             return False
 
-        # Calculate current time
+        # Calculate current time with timing
         print(f"\n[{self.name}] 2. Analyzing current trajectory...")
+        analysis_start_time = time.time()
         current_robot_time = trajectory_data.get('total_time', 0)
         print(f"[{self.name}]    Current time: {current_robot_time:.3f}s")
         print(f"[{self.name}]    Target time: {target_time:.3f}s")
@@ -218,7 +235,9 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         num_segments = len(time_segments)
         
         if num_segments == 0:
-            print(f"[{self.name}] No time segments found!")
+            analysis_end_time = time.time()
+            analysis_duration = analysis_end_time - analysis_start_time
+            print(f"[{self.name}] ✗ No time segments found! (analyzed in {analysis_duration:.3f}s)")
             return False
         
         print(f"[{self.name}]    Number of segments: {num_segments}")
@@ -233,8 +252,13 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                 segment_time += sum(segment['line'])
             current_segment_times.append(segment_time)
         
+        analysis_end_time = time.time()
+        analysis_duration = analysis_end_time - analysis_start_time
+        print(f"[{self.name}] ✓ Trajectory analysis completed in {analysis_duration:.3f}s")
+        
         # Replan using CasADi optimization (full implementation)
         print(f"\n[{self.name}] 3. Optimizing trajectory times...")
+        setup_start_time = time.time()
         
         try:
             opti = ca.Opti()
@@ -287,79 +311,143 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     else:
                         delta_t_lines.append([])
             
-            # Detailed constraints similar to Planning_deltaT.py
+            setup_end_time = time.time()
+            setup_duration = setup_end_time - setup_start_time
+            print(f"[{self.name}] ✓ Optimization setup completed in {setup_duration:.3f}s")
+            
+            # Add constraints with timing (ULTRA-OPTIMIZED VERSION)
+            print(f"[{self.name}] Adding constraints...")
+            constraint_start_time = time.time()
             all_accelerations = []  # Store acceleration terms for objective penalty
             
+            # Pre-calculate physics limits ONCE to avoid repeated calculations
+            physics_limits = {}
+            for i in range(len(time_segments)):
+                if i < len(r0) and abs(r0[i]) > 0:
+                    physics_limits[i] = {
+                        'w_max_arc': calculate_angular_velocity_limit(abs(r0[i])),
+                        'aw_max_arc': calculate_angular_acceleration_limit(r0[i])
+                    }
+            
+            # Collect ALL variables and constraint expressions for BATCH processing
+            all_arc_vars = []
+            all_line_vars = []
+            arc_velocity_constraints = []
+            arc_acceleration_constraints = []
+            line_velocity_constraints = []  
+            line_acceleration_constraints = []
+            
+            # Pre-calculate all constraint expressions (minimize loops)
             for i in range(len(time_segments)):
                 if i < len(r0) and i < len(l) and i < len(phi):
-                    # Arc constraints
+                    # Process arc variables and constraints
                     if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
+                        all_arc_vars.extend(delta_t_arcs[i])
+                        
                         delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
                         arc_length = abs(r0[i] * delta_phi)
                         arc_segment_length = arc_length / len(delta_t_arcs[i])
                         
-                        # Initial state constraint for arc segments starting from zero velocity
-                        if i == 0 or (i < len(Flagb) and Flagb[i] != 0):
-                            min_t_initial = np.sqrt(2*arc_segment_length / calculate_angular_acceleration_limit(r0[i]) / abs(r0[i])) if abs(r0[i]) > 0 else 0.2
-                            opti.subject_to(delta_t_arcs[i][0] >= min_t_initial)
-                            opti.subject_to(delta_t_arcs[i][0] <= 10.0)
-                        
-                        for j, dt_arc in enumerate(delta_t_arcs[i]):
-                            # Time bounds
-                            opti.subject_to(dt_arc >= 0.20)
-                            opti.subject_to(dt_arc <= 10.0)
-                            
-                            # Angular velocity constraint
-                            if abs(r0[i]) > 0:
+                        # Only add physics constraints for valid arcs
+                        if abs(r0[i]) > 0 and i in physics_limits:
+                            for j, dt_arc in enumerate(delta_t_arcs[i]):
+                                # Velocity constraint expressions
                                 omega_c = arc_segment_length / abs(r0[i]) / dt_arc
-                                w_max_arc = calculate_angular_velocity_limit(abs(r0[i]))
-                                opti.subject_to(omega_c >= 0)
-                                opti.subject_to(omega_c <= w_max_arc)
-                            
-                            # Angular acceleration constraint between consecutive arc subsegments
-                            if j > 0:
-                                v1 = arc_segment_length / delta_t_arcs[i][j-1]
-                                v2 = arc_segment_length / delta_t_arcs[i][j]
-                                t_avg = (delta_t_arcs[i][j-1] + delta_t_arcs[i][j])/2
-                                a_tangential = (v2 - v1) / t_avg
-                                all_accelerations.append(a_tangential)
+                                arc_velocity_constraints.append(omega_c)
                                 
-                                alpha = a_tangential / abs(r0[i])
-                                aw_max_arc = calculate_angular_acceleration_limit(r0[i])
-                                opti.subject_to(alpha >= -aw_max_arc)
-                                opti.subject_to(alpha <= aw_max_arc)
+                                # Acceleration constraint expressions
+                                if j > 0:
+                                    v1 = arc_segment_length / delta_t_arcs[i][j-1]
+                                    v2 = arc_segment_length / delta_t_arcs[i][j]
+                                    t_avg = (delta_t_arcs[i][j-1] + delta_t_arcs[i][j])/2
+                                    a_tangential = (v2 - v1) / t_avg
+                                    all_accelerations.append(a_tangential)
+                                    
+                                    alpha = a_tangential / abs(r0[i])
+                                    arc_acceleration_constraints.append((alpha, physics_limits[i]['aw_max_arc']))
                     
-                    # Line constraints
+                    # Process line variables and constraints
                     if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
+                        all_line_vars.extend(delta_t_lines[i])
+                        
                         line_length = l[i] if i < len(l) else 0
                         line_segment_length = line_length / len(delta_t_lines[i])
                         
                         for j, dt_line in enumerate(delta_t_lines[i]):
-                            # Time bounds
-                            opti.subject_to(dt_line >= 0.1)
-                            opti.subject_to(dt_line <= 5.0)
-                            
-                            # Linear velocity constraint
+                            # Velocity constraint expressions
                             velocity_expr = line_segment_length / dt_line
-                            opti.subject_to(velocity_expr >= 0)
-                            opti.subject_to(velocity_expr <= v_max)
+                            line_velocity_constraints.append(velocity_expr)
                             
-                            # Linear acceleration constraint between consecutive line subsegments
+                            # Acceleration constraint expressions
                             if j > 0:
                                 a_lin = line_segment_length * (1/dt_line - 1/delta_t_lines[i][j-1]) / ((dt_line + delta_t_lines[i][j-1])/2)
                                 all_accelerations.append(a_lin)
                                 
                                 constraint_expr = (dt_line**2 - delta_t_lines[i][j-1]**2) / delta_t_lines[i][j-1] / dt_line
-                                opti.subject_to(constraint_expr >= -a_max/2/line_segment_length)
-                                opti.subject_to(constraint_expr <= a_max/2/line_segment_length)
+                                constraint_bound = a_max/2/line_segment_length
+                                line_acceleration_constraints.append((constraint_expr, constraint_bound))
             
-                # Calculate total time for detailed optimization
-                total_time = 0
-                for i in range(len(time_segments)):
-                    if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
-                        total_time += ca.sum1(ca.vertcat(*delta_t_arcs[i]))
-                    if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
+            # ULTRA-VECTORIZED constraint addition (minimal opti.subject_to calls)
+            print(f"[{self.name}] Adding ULTRA-vectorized constraints...")
+            
+            # Time bound constraints (fastest possible)
+            if all_arc_vars:
+                print(f"[{self.name}] Adding time bounds for {len(all_arc_vars)} arc variables...")
+                arc_vars_vector = ca.vertcat(*all_arc_vars)
+                opti.subject_to(ca.vertcat(arc_vars_vector - 0.20, 10.0 - arc_vars_vector) >= 0)
+                
+            if all_line_vars:
+                print(f"[{self.name}] Adding time bounds for {len(all_line_vars)} line variables...")
+                line_vars_vector = ca.vertcat(*all_line_vars)
+                opti.subject_to(ca.vertcat(line_vars_vector - 0.1, 5.0 - line_vars_vector) >= 0)
+            
+            # Velocity constraints (vectorized)
+            if arc_velocity_constraints:
+                print(f"[{self.name}] Adding {len(arc_velocity_constraints)} arc velocity constraints...")
+                arc_vel_vector = ca.vertcat(*arc_velocity_constraints)
+                # Get max velocity for each constraint (assuming same w_max for all arcs in segment)
+                max_w_values = [list(physics_limits.values())[0]['w_max_arc']] * len(arc_velocity_constraints)
+                max_w_vector = ca.vertcat(*max_w_values)
+                opti.subject_to(ca.vertcat(arc_vel_vector, max_w_vector - arc_vel_vector) >= 0)
+                
+            if line_velocity_constraints:
+                print(f"[{self.name}] Adding {len(line_velocity_constraints)} line velocity constraints...")
+                line_vel_vector = ca.vertcat(*line_velocity_constraints)
+                v_max_vector = ca.vertcat(*([v_max] * len(line_velocity_constraints)))
+                opti.subject_to(ca.vertcat(line_vel_vector, v_max_vector - line_vel_vector) >= 0)
+            
+            # Acceleration constraints (vectorized)
+            if arc_acceleration_constraints:
+                print(f"[{self.name}] Adding {len(arc_acceleration_constraints)} arc acceleration constraints...")
+                arc_accel_exprs = [constraint[0] for constraint in arc_acceleration_constraints]
+                arc_accel_bounds = [constraint[1] for constraint in arc_acceleration_constraints]
+                arc_accel_vector = ca.vertcat(*arc_accel_exprs)
+                arc_bound_vector = ca.vertcat(*arc_accel_bounds)
+                opti.subject_to(ca.vertcat(arc_accel_vector + arc_bound_vector, arc_bound_vector - arc_accel_vector) >= 0)
+                
+            if line_acceleration_constraints:
+                print(f"[{self.name}] Adding {len(line_acceleration_constraints)} line acceleration constraints...")
+                line_accel_exprs = [constraint[0] for constraint in line_acceleration_constraints]
+                line_accel_bounds = [constraint[1] for constraint in line_acceleration_constraints]
+                line_accel_vector = ca.vertcat(*line_accel_exprs)
+                line_bound_vector = ca.vertcat(*line_accel_bounds)
+                opti.subject_to(ca.vertcat(line_accel_vector + line_bound_vector, line_bound_vector - line_accel_vector) >= 0)
+            
+            # Calculate total time for detailed optimization
+            total_time = 0
+            for i in range(len(time_segments)):
+                if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
+                    total_time += ca.sum1(ca.vertcat(*delta_t_arcs[i]))
+                if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
                         total_time += ca.sum1(ca.vertcat(*delta_t_lines[i]))
+            
+            constraint_end_time = time.time()
+            constraint_duration = constraint_end_time - constraint_start_time
+            print(f"[{self.name}] ✓ Constraints added in {constraint_duration:.3f}s")
+            
+            # Setup objective and solver with timing
+            print(f"[{self.name}] Setting up objective and solver...")
+            objective_start_time = time.time()
             
             # Objective: minimize deviation from target time + acceleration penalty
             # Use adaptive weighting based on feasibility of target time
@@ -440,10 +528,21 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             }
             opti.solver('ipopt', opts)
             
-            # Solve
-            sol = opti.solve()
+            objective_end_time = time.time()
+            objective_duration = objective_end_time - objective_start_time
+            print(f"[{self.name}] ✓ Objective and solver setup completed in {objective_duration:.3f}s")
             
-            # Extract solution
+            # Solve with timing
+            print(f"[{self.name}] Starting optimization solve...")
+            solve_start_time = time.time()
+            sol = opti.solve()
+            solve_end_time = time.time()
+            solve_duration = solve_end_time - solve_start_time
+            print(f"[{self.name}] ✓ Optimization solve completed in {solve_duration:.3f} seconds")
+            
+            # Extract solution with timing
+            print(f"[{self.name}] Extracting solution...")
+            extract_start_time = time.time()
             optimized_total_time = float(sol.value(total_time))
             
                 # Detailed subsegment optimization - reconstruct segment times
@@ -463,6 +562,10 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                 trajectory_data, delta_t_arcs, delta_t_lines, sol, optimized_total_time
             )
             
+            extract_end_time = time.time()
+            extract_duration = extract_end_time - extract_start_time
+            print(f"[{self.name}] ✓ Solution extraction completed in {extract_duration:.3f}s")
+            
             optimization_results = {
                 'original_total_time': current_robot_time,
                 'target_time': target_time,
@@ -479,16 +582,49 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             print(f"[{self.name}]   Deviation from target: {abs(optimized_total_time - target_time):.3f}s")
             print(f"[{self.name}]   Improvement from original: {current_robot_time - optimized_total_time:.3f}s")
             
-            # Save results
+            # Save results with timing
+            print(f"[{self.name}] Starting to save replanned trajectory parameters...")
+            save_start_time = time.time()
             saved_file = self.save_replanned_trajectory_parameters(replanned_trajectory, case, robot_id)
+            save_end_time = time.time()
+            save_duration = save_end_time - save_start_time
+            print(f"[{self.name}] ✓ Trajectory parameters saved in {save_duration:.3f} seconds")
             
             if saved_file:
-                # Generate discrete trajectory from replanned parameters using cubic spline inter
+                # Generate discrete trajectory from replanned parameters using cubic spline interpolation
+                print(f"[{self.name}] Starting discrete trajectory generation...")
+                discrete_start_time = time.time()
                 discrete_success = self.generate_discrete_trajectory_from_replanned(case, robot_id, dt=0.1)
+                discrete_end_time = time.time()
+                discrete_duration = discrete_end_time - discrete_start_time
+                print(f"[{self.name}] ✓ Discrete trajectory generation completed in {discrete_duration:.3f} seconds")
                 
                 if discrete_success:
+                    # Calculate total method time and detailed timing breakdown
+                    method_end_time = time.time()
+                    method_total_duration = method_end_time - method_start_time
+                    
+                    # Core component times
+                    method_component_time = solve_duration + save_duration + discrete_duration
+                    
+                    # Other overhead time (setup, constraints, extraction, etc.)
+                    other_overhead_time = method_total_duration - method_component_time
+                    
                     print(f"\n[{self.name}] === Complete Replanning Summary ===")
                     print(f"[{self.name}] Robot {robot_id} results:")
+                    print(f"[{self.name}]   Detailed Timing Breakdown:")
+                    print(f"[{self.name}]     - Data loading: {load_duration:.3f}s")
+                    print(f"[{self.name}]     - Trajectory analysis: {analysis_duration:.3f}s")
+                    print(f"[{self.name}]     - Optimization setup: {setup_duration:.3f}s")
+                    print(f"[{self.name}]     - Constraint generation: {constraint_duration:.3f}s")
+                    print(f"[{self.name}]     - Objective/solver setup: {objective_duration:.3f}s")
+                    print(f"[{self.name}]     - Optimization solve: {solve_duration:.3f}s")
+                    print(f"[{self.name}]     - Solution extraction: {extract_duration:.3f}s")
+                    print(f"[{self.name}]     - Parameter save: {save_duration:.3f}s") 
+                    print(f"[{self.name}]     - Discrete generation: {discrete_duration:.3f}s")
+                    print(f"[{self.name}]     - Other overhead: {other_overhead_time:.3f}s")
+                    print(f"[{self.name}]     - Method total time: {method_total_duration:.3f}s")
+                    print(f"[{self.name}]   Optimization Results:")
                     print(f"[{self.name}]   Original → Replanned: {optimization_results['original_total_time']:.3f}s → {optimization_results['optimized_total_time']:.3f}s")
                     print(f"[{self.name}]   Target: {optimization_results['target_time']:.3f}s")
                     print(f"[{self.name}]   Deviation: {optimization_results['deviation']:.3f}s")
