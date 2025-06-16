@@ -892,9 +892,11 @@ class PushObject(py_trees.behaviour.Behaviour):
             # Check if we have pose data to give more detailed feedback
             if self.parcel_pose and self.relay_pose:
                 distance = self._calculate_distance(self.parcel_pose, self.relay_pose)
-                print(f"[{self.name}] RUNNING: Trajectory complete, continuing to push parcel toward relay point. Distance: {distance:.3f}m")
+                relay_number = self._extract_namespace_number()+1  # Relaypoint number
+                print(f"[{self.name}] RUNNING: Trajectory complete, continuing to push parcel{self.current_parcel_index} toward relaypoint{relay_number}. Distance: {distance:.3f}m")
             else:
-                print(f"[{self.name}] RUNNING: Trajectory complete, continuing to push parcel toward relay point")
+                relay_number = self._extract_namespace_number()+1  # Relaypoint number
+                print(f"[{self.name}] RUNNING: Trajectory complete, continuing to push parcel{self.current_parcel_index} toward relaypoint{relay_number}")
         
         # Timeout check (adjust based on expected trajectory duration)
         if elapsed >= 120.0: 

@@ -643,3 +643,15 @@ class MoveBackward(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
         
         return py_trees.common.Status.RUNNING
+    
+    def terminate(self, new_status):
+        """Clean up when behavior terminates - ensure robot stops"""
+        # Stop the robot immediately
+        if self.cmd_vel_pub:
+            stop_cmd = Twist()
+            stop_cmd.linear.x = 0.0
+            stop_cmd.angular.z = 0.0
+            self.cmd_vel_pub.publish(stop_cmd)
+        
+        self.feedback_message = f"MoveBackward terminated with status: {new_status}"
+        print(f"[{self.name}] MoveBackward terminated with status: {new_status} - robot stopped")

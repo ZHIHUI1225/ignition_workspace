@@ -484,8 +484,7 @@ class WaitAction(py_trees.behaviour.Behaviour):
         # Will be updated when parcel index is received
         self.parcel_pose_sub = None
         
-        # Create initial parcel subscription for index 0
-        self.update_parcel_subscription()
+        # Parcel subscription will be created in initialise() when behavior starts
         
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
@@ -568,6 +567,9 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.feedback_message = f"Waiting for {self.duration}s and monitoring parcel proximity"
         print(f"[{self.name}] Starting wait for {self.duration}s with parcel monitoring...")
         print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, relay: Relaypoint{self.relay_number}")
+        
+        # Create initial parcel subscription when behavior starts
+        self.update_parcel_subscription()
     
     def update(self) -> py_trees.common.Status:
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
@@ -1027,8 +1029,7 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
                 10
             )
             
-            # Create initial parcel subscription for index 0
-            self.update_parcel_subscription()
+            # Parcel subscription will be created in initialise() when behavior starts
             
             self.node.get_logger().info(f'CheckPairComplete setup complete for {self.robot_namespace}')
             return True
