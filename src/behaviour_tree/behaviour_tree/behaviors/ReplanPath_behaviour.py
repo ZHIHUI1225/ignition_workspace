@@ -7,6 +7,8 @@ Uses the replanning functions from Replan_behaviors.py to optimize robot traject
 import py_trees
 import time
 import re
+import rclpy
+from std_msgs.msg import Float64
 from .Replan_behaviors import replan_trajectory_parameters_to_target
 
 
@@ -25,7 +27,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         Args:
             name (str): Name of the behavior
             duration (float): Maximum duration for the replanning process (seconds)
-            robot_namespace (str): Robot namespace for blackboard variables
+            robot_namespace (str): Robot namespace for ROS topics
             case (str): Case name for trajectory data (e.g., "simple_maze")
         """
         super().__init__(name)
@@ -36,29 +38,15 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         self.replanning_completed = False
         self.replanning_successful = False
         
-        # Set up blackboard client
-        self.blackboard = py_trees.blackboard.Client(name=self.name)
+        # ROS2 components
+        self.node = None
+        self.pushing_estimated_time_sub = None
+        self.previous_robot_pushing_estimated_time = 45.0  # Default value
         
-        # Register blackboard keys
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/pushing_estimated_time",
-            access=py_trees.common.Access.READ
-        )
-        
-        # Register read access for other robots' target times that this robot might need
-        # Extract robot number to determine which other robots to register
-        if robot_namespace.startswith("turtlebot"):
-            try:
-                robot_num = int(robot_namespace.replace("turtlebot", ""))
-                if robot_num > 0:
-                    # Register read access for the previous robot's target time
-                    prev_robot = f"turtlebot{robot_num - 1}"
-                    self.blackboard.register_key(
-                        key=f"{prev_robot}/pushing_estimated_time",
-                        access=py_trees.common.Access.READ
-                    )
-            except ValueError:
-                pass
+        # Extract robot number for determining previous robot
+        namespace_match = re.search(r'turtlebot(\d+)', self.robot_namespace)
+        self.namespace_number = int(namespace_match.group(1)) if namespace_match else 0
+        self.previous_robot_namespace = f"turtlebot{self.namespace_number - 1}" if self.namespace_number > 0 else None
         
     
     def initialise(self):
@@ -69,37 +57,21 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         
         print(f"[{self.name}] Starting trajectory replanning for case '{self.case}'...")
         
-        # Get target time from previous robot's pushing_estimated_time
-        # Extract namespace number for determining previous robot
-        namespace_match = re.search(r'turtlebot(\d+)', self.robot_namespace)
-        namespace_number = int(namespace_match.group(1)) if namespace_match else 0
-        
-        if namespace_number == 0:
+        # Get target time from previous robot's pushing_estimated_time via ROS topic
+        if self.namespace_number == 0:
             # turtlebot0 uses default 45s
             raw_target_time = 45.0
             print(f"[{self.name}] Using default target time for turtlebot0: {raw_target_time:.2f}s")
         else:
-            # turtlebotN gets pushing_estimated_time from turtlebot(N-1)
-            previous_robot = f'turtlebot{namespace_number - 1}'
-            try:
-                raw_target_time = self.blackboard.get(f'{previous_robot}/pushing_estimated_time')
-                print(f"[{self.name}] Getting target time from {previous_robot}: {raw_target_time:.2f}s")
-            except KeyError:
-                raw_target_time = 45.0
-                print(f"[{self.name}] Warning: {previous_robot}/pushing_estimated_time not found, using default 45.0s")
+            # turtlebotN gets pushing_estimated_time from turtlebot(N-1) via ROS topic
+            raw_target_time = self.previous_robot_pushing_estimated_time
+            print(f"[{self.name}] Getting target time from {self.previous_robot_namespace} via ROS topic: {raw_target_time:.2f}s")
 
         target_time = raw_target_time
         print(f"[{self.name}] Target time for replanning: {target_time:.2f}s")
         
-        # Extract robot ID from namespace (e.g., "turtlebot0" -> 0)
-        if self.robot_namespace.startswith("turtlebot"):
-            try:
-                robot_id = int(self.robot_namespace.replace("turtlebot", ""))
-            except ValueError:
-                robot_id = 0
-        else:
-            robot_id = 0
-        
+        # Use robot ID from namespace
+        robot_id = self.namespace_number
         print(f"[{self.name}] Using robot ID: {robot_id}")
         
         # Store parameters for the update method
@@ -168,6 +140,14 @@ class ReplanPath(py_trees.behaviour.Behaviour):
     
     def terminate(self, new_status):
         """Clean up when the behavior terminates."""
+        # Clean up ROS subscriptions
+        if hasattr(self, 'pushing_estimated_time_sub') and self.pushing_estimated_time_sub:
+            try:
+                self.node.destroy_subscription(self.pushing_estimated_time_sub)
+                self.pushing_estimated_time_sub = None
+            except:
+                pass
+        
         if new_status == py_trees.common.Status.SUCCESS:
             print(f"[{self.name}] Replanning behavior completed successfully")
         elif new_status == py_trees.common.Status.FAILURE:
@@ -179,3 +159,36 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         self.start_time = None
         self.replanning_completed = False
         self.replanning_successful = False
+    
+    def setup(self, **kwargs):
+        """Setup ROS2 components"""
+        try:
+            # Get the shared ROS node from kwargs
+            if 'node' in kwargs:
+                self.node = kwargs['node']
+            else:
+                print(f"[{self.name}] No ROS node provided")
+                return False
+            
+            # Subscribe to previous robot's pushing_estimated_time topic
+            if self.previous_robot_namespace:
+                self.pushing_estimated_time_sub = self.node.create_subscription(
+                    Float64,
+                    f'/{self.previous_robot_namespace}/pushing_estimated_time',
+                    self.pushing_estimated_time_callback,
+                    10
+                )
+                print(f"[{self.name}] DEBUG: Subscribed to {self.previous_robot_namespace}/pushing_estimated_time topic")
+            else:
+                print(f"[{self.name}] DEBUG: No previous robot (this is turtlebot0)")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Setup failed: {e}")
+            return False
+    
+    def pushing_estimated_time_callback(self, msg):
+        """Callback for previous robot's pushing estimated time"""
+        self.previous_robot_pushing_estimated_time = msg.data
+        print(f"[{self.name}] DEBUG: Received {self.previous_robot_namespace}/pushing_estimated_time = {msg.data:.2f}s")

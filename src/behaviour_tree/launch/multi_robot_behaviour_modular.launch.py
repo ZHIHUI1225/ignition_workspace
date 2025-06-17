@@ -30,7 +30,7 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument(
         'num_robots',
-        default_value='2',
+        default_value='3',
         description='Number of robots to launch behavior trees for'))
     
     # Use OpaqueFunction to handle dynamic robot count properly
@@ -97,7 +97,7 @@ def generate_launch_description():
         ],
         parameters=[{'use_sim_time': True}]  # Ensure simulation time is used
     )
-    ld.add_action(rviz_node)
+    # ld.add_action(rviz_node)
     # Add the dynamic robot node creation
     ld.add_action(OpaqueFunction(function=create_robot_nodes))
     return ld

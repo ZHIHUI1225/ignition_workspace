@@ -182,14 +182,14 @@ class ApproachObject(py_trees.behaviour.Behaviour):
     Uses MPC controller to make the robot approach the parcel based on the logic from State_switch.py.
     """
 
-    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.12):
+    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.17):
         """
         Initialize the ApproachObject behavior.
         
         Args:
             name: Name of the behavior node
             robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
-            approach_distance: Distance to maintain from the parcel (default 0.12m)
+            approach_distance: Distance to maintain from the parcel
         """
         super(ApproachObject, self).__init__(name)
         self.robot_namespace = robot_namespace
@@ -197,10 +197,6 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         
         # Extract namespace number for topic subscriptions
         self.namespace_number = self.extract_namespace_number(robot_namespace)
-        
-        # Pose storage
-        self.robot_pose = None
-        self.parcel_pose = None
         
         # Setup blackboard access for current_parcel_index with namespace
         self.blackboard = self.attach_blackboard_client()
@@ -213,13 +209,8 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             access=py_trees.common.Access.WRITE
         )
         
-        # Set default pushing estimated time (45 seconds)
-        setattr(self.blackboard, f"{robot_namespace}/pushing_estimated_time", 45.0)
-        
-        # State variables
-        self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
-        self.target_state = np.array([0.0, 0.0, 0.0])   # [x, y, theta]
-        self.approaching_target = False
+        # Initialize only persistent variables that shouldn't reset
+        # State variables will be initialized in initialise() method
         
         # ROS2 components (will be initialized in setup)
         self.ros_node = None
@@ -227,13 +218,12 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.parcel_pose_sub = None
         self.cmd_vel_pub = None
         
-        # MPC controller
-        self.mpc = MobileRobotMPC()
+        # MPC controller will be initialized in initialise() method
+        self.mpc = None
         
         # Control loop timer
         self.control_timer = None
         self.dt = 0.1  # 0.1s timer period for MPC control (10Hz)
-        self.control_active = False
         
         # Threading lock for state protection
         self.lock = threading.Lock()
@@ -247,29 +237,19 @@ class ApproachObject(py_trees.behaviour.Behaviour):
     def setup(self, **kwargs):
         """Setup ROS connections"""
         try:
-            # Get or create ROS node
+            # Always use the shared ROS node from the behavior tree
             if 'node' in kwargs:
                 self.ros_node = kwargs['node']
+                self.ros_node.get_logger().info(f'[{self.name}] Using shared ROS node: {self.ros_node.get_name()}')
             else:
-                if not rclpy.ok():
-                    rclpy.init()
-                
-                class ApproachObjectNode(Node):
-                    def __init__(self):
-                        super().__init__(f'approach_object_{self.robot_namespace}')
-                
-                self.ros_node = ApproachObjectNode()
+                raise RuntimeError("No ROS node provided in kwargs. ApproachObject requires a shared node for proper callback processing.")
             
             # Create command velocity publisher
             self.cmd_vel_pub = self.ros_node.create_publisher(
                 Twist, f'/turtlebot{self.namespace_number}/cmd_vel', 10)
             
-            # Subscribe to robot pose (Odometry)
-            self.robot_pose_sub = self.ros_node.create_subscription(
-                Odometry, f'/turtlebot{self.namespace_number}/odom_map',
-                self.robot_pose_callback, 10)
-            
-            # Initialize parcel subscription as None - will be set up in update() method
+            # Initialize subscriptions as None - will be set up in initialise() method
+            self.robot_pose_sub = None
             self.parcel_pose_sub = None
             self._last_parcel_index = None
             
@@ -352,6 +332,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         if not hasattr(self, '_last_timer_time'):
             self._last_timer_time = current_time
             self._timer_call_count = 0
+            self._mpc_execution_times = []
         
         time_interval = current_time - self._last_timer_time
         self._timer_call_count += 1
@@ -404,6 +385,10 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 self.target_state[1] = self.target_state[1] - (self.approach_distance-0.2) * math.sin(optimal_direction)
                 
                 # Generate and apply control using MPC
+                if self.mpc is None:
+                    print(f"[{self.name}] WARNING: MPC controller not initialized, skipping control")
+                    return
+                
                 u = self.mpc.update_control(self.current_state, self.target_state)
                 
                 if u is not None and self.cmd_vel_pub:
@@ -455,9 +440,51 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 
     def initialise(self):
         """Initialize the behavior when it starts running"""
+        # Reset state variables every time behavior launches
+        self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
+        self.target_state = np.array([0.0, 0.0, 0.0])   # [x, y, theta]
         self.approaching_target = False
         self.control_active = False
+        
+        # Reset ROS2 components
+        self.robot_pose = None
+        self.parcel_pose = None
+        
         self.feedback_message = "Initializing approach behavior"
+        
+        # Set default pushing estimated time (45 seconds) every time behavior starts
+        setattr(self.blackboard, f"{self.robot_namespace}/pushing_estimated_time", 45.0)
+        
+        # Reset and create fresh MPC controller every time the node launches
+        print(f"[{self.name}] Creating fresh MPC controller instance")
+        self.mpc = MobileRobotMPC()
+        
+        # Reset control timer (will be created later if ros_node is available)
+        self.control_timer = None
+        
+        # Clean up existing subscriptions first
+        if self.robot_pose_sub is not None:
+            self.ros_node.destroy_subscription(self.robot_pose_sub)
+            self.robot_pose_sub = None
+        if self.parcel_pose_sub is not None:
+            self.ros_node.destroy_subscription(self.parcel_pose_sub)
+            self.parcel_pose_sub = None
+        
+        # Set up robot pose subscription every time behavior starts
+        if self.ros_node:
+            self.robot_pose_sub = self.ros_node.create_subscription(
+                Odometry, f'/turtlebot{self.namespace_number}/odom_map',
+                self.robot_pose_callback, 10)
+            print(f"[{self.name}] Set up robot pose subscription to /turtlebot{self.namespace_number}/odom_map")
+        
+        # Set up parcel subscription with current parcel index every time behavior starts
+        current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+        success = self.setup_parcel_subscription(current_parcel_index)
+        if success:
+            self._last_parcel_index = current_parcel_index
+            print(f"[{self.name}] Initialized parcel subscription for parcel{current_parcel_index}")
+        else:
+            print(f"[{self.name}] WARNING: Failed to set up parcel subscription for parcel{current_parcel_index}")
         
         # Create and start ROS timer for control loop at 10Hz (0.1s)
         if self.ros_node:
@@ -481,13 +508,12 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         """
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
 
-        # Get current parcel index and set up subscription if needed
+        # Get current parcel index for monitoring (subscription already set up in initialise)
         current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
         
-        # Set up parcel subscription if not done yet or if parcel index changed
-        if (self.parcel_pose_sub is None or 
-            self._last_parcel_index != current_parcel_index):
-            
+        # Check if parcel index changed since initialization
+        if self._last_parcel_index != current_parcel_index:
+            print(f"[{self.name}] Parcel index changed from {self._last_parcel_index} to {current_parcel_index} - updating subscription")
             success = self.setup_parcel_subscription(current_parcel_index)
             if success:
                 self._last_parcel_index = current_parcel_index
@@ -550,6 +576,17 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             self.control_timer.cancel()
             self.control_timer = None
             print(f"[{self.name}] DEBUG: Cancelled control timer on terminate")
+        
+        # Clean up subscriptions
+        if self.robot_pose_sub is not None:
+            self.ros_node.destroy_subscription(self.robot_pose_sub)
+            self.robot_pose_sub = None
+            print(f"[{self.name}] DEBUG: Destroyed robot pose subscription on terminate")
+        
+        if self.parcel_pose_sub is not None:
+            self.ros_node.destroy_subscription(self.parcel_pose_sub)
+            self.parcel_pose_sub = None
+            print(f"[{self.name}] DEBUG: Destroyed parcel pose subscription on terminate")
         
         self.feedback_message = f"ApproachObject terminated with status: {new_status}"
         print(f"[{self.name}] ApproachObject terminated with status: {new_status}")

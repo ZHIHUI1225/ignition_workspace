@@ -113,7 +113,7 @@ class TrajectoryVisualizer(Node):
                 data = json.load(f)
             
             trajectory_points = data['Trajectory']
-            self.get_logger().info(f"Loaded {len(trajectory_points)} trajectory points for tb{robot_id}")
+            # self.get_logger().info(f"Loaded {len(trajectory_points)} trajectory points for tb{robot_id}")
             
             # Create Path message for RViz-style visualization
             path_msg = self.create_path_message(trajectory_points, robot_id)
@@ -125,7 +125,7 @@ class TrajectoryVisualizer(Node):
             self.path_publishers[robot_id].publish(path_msg)
             self.marker_publishers[robot_id].publish(marker_array)
             
-            self.get_logger().info(f"Published trajectory visualization for tb{robot_id}")
+            # self.get_logger().info(f"Published trajectory visualization for tb{robot_id}")
             
         except Exception as e:
             self.get_logger().error(f"Error loading trajectory for tb{robot_id}: {str(e)}")

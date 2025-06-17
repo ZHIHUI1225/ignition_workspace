@@ -308,6 +308,6 @@ def generate_launch_description():
         arguments=['-d', rviz_config_path] if os.path.exists(rviz_config_path) else [],
         output='screen'
     )
-    ld.add_action(rviz_node)
+    # ld.add_action(rviz_node)
 
     return ld

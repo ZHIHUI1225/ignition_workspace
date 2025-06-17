@@ -20,7 +20,7 @@ from scipy.interpolate import CubicSpline
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Int32, Float64
+from std_msgs.msg import Int32, Float64, Bool
 from std_srvs.srv import Trigger
 
 
@@ -63,24 +63,98 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.last_robot_pose = None  # New: track last robot position
         self.current_parcel_index = 0
         
-        # Setup blackboard access for namespaced current_parcel_index
+        # Setup blackboard access for namespaced current_parcel_index (keep this one)
         self.blackboard = self.attach_blackboard_client()
         self.blackboard.register_key(
             key=f"{robot_namespace}/current_parcel_index", 
             access=py_trees.common.Access.READ
         )
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/pushing_estimated_time", 
-            access=py_trees.common.Access.WRITE
-        )
         
-        # Set default pushing estimated time (45 seconds)
-        setattr(self.blackboard, f"{robot_namespace}/pushing_estimated_time", 45.0)
+        # ROS2 topics for pushing coordination instead of blackboard
+        self.pushing_finished_pub = None
+        self.pushing_finished_sub = None
+        self.pushing_estimated_time_pub = None
+        self.previous_robot_pushing_finished = False  # Track previous robot's status
+        
+        # Set default pushing estimated time (45 seconds) - will be published via ROS topic
+        self.pushing_estimated_time = 45.0
         
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        import re
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
+
+    def get_previous_robot_namespace(self, current_namespace):
+        """Get the namespace of the previous robot in sequence"""
+        current_number = self.extract_namespace_number(current_namespace)
+        if current_number <= 0:
+            return None  # turtlebot0 has no previous robot
+        previous_number = current_number - 1
+        return f"turtlebot{previous_number}"
+
+    def check_previous_robot_finished(self):
+        """Check if the previous robot has finished pushing via ROS topic"""
+        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
+        
+        # For turtlebot0, default to True (no previous robot)
+        if previous_robot_namespace is None:
+            print(f"[{self.name}] DEBUG: No previous robot (this is turtlebot0), returning True")
+            return True
+        
+        # For other robots, check the previous robot's pushing_finished flag via ROS topic
+        print(f"[{self.name}] DEBUG: Current robot: {self.robot_namespace}, checking previous robot: {previous_robot_namespace}")
+        print(f"[{self.name}] DEBUG: Previous robot pushing finished status: {self.previous_robot_pushing_finished}")
+        
+        return self.previous_robot_pushing_finished
+    
+    def previous_robot_pushing_finished_callback(self, msg):
+        """Callback for previous robot's pushing finished status"""
+        self.previous_robot_pushing_finished = msg.data
+        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
+        print(f"[{self.name}] DEBUG: Received {previous_robot_namespace}/pushing_finished = {msg.data}")
+    
+    def setup_pushing_coordination_topics(self):
+        """Setup ROS2 topics for pushing coordination"""
+        if self.node is None:
+            return
+        
+        # Publisher for this robot's pushing_finished status
+        self.pushing_finished_pub = self.node.create_publisher(
+            Bool,
+            f'/{self.robot_namespace}/pushing_finished',
+            10
+        )
+        
+        # Publisher for this robot's pushing_estimated_time
+        self.pushing_estimated_time_pub = self.node.create_publisher(
+            Float64,
+            f'/{self.robot_namespace}/pushing_estimated_time',
+            10
+        )
+        
+        # Subscriber for previous robot's pushing_finished status
+        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
+        if previous_robot_namespace:
+            self.pushing_finished_sub = self.node.create_subscription(
+                Bool,
+                f'/{previous_robot_namespace}/pushing_finished',
+                self.previous_robot_pushing_finished_callback,
+                10
+            )
+            print(f"[{self.name}] DEBUG: Subscribed to {previous_robot_namespace}/pushing_finished topic")
+        
+        # Publish initial values
+        self.publish_pushing_estimated_time()
+        print(f"[{self.name}] DEBUG: Setup pushing coordination topics")
+    
+    def publish_pushing_estimated_time(self):
+        """Publish the pushing estimated time via ROS topic"""
+        if self.pushing_estimated_time_pub:
+            msg = Float64()
+            msg.data = self.pushing_estimated_time
+            self.pushing_estimated_time_pub.publish(msg)
+            print(f"[{self.name}] DEBUG: Published pushing_estimated_time = {self.pushing_estimated_time}s")
     
     def setup_subscriptions(self):
         """Setup ROS2 subscriptions"""
@@ -110,6 +184,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
                 10
             )
         
+        # Setup pushing coordination topics
+        self.setup_pushing_coordination_topics()
+        
         # Initialize parcel subscription as None - will be set up in initialise() when blackboard is ready
         self.parcel_pose_sub = None
         print(f"[{self.name}] DEBUG: Parcel subscription will be created in initialise() when blackboard is ready")
@@ -136,7 +213,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     def parcel_pose_callback(self, msg):
         """Callback for parcel pose updates"""
         self.parcel_pose = msg
-        print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
+        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
     
     def setup_parcel_subscription(self):
         """Set up parcel subscription when blackboard is ready"""
@@ -244,29 +321,31 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         elapsed = time.time() - self.start_time
         
-        # Check both success conditions
-        if self.check_success_conditions():
-            print(f"[{self.name}] SUCCESS: All conditions met for PUSH!")
-            print(f"[{self.name}] - Parcel{self.current_parcel_index} is near Relaypoint{self.relay_number}")
-            if not self.is_first_robot:
-                print(f"[{self.name}] - Last robot (tb{self.last_robot_number}) is out of relay range")
-            return py_trees.common.Status.SUCCESS
+        # First check if previous robot has finished pushing
+        previous_finished = self.check_previous_robot_finished()
+        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
         
-        # Timeout condition - FAILURE if conditions not met
-        if elapsed >= self.duration:
-            print(f"[{self.name}] TIMEOUT: PUSH wait FAILED - conditions not satisfied")
-            parcel_in_range = self.check_parcel_in_relay_range()
+        print(f"[{self.name}] DEBUG: Elapsed: {elapsed:.1f}s, Previous robot finished: {previous_finished}")
+        
+        if not previous_finished:
+            print(f"[{self.name}] DEBUG: Still waiting for {previous_robot_namespace} to finish pushing")
+            self.feedback_message = f"Waiting for {previous_robot_namespace} to finish pushing..."
+            return py_trees.common.Status.RUNNING
+        
+        # For non-turtlebot0 robots, also check if last robot is out of relay range
+        if not self.is_first_robot:
             last_robot_out = self.check_last_robot_out_of_relay_range()
-            print(f"[{self.name}] - Parcel in range: {parcel_in_range}")
-            print(f"[{self.name}] - Last robot out of range: {last_robot_out}")
-            return py_trees.common.Status.FAILURE
+            print(f"[{self.name}] DEBUG: Last robot out of relay range: {last_robot_out}")
+            
+            if not last_robot_out:
+                print(f"[{self.name}] DEBUG: Still waiting for last robot (tb{self.last_robot_number}) to move out of relay range")
+                self.feedback_message = f"Waiting for tb{self.last_robot_number} to move out of relay range..."
+                return py_trees.common.Status.RUNNING
         
-        # Status update with detailed information
-        parcel_relay_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
-        parcel_in_range = self.check_parcel_in_relay_range()
-        last_robot_out = self.check_last_robot_out_of_relay_range()
-        
-        return py_trees.common.Status.RUNNING
+        # Both conditions met (previous robot finished AND last robot out of range for non-turtlebot0)
+        print(f"[{self.name}] DEBUG: All conditions satisfied, returning SUCCESS")
+        print(f"[{self.name}] SUCCESS: Ready to proceed with pushing!")
+        return py_trees.common.Status.SUCCESS
     
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
@@ -294,6 +373,13 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             try:
                 self.node.destroy_subscription(self.last_robot_pose_sub)
                 self.last_robot_pose_sub = None
+            except:
+                pass
+        # Clean up pushing coordination topics
+        if hasattr(self, 'pushing_finished_sub') and self.pushing_finished_sub:
+            try:
+                self.node.destroy_subscription(self.pushing_finished_sub)
+                self.pushing_finished_sub = None
             except:
                 pass
         super().terminate(new_status)
@@ -1164,12 +1250,15 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
         super().__init__(name)
         self.robot_namespace = robot_namespace
         
-        # Setup blackboard access
+        # Setup blackboard access (only for current_parcel_index)
         self.blackboard = self.attach_blackboard_client()
         self.blackboard.register_key(
             key=f"{robot_namespace}/current_parcel_index", 
             access=py_trees.common.Access.WRITE
         )
+        
+        # ROS2 topic for pushing coordination instead of blackboard
+        self.pushing_finished_pub = None
         
         # ROS setup for service client (only for turtlebot0)
         self.is_first_robot = (robot_namespace == "turtlebot0")
@@ -1188,27 +1277,32 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
     
     def setup(self, **kwargs):
         """Setup ROS node and service client"""
-        if not self.is_first_robot:
-            return True  # No setup needed for non-turtlebot0 robots
-            
         try:
             self.node = kwargs.get('node')
             if self.node is None:
                 print(f"[{self.name}] No ROS node provided")
                 return False
             
-            # Create service client for spawning parcels
-            self.spawn_service_client = self.node.create_client(
-                Trigger, 
-                '/spawn_next_parcel_service'
-            )
+            # Create publisher for pushing_finished coordination
+            self.pushing_finished_pub = self.node.create_publisher(
+                Bool, f'/{self.robot_namespace}/pushing_finished', 10)
+            print(f"[{self.name}] DEBUG: Created pushing_finished topic publisher")
             
-            # Wait for service to be available
-            if not self.spawn_service_client.wait_for_service(timeout_sec=5.0):
-                print(f"[{self.name}] Spawn service not available")
-                return False
+            # Only setup service client for turtlebot0
+            if self.is_first_robot:
+                # Create service client for spawning parcels
+                self.spawn_service_client = self.node.create_client(
+                    Trigger, 
+                    '/spawn_next_parcel_service'
+                )
+                
+                # Wait for service to be available
+                if not self.spawn_service_client.wait_for_service(timeout_sec=5.0):
+                    print(f"[{self.name}] Spawn service not available")
+                    return False
+                
+                print(f"[{self.name}] Spawn service client ready")
             
-            print(f"[{self.name}] Spawn service client ready")
             return True
             
         except Exception as e:
@@ -1310,6 +1404,13 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             
             # Update the index
             setattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', new_index)
+            
+            # Reset pushing_finished flag to False for the new parcel via ROS topic
+            if self.pushing_finished_pub:
+                msg = Bool()
+                msg.data = False
+                self.pushing_finished_pub.publish(msg)
+                print(f"[{self.name}] DEBUG: Published pushing_finished = False via ROS topic for new parcel{new_index}")
             
             print(f"[{self.name}] Incremented index from {current_index} to {new_index}")
             
