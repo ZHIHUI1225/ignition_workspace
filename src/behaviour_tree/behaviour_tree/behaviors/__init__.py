@@ -35,10 +35,7 @@ from .mpc_controller import (
 
 # Import tree builder functions
 from .tree_builder import (
-    create_root,
-    create_pushing_sequence,
-    create_picking_sequence,
-    create_simple_test_tree
+    create_root
 )
 
 __all__ = [

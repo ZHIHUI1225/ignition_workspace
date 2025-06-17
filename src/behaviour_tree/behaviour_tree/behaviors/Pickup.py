@@ -28,25 +28,24 @@ def extract_namespace_number(namespace):
 
 class MobileRobotMPC:
     def __init__(self):
-        # MPC parameters - optimized for 3-state control (x, y, theta)
+        # MPC parameters - 5-state control (x, y, theta, v, omega)
         self.N = 8           # Prediction horizon for good tracking
         self.N_c = 3         # Control horizon for smoother control
         self.dt = 0.1        # Time step
-        # Higher position weights for precise tracking, reduced orientation weight
-        self.Q = np.diag([100.0, 100.0, 2.0])   # State weights (x, y, theta) - reduced theta weight
-        # Lower control input weights for more aggressive control
-        self.R = np.diag([0.05, 0.02])           # Control input weights (v, omega)
-        # Much higher terminal position weights, reduced terminal orientation weight
-        self.F = np.diag([200.0, 200.0, 5.0])   # Terminal cost weights - reduced theta weight
         
-        # Velocity constraints
+        # Balanced weights for 5-state formulation
+        self.Q = np.diag([50.0, 50.0, 5.0, 1.0, 1.0])   # State weights (x, y, theta, v, omega)
+        self.R = np.diag([1.0, 1.0])                     # Control input weights (v, omega)
+        self.F = np.diag([100.0, 100.0, 10.0, 2.0, 2.0]) # Terminal cost weights
+        
+        # Conservative velocity constraints
         self.max_vel = 0.25      # m/s
-        self.min_vel = -0.25     # m/s (allow reverse)
-        self.max_omega = np.pi/3 # rad/s (reduced from pi/2 for smoother orientation control)
+        self.min_vel = -0.1      # m/s (limited reverse)
+        self.max_omega = np.pi/3 # rad/s (conservative angular velocity)
         self.min_omega = -np.pi/3 # rad/s
         
         # System dimensions
-        self.nx = 3   # Number of states (x, y, theta)
+        self.nx = 5   # Number of states (x, y, theta, v, omega)
         self.nu = 2   # Number of controls (v, omega)
         
         # Reference trajectory
@@ -59,81 +58,97 @@ class MobileRobotMPC:
         self.setup_mpc()
 
     def setup_mpc(self):
-        # Optimization problem
+        # Robust optimization problem with numerical stability
         self.opti = ca.Opti()
         
         # Decision variables
-        self.X = self.opti.variable(self.nx, self.N+1)  # State trajectory (N+1 states)
+        self.X = self.opti.variable(self.nx, self.N+1)  # State trajectory
         self.U = self.opti.variable(self.nu, self.N)    # Control trajectory
         
         # Parameters
         self.x0 = self.opti.parameter(self.nx)          # Initial state
         self.ref = self.opti.parameter(self.nx, self.N+1)  # Reference trajectory
 
-        # Cost function - 3-state tracking
+        # Robust cost function with numerical stability
         cost = 0
         for k in range(self.N):
-            # Position error (x,y)
-            pos_error = self.X[:2, k] - self.ref[:2, k]
+            # State tracking cost - robust formulation
+            state_error = self.X[:, k] - self.ref[:, k]
+            
+            # Position error (x, y) - standard quadratic
+            pos_error = state_error[:2]
             cost += ca.mtimes([pos_error.T, self.Q[:2,:2], pos_error])
             
-            # Orientation (theta) - scalar operation with angle wrapping
-            theta_error = self.X[2, k] - self.ref[2, k]
-            # Normalize angle difference to [-pi, pi]
-            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi
-            cost += self.Q[2,2] * theta_error**2
+            # Orientation error with angle wrapping
+            theta_error = state_error[2]
+            # Robust angle wrapping using atan2 for numerical stability
+            theta_error_wrapped = ca.atan2(ca.sin(theta_error), ca.cos(theta_error))
+            cost += self.Q[2,2] * theta_error_wrapped**2
             
-            # Control cost
-            cost += ca.mtimes([self.U[:, k].T, self.R, self.U[:, k]])
+            # Velocity errors - add small regularization for stability
+            vel_error = state_error[3:5]
+            cost += ca.mtimes([vel_error.T, self.Q[3:5,3:5], vel_error])
+            
+            # Control cost with regularization
+            u_reg = self.U[:, k] + 1e-6  # Small regularization to prevent singularity
+            cost += ca.mtimes([u_reg.T, self.R, u_reg])
             
             # Dynamics constraints
             x_next = self.robot_model(self.X[:, k], self.U[:, k])
             self.opti.subject_to(self.X[:, k+1] == x_next)
 
-        # Terminal cost - 3-state terminal penalty
-        pos_term_error = self.X[:2, -1] - self.ref[:2, -1]
+        # Terminal cost with robust angle handling
+        terminal_error = self.X[:, -1] - self.ref[:, -1]
+        
+        # Terminal position cost
+        pos_term_error = terminal_error[:2]
         cost += ca.mtimes([pos_term_error.T, self.F[:2,:2], pos_term_error])
         
-        # Terminal orientation error with angle wrapping
-        theta_term_error = self.X[2, -1] - self.ref[2, -1]
-        theta_term_error = ca.fmod(theta_term_error + ca.pi, 2*ca.pi) - ca.pi
-        cost += self.F[2,2] * theta_term_error**2
+        # Terminal orientation cost with wrapping
+        theta_term_error = terminal_error[2]
+        theta_term_wrapped = ca.atan2(ca.sin(theta_term_error), ca.cos(theta_term_error))
+        cost += self.F[2,2] * theta_term_wrapped**2
+        
+        # Terminal velocity costs
+        vel_term_error = terminal_error[3:5]
+        cost += ca.mtimes([vel_term_error.T, self.F[3:5,3:5], vel_term_error])
 
         # Constraints
         self.opti.subject_to(self.X[:, 0] == self.x0)  # Initial condition
         
-        # Control input constraints (velocity and angular velocity)
+        # Control input constraints
         self.opti.subject_to(self.opti.bounded(self.min_vel, self.U[0, :], self.max_vel))
         self.opti.subject_to(self.opti.bounded(self.min_omega, self.U[1, :], self.max_omega))
+        
+        # State constraints for numerical stability
+        self.opti.subject_to(self.opti.bounded(-2.0, self.X[3, :], 2.0))  # Linear velocity bounds
+        self.opti.subject_to(self.opti.bounded(-np.pi, self.X[4, :], np.pi))  # Angular velocity bounds
 
-        # Solver settings - optimized for precision positioning in pickup
+        # Robust solver settings
         self.opti.minimize(cost)
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
-            'ipopt.max_iter': 60,       # More iterations for precision positioning
-            'ipopt.max_cpu_time': 0.25, # More time for convergence near target
-            'ipopt.tol': 5e-4,          # Tighter tolerance for precision
-            'ipopt.acceptable_tol': 2e-2, # More relaxed acceptable tolerance
-            'ipopt.acceptable_iter': 3,  # Accept solution quickly if reasonable
-            'ipopt.warm_start_init_point': 'yes', # Use warm starting
-            'ipopt.hessian_approximation': 'limited-memory', # BFGS approximation
-            'ipopt.linear_solver': 'mumps', # Reliable linear solver
-            'ipopt.mu_strategy': 'adaptive', # Adaptive barrier parameter for better convergence
-            'ipopt.adaptive_mu_globalization': 'kkt-error', # Better convergence strategy
-            'ipopt.constr_viol_tol': 1e-3, # Constraint violation tolerance
-            'ipopt.bound_frac': 0.01,   # Fraction of step to bounds
-            'ipopt.bound_push': 0.01    # Amount to push bounds
+            'ipopt.max_iter': 100,
+            'ipopt.max_cpu_time': 0.15,
+            'ipopt.tol': 1e-3,
+            'ipopt.acceptable_tol': 1e-2,
+            'ipopt.acceptable_iter': 10,
+            'ipopt.mu_strategy': 'monotone',
+            'ipopt.linear_solver': 'mumps',
+            'ipopt.hessian_approximation': 'limited-memory'
         }
         
         self.opti.solver('ipopt', opts)
 
     def robot_model(self, x, u):
-        """ System dynamics for 3-state model: x_next = f(x, u) """
+        """ 5-state system dynamics: x_next = f(x, u) """
         return ca.vertcat(
-            x[0] + u[0] * ca.cos(x[2]) * self.dt,  # x position
-            x[1] + u[0] * ca.sin(x[2]) * self.dt,  # y position
-            x[2] + u[1] * self.dt                  # theta
+            x[0] + x[3] * ca.cos(x[2]) * self.dt,  # x position
+            x[1] + x[3] * ca.sin(x[2]) * self.dt,  # y position
+            x[2] + x[4] * self.dt,                 # theta
+            u[0],                                  # linear velocity (direct control)
+            u[1]                                   # angular velocity (direct control)
         )
 
     def set_reference_trajectory(self, ref_traj):
@@ -144,34 +159,49 @@ class MobileRobotMPC:
         self.target_pose = target_pose
 
     def update(self, current_state):
-        # Ensure we have a 3-state input
-        if len(current_state) != 3:
-            current_state = current_state[:3]  # Take only x, y, theta
-            
+        # Convert 3-state input to 5-state for 5-state MPC
+        if len(current_state) == 3:
+            # Add current velocities (assume zero if not provided)
+            current_state_5d = np.zeros(5)
+            current_state_5d[:3] = current_state  # x, y, theta
+            current_state_5d[3] = 0.0  # v (will be estimated or use last known)
+            current_state_5d[4] = 0.0  # omega (will be estimated or use last known)
+            current_state = current_state_5d
+        
+        # Set parameters
         self.opti.set_value(self.x0, current_state)
         self.opti.set_value(self.ref, self.ref_traj)
         
-        # Simplified warm starting for speed
+        # Simplified warm starting for stability
         if self.last_solution is not None:
-            # Simple shift without expensive propagation
-            u_init = np.zeros((self.nu, self.N))
-            x_init = np.zeros((self.nx, self.N+1))
-            
-            # Copy and shift previous solution
-            if self.N > 1:
-                u_init[:, :self.N-1] = self.last_solution['u'][:, 1:]
-                u_init[:, self.N-1] = self.last_solution['u'][:, -1]  # Repeat last control
+            try:
+                # Simple shift without expensive propagation
+                u_init = np.zeros((self.nu, self.N))
+                x_init = np.zeros((self.nx, self.N+1))
                 
-                x_init[:, :self.N] = self.last_solution['x'][:, 1:]
-                x_init[:, self.N] = self.last_solution['x'][:, -1]  # Use last state instead of propagation
-            
-            self.opti.set_initial(self.X, x_init)
-            self.opti.set_initial(self.U, u_init)
-        else:
-            pass  # No previous solution available for warm start
+                # Copy and shift previous solution
+                if self.N > 1:
+                    u_init[:, :self.N-1] = self.last_solution['u'][:, 1:]
+                    u_init[:, self.N-1] = self.last_solution['u'][:, -1]  # Repeat last control
+                    
+                    x_init[:, :self.N] = self.last_solution['x'][:, 1:]
+                    x_init[:, self.N] = self.last_solution['x'][:, -1]  # Use last state
+                
+                self.opti.set_initial(self.X, x_init)
+                self.opti.set_initial(self.U, u_init)
+            except:
+                # If warm start fails, continue with cold start
+                pass
         
         try:
             sol = self.opti.solve()
+            
+            # Validate solution - check for NaN or extreme values
+            u_opt = sol.value(self.U)[:, :self.N_c]
+            if np.isnan(u_opt).any() or np.abs(u_opt[0]).max() > 2.0 or np.abs(u_opt[1]).max() > np.pi:
+                print(f"MPC solution validation failed - using fallback controller")
+                self.last_solution = None  # Clear stale solution
+                return np.zeros((self.nu, self.N_c))
             
             # Store solution for warm starting next time
             self.last_solution = {
@@ -180,21 +210,14 @@ class MobileRobotMPC:
             }
             
             # Return all N_c control steps
-            return sol.value(self.U)[:, :self.N_c]
+            return u_opt
+            
         except Exception as e:
             print(f"MPC Solver failed: {str(e)}")
             # Clear last solution on failure to avoid using stale data
             self.last_solution = None
             return np.zeros((self.nu, self.N_c))
     
-    def robot_model_np(self, x, u):
-        """System dynamics in numpy for warm starting (3-state)"""
-        return np.array([
-            x[0] + u[0] * np.cos(x[2]) * self.dt,  # x position
-            x[1] + u[0] * np.sin(x[2]) * self.dt,  # y position
-            x[2] + u[1] * self.dt                  # theta
-        ])
-
     def get_predicted_trajectory(self):
         try:
             return self.opti.debug.value(self.X)
@@ -352,13 +375,33 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Add interpolation points for smoother approach
             num_interp_points = 5
             interp_points = []
+            dt = 0.1  # Time interval in seconds
+            
             for i in range(num_interp_points):
                 alpha = i / (num_interp_points - 1)  # Interpolation factor (0 to 1)
                 interp_x = self.target_pose[0] * alpha + self.goal[0] * (1 - alpha)
                 interp_y = self.target_pose[1] * alpha + self.goal[1] * (1 - alpha)
                 interp_theta = self.target_pose[2]  # Keep orientation constant
                 
-                interp_points.append([interp_x, interp_y, interp_theta])
+                # Estimate velocity based on distance to next point (delta x, delta y)
+                if i < num_interp_points - 1:
+                    # Calculate next point for velocity estimation
+                    next_alpha = (i + 1) / (num_interp_points - 1)
+                    next_x = self.target_pose[0] * next_alpha + self.goal[0] * (1 - next_alpha)
+                    next_y = self.target_pose[1] * next_alpha + self.goal[1] * (1 - next_alpha)
+                    
+                    # Calculate velocity as distance / time
+                    delta_x = next_x - interp_x
+                    delta_y = next_y - interp_y
+                    distance = np.sqrt(delta_x**2 + delta_y**2)
+                    estimated_v = distance / dt
+                else:
+                    # For the last point, use zero velocity (stationary)
+                    estimated_v = 0.0
+                
+                # Add trajectory point with 5 elements (x, y, theta, v, omega)
+                # omega = 0 for straight line interpolation
+                interp_points.append([interp_x, interp_y, interp_theta, estimated_v, 0.0])
             
             # Add interpolation points to the trajectory (executed last in reverse)
             self.trajectory_data = self.trajectory_data + interp_points
@@ -384,6 +427,53 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.control_sequence = None
         self.control_step = 0
     
+    def _find_initial_closest_trajectory_index(self):
+        """Find the closest trajectory point to robot's current position at initialization"""
+        try:
+            # Get current robot position
+            with self.state_lock:
+                current_state = self.current_state.copy()
+            
+            if not self.trajectory_data or len(self.trajectory_data) == 0:
+                print(f"[{self.name}] No trajectory data available for initial closest index finding")
+                return 0
+            
+            curr_pos = np.array([current_state[0], current_state[1]])
+            min_dist = float('inf')
+            closest_idx = 0
+            
+            # Search through entire trajectory to find the closest point
+            for idx in range(len(self.trajectory_data)):
+                ref_pos = np.array([self.trajectory_data[idx][0], self.trajectory_data[idx][1]])
+                dist = np.linalg.norm(curr_pos - ref_pos)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = idx
+            
+            print(f"[{self.name}] Initial closest trajectory point found at index {closest_idx}/{len(self.trajectory_data)-1}, distance: {min_dist:.3f}m")
+            print(f"[{self.name}] Robot position: ({current_state[0]:.3f}, {current_state[1]:.3f})")
+            print(f"[{self.name}] Closest trajectory point: ({self.trajectory_data[closest_idx][0]:.3f}, {self.trajectory_data[closest_idx][1]:.3f})")
+            
+            return closest_idx
+            
+        except Exception as e:
+            print(f"[{self.name}] Error finding initial closest trajectory index: {e}")
+            return 0
+
+    def _wait_for_initial_pose(self, timeout=5.0):
+        """Wait for initial robot pose to be received before finding closest trajectory point"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.state_lock:
+                # Check if we have received a valid pose (not all zeros)
+                if not np.allclose(self.current_state, [0.0, 0.0, 0.0]):
+                    print(f"[{self.name}] Initial robot pose received: ({self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f})")
+                    return True
+            time.sleep(0.1)  # Wait 100ms before checking again
+        
+        print(f"[{self.name}] Warning: Timeout waiting for initial robot pose, using default position")
+        return False
+
     def initialise(self):
         """Initialize the picking behavior"""
         self.start_time = time.time()
@@ -398,7 +488,12 @@ class PickObject(py_trees.behaviour.Behaviour):
         # Set up control timer for MPC
         if self.node and not self.control_timer:
             self.control_timer = self.node.create_timer(self.dt, self.control_timer_callback)
-            
+        
+        # Find initial closest trajectory index
+        self._wait_for_initial_pose(timeout=5.0)  # Wait for initial pose
+        self.closest_idx = self._find_initial_closest_trajectory_index()
+        self.trajectory_index = self.closest_idx  # Start at closest index
+        
         print(f"[{self.name}] Starting to pick object...")
     
     def control_timer_callback(self):
@@ -472,8 +567,8 @@ class PickObject(py_trees.behaviour.Behaviour):
             angle_error = min(angle_error, 2*np.pi - angle_error)  # Normalize to [0, pi]
             
             # Define stopping criteria
-            position_tolerance = 0.015  # 5cm position tolerance
-            orientation_tolerance = 0.3  # ~17 degrees orientation tolerance (increased from ~5.7 degrees)
+            position_tolerance = 0.025 # 2cm position tolerance
+            orientation_tolerance = 0.2  # ~17 degrees orientation tolerance (increased from ~5.7 degrees)
             
             # Check if picking is complete
             position_reached = distance_error <= position_tolerance
@@ -557,8 +652,8 @@ class PickObject(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] Updated trajectory index to {self.trajectory_index}, distance to closest point: {min_dist:.3f}m")
                 self._last_logged_index = self.trajectory_index
             
-            # Generate reference trajectory from trajectory data using updated closest index
-            ref_array = np.zeros((3, self.prediction_horizon + 1))
+            # Generate reference trajectory for 5-state MPC from trajectory data using updated closest index
+            ref_array = np.zeros((5, self.prediction_horizon + 1))
             
             # Check if we're close to target - use stationary reference for precision
             distance_to_target = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
@@ -570,6 +665,8 @@ class PickObject(py_trees.behaviour.Behaviour):
                     ref_array[0, i] = self.target_pose[0]  # x
                     ref_array[1, i] = self.target_pose[1]  # y  
                     ref_array[2, i] = self.target_pose[2]  # theta
+                    ref_array[3, i] = 0.0  # v (stationary)
+                    ref_array[4, i] = 0.0  # omega (stationary)
                 print(f"[{self.name}] Using stationary target reference for precision positioning")
             else:
                 # Fill reference trajectory from trajectory points starting from closest index
@@ -583,11 +680,16 @@ class PickObject(py_trees.behaviour.Behaviour):
                         ref_array[0, i] = point[0]  # x
                         ref_array[1, i] = point[1]  # y
                         ref_array[2, i] = point[2]  # theta
+                        # Use actual velocity values from trajectory data
+                        ref_array[3, i] = point[3]  # v
+                        ref_array[4, i] = point[4]  # omega
                     else:
                         # Trajectory index has reached the end - use target pose
                         ref_array[0, i] = self.target_pose[0]  # x
                         ref_array[1, i] = self.target_pose[1]  # y
                         ref_array[2, i] = self.target_pose[2]  # theta
+                        ref_array[3, i] = 0.0  # v (stationary)
+                        ref_array[4, i] = 0.0  # omega (stationary)
             
             # Apply cross-track error correction using the closest trajectory point
             cross_track_gain = 0.2  # Reduced from 0.5 to make orientation less aggressive
@@ -638,7 +740,8 @@ class PickObject(py_trees.behaviour.Behaviour):
             self.mpc.set_target_pose(self.target_pose)
             u_sequence = self.mpc.update(current_state)
             
-            if u_sequence is not None and not np.isnan(u_sequence).any():
+            # Check if MPC provided valid solution
+            if u_sequence is not None and not np.isnan(u_sequence).any() and not np.allclose(u_sequence, 0.0):
                 # Store the N_c control steps for future use
                 self.control_sequence = u_sequence
                 self.control_step = 0
@@ -650,15 +753,118 @@ class PickObject(py_trees.behaviour.Behaviour):
                     return True
                 else:
                     print(f"[{self.name}] Failed to apply stored control")
-                    return False
+                    return self._apply_fallback_control(current_state)
             else:
-                print(f"[{self.name}] MPC returned invalid control")
-                return False
+                print(f"[{self.name}] MPC returned invalid control, using fallback controller")
+                return self._apply_fallback_control(current_state)
                 
         except Exception as e:
             print(f"[{self.name}] Error in trajectory following: {e}")
             return False
-
+    
+    def _apply_fallback_control(self, current_state):
+        """Enhanced fallback controller for pickup behavior when MPC fails"""
+        try:
+            # Get target from current trajectory index or target pose
+            if self.trajectory_index < len(self.trajectory_data):
+                target_x = self.trajectory_data[self.trajectory_index][0]
+                target_y = self.trajectory_data[self.trajectory_index][1]
+                target_theta = self.trajectory_data[self.trajectory_index][2]
+            else:
+                target_x = self.target_pose[0]
+                target_y = self.target_pose[1]
+                target_theta = self.target_pose[2]
+            
+            # Calculate errors
+            dx = target_x - current_state[0]
+            dy = target_y - current_state[1]
+            distance = np.sqrt(dx**2 + dy**2)
+            bearing_to_target = np.arctan2(dy, dx)
+            
+            # Normalize angle difference
+            angle_error = bearing_to_target - current_state[2]
+            while angle_error > np.pi:
+                angle_error -= 2*np.pi
+            while angle_error < -np.pi:
+                angle_error += 2*np.pi
+            
+            # Orientation error to target orientation
+            orientation_error = target_theta - current_state[2]
+            while orientation_error > np.pi:
+                orientation_error -= 2*np.pi
+            while orientation_error < -np.pi:
+                orientation_error += 2*np.pi
+            
+            # Distance-based control strategy
+            if distance < 0.05:
+                # Very close - just align orientation
+                v_cmd = 0.0
+                w_cmd = 2.0 * orientation_error
+                w_cmd = np.clip(w_cmd, -np.pi/4, np.pi/4)
+            elif distance < 0.15:
+                # Close approach - precise positioning
+                kp_linear = 1.5
+                kp_angular = 2.5
+                
+                # Move toward target with orientation correction
+                v_cmd = kp_linear * distance
+                w_cmd = kp_angular * angle_error + 0.5 * orientation_error
+                
+                v_cmd = np.clip(v_cmd, 0.0, 0.15)
+                w_cmd = np.clip(w_cmd, -np.pi/3, np.pi/3)
+            else:
+                # Far approach - trajectory following mode
+                kp_linear = 1.0
+                kp_angular = 1.5
+                
+                # Align with path direction first if large angle error
+                if abs(angle_error) > np.pi/3:
+                    v_cmd = 0.05  # Very slow forward motion while turning
+                    w_cmd = kp_angular * angle_error
+                else:
+                    v_cmd = kp_linear * distance * np.cos(angle_error)
+                    w_cmd = kp_angular * angle_error
+                
+                v_cmd = np.clip(v_cmd, 0.0, 0.4)
+                w_cmd = np.clip(w_cmd, -np.pi/2, np.pi/2)
+            
+            # Publish control command
+            cmd_msg = Twist()
+            cmd_msg.linear.x = float(v_cmd)
+            cmd_msg.angular.z = float(w_cmd)
+            self.cmd_vel_pub.publish(cmd_msg)
+            
+            print(f"[{self.name}] Fallback control: dist={distance:.3f}m, angle_err={angle_error:.3f}rad, v={v_cmd:.3f}, w={w_cmd:.3f}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error in fallback controller: {e}")
+            # Emergency stop
+            cmd_msg = Twist()
+            cmd_msg.linear.x = 0.0
+            cmd_msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(cmd_msg)
+            return False
+    
+    
+    def terminate(self, new_status):
+        """Clean up when behavior terminates"""
+        self.picking_active = False
+        
+        # Stop the robot
+        if self.cmd_vel_pub:
+            cmd_msg = Twist()
+            cmd_msg.linear.x = 0.0
+            cmd_msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(cmd_msg)
+        
+        # Clean up timer
+        if self.control_timer:
+            self.control_timer.cancel()
+            self.control_timer = None
+        
+        print(f"[{self.name}] Pick behavior terminated with status: {new_status}")
+    
     def _apply_stored_control(self):
         """Apply the current step from the stored control sequence"""
         if self.control_sequence is None or self.control_step >= self.mpc.N_c:
@@ -745,22 +951,3 @@ class PickObject(py_trees.behaviour.Behaviour):
         
         # Otherwise we can use the next step from our stored sequence
         return True
-    
-    
-    def terminate(self, new_status):
-        """Clean up when behavior terminates"""
-        self.picking_active = False
-        
-        # Stop the robot
-        if self.cmd_vel_pub:
-            cmd_msg = Twist()
-            cmd_msg.linear.x = 0.0
-            cmd_msg.angular.z = 0.0
-            self.cmd_vel_pub.publish(cmd_msg)
-        
-        # Clean up timer
-        if self.control_timer:
-            self.control_timer.cancel()
-            self.control_timer = None
-        
-        print(f"[{self.name}] Pick behavior terminated with status: {new_status}")

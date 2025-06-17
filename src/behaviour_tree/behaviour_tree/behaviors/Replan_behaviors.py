@@ -132,6 +132,65 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
     print(f"   Current time: {current_robot_time:.3f}s")
     print(f"   Target time: {target_time:.3f}s")
     
+    # Check if replanning is needed based on conditional logic
+    if current_robot_time <= target_time:
+        print(f"\n✓ Current time ({current_robot_time:.3f}s) is already ≤ target time ({target_time:.3f}s)")
+        print("   Using original trajectory data without optimization")
+        
+        # Create result structure with original data
+        optimization_results = {
+            'original_total_time': current_robot_time,
+            'target_time': target_time,
+            'optimized_total_time': current_robot_time,  # No change
+            'segment_times': [robot_data.get('total_time', 0)],  # Use original total time as single segment
+            'deviation': abs(current_robot_time - target_time),
+            'improvement': 0.0,  # No improvement since no optimization
+            'optimization_skipped': True
+        }
+        
+        # Use original trajectory as "replanned" (no changes)
+        replanned_trajectory = robot_data.copy()
+        
+        # Create result structure
+        result = {
+            'robot_id': robot_id,
+            'original_trajectory': robot_data,
+            'replanned_trajectory': replanned_trajectory,
+            'optimization_results': optimization_results
+        }
+        
+        # Save results if requested (saves original data as replanned)
+        if save_results:
+            print(f"\n4. Saving original data as replanned results...")
+            save_single_robot_trajectory_parameters(result, case, robot_id)
+            
+            # Also copy the original discrete trajectory file directly
+            print(f"\n5. Copying original discrete trajectory file...")
+            original_discrete_file = f'/root/workspace/data/{case}/tb{robot_id}_Trajectory.json'
+            replanned_discrete_file = f'/root/workspace/data/{case}/tb{robot_id}_Trajectory_replanned.json'
+            
+            if os.path.exists(original_discrete_file):
+                import shutil
+                shutil.copy2(original_discrete_file, replanned_discrete_file)
+                print(f"✓ Copied original discrete trajectory: {original_discrete_file}")
+                print(f"  → {replanned_discrete_file}")
+            else:
+                print(f"⚠ Original discrete trajectory file not found: {original_discrete_file}")
+        
+        # Print summary
+        print(f"\n=== Replanning Summary ===")
+        print(f"Robot {robot_id} results:")
+        print(f"  Original → Replanned: {optimization_results['original_total_time']:.3f}s → {optimization_results['optimized_total_time']:.3f}s")
+        print(f"  Target: {optimization_results['target_time']:.3f}s")
+        print(f"  Deviation: {optimization_results['deviation']:.3f}s")
+        print(f"  Improvement: {optimization_results['improvement']:.3f}s")
+        print(f"  Status: Optimization skipped (current time already meets target)")
+        
+        return result
+    
+    print(f"\n⚠️  Current time ({current_robot_time:.3f}s) > target time ({target_time:.3f}s)")
+    print("   Proceeding with trajectory optimization...")
+    
     # Extract time segments
     time_segments = robot_data.get('time_segments', [])
     num_segments = len(time_segments)
@@ -209,137 +268,101 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                 else:
                     delta_t_lines.append([])
         
-        # If no detailed variables were created, fall back to simple segment optimization
-        if not all_vars_flat:
-            # Simple segment-based optimization (original approach)
-            T = opti.variable(num_segments)
-            all_vars_flat = [T[i] for i in range(num_segments)]
+        # Optimized constraint formulation - batch constraints for efficiency
+        all_accelerations = []
+        
+        # Pre-compute common values once to avoid repeated calculations
+        max_segments = len(time_segments)
+        r0_valid = np.array([abs(r0[i]) if i < len(r0) else 0 for i in range(max_segments)])
+        l_valid = np.array([l[i] if i < len(l) else 0 for i in range(max_segments)])
+        
+        # Cache angular limits to avoid repeated calculations
+        angular_limits = {}
+        for i in range(max_segments):
+            if r0_valid[i] > 0:
+                angular_limits[i] = {
+                    'w_max': calculate_angular_velocity_limit(r0_valid[i]),
+                    'aw_max': calculate_angular_acceleration_limit(r0[i])
+                }
+        
+        # Batch time bounds for all variables at once
+        for i in range(max_segments):
+            # Arc time bounds (vectorized)
+            if i < len(delta_t_arcs) and delta_t_arcs[i]:
+                arc_vars = ca.vertcat(*delta_t_arcs[i])
+                opti.subject_to(opti.bounded(0.20, arc_vars, 10.0))
             
-            # Simple constraints
-            for i in range(num_segments):
-                opti.subject_to(T[i] >= 0.1)  # Minimum segment time
-                opti.subject_to(T[i] <= target_time)  # Maximum segment time
-            
-            total_time = ca.sum1(T)
-        else:
-            # Detailed constraints similar to Planning_deltaT.py
-            all_accelerations = []  # Store acceleration terms for objective penalty
-            
-            for i in range(len(time_segments)):
-                if i < len(r0) and i < len(l) and i < len(phi):
-                    # Arc constraints
-                    if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
-                        delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
-                        arc_length = abs(r0[i] * delta_phi)
-                        arc_segment_length = arc_length / len(delta_t_arcs[i])
-                        
-                        # Initial state constraint for arc segments starting from zero velocity
-                        if i == 0 or (i < len(Flagb) and Flagb[i] != 0):  # First segment or relay point - start from rest
-                            min_t_initial = np.sqrt(2*arc_segment_length / calculate_angular_acceleration_limit(r0[i]) / abs(r0[i])) if abs(r0[i]) > 0 else 0.2
-                            opti.subject_to(delta_t_arcs[i][0] >= min_t_initial)
-                            opti.subject_to(delta_t_arcs[i][0] <= 10.0)
-                        
-                        # Acceleration-based continuity between segments (simplified to match Planning_deltaT.py)
-                        if i > 0 and (i >= len(Flagb) or Flagb[i] == 0):  # Not first segment and not relay point
-                            if i-1 < len(delta_t_lines) and len(delta_t_lines[i-1]) > 0:  # Previous segment ends with line
-                                prev_line_segment_length = l[i-1] / len(delta_t_lines[i-1])
-                                v_end_prev_line = prev_line_segment_length / delta_t_lines[i-1][-1]
-                                v_start_curr_arc = arc_segment_length / delta_t_arcs[i][0]
-                                
-                                t_avg_transition = (delta_t_lines[i-1][-1] + delta_t_arcs[i][0])/2
-                                a_transition = (v_start_curr_arc - v_end_prev_line) / t_avg_transition
-                                all_accelerations.append(a_transition)
-                                
-                                opti.subject_to(a_transition >= -a_max)
-                                opti.subject_to(a_transition <= a_max)
-                        
-                        for j, dt_arc in enumerate(delta_t_arcs[i]):
-                            # Time bounds (similar to Planning_deltaT.py)
-                            opti.subject_to(dt_arc >= 0.20)  # Minimum time (same as Planning_deltaT.py)
-                            opti.subject_to(dt_arc <= 10.0)   # Maximum time (same as Planning_deltaT.py)
-                            
-                            # Angular velocity constraint: omega = arc_segment_length / r / delta_t <= w_max_arc
-                            if abs(r0[i]) > 0:
-                                omega_c = arc_segment_length / abs(r0[i]) / dt_arc
-                                w_max_arc = calculate_angular_velocity_limit(abs(r0[i]))
-                                opti.subject_to(omega_c >= 0)
-                                opti.subject_to(omega_c <= w_max_arc)
-                            
-                            # Angular acceleration constraint between consecutive arc subsegments
-                            if j > 0:
-                                # Similar to Planning_deltaT.py: tangential acceleration constraint
-                                v1 = arc_segment_length / delta_t_arcs[i][j-1]
-                                v2 = arc_segment_length / delta_t_arcs[i][j]
-                                t_avg = (delta_t_arcs[i][j-1] + delta_t_arcs[i][j])/2
-                                a_tangential = (v2 - v1) / t_avg
-                                all_accelerations.append(a_tangential)
-                                
-                                # Convert to angular acceleration: alpha = a_tangential / radius
-                                alpha = a_tangential / abs(r0[i])
-                                aw_max_arc = calculate_angular_acceleration_limit(r0[i])
-                                opti.subject_to(alpha >= -aw_max_arc)
-                                opti.subject_to(alpha <= aw_max_arc)
-                        
-                        # Enhanced constraints for arc segments ending at relay points or final point
-                        if (i == len(time_segments)-1 or (i+1 < len(Flagb) and Flagb[i+1] != 0)) and (i >= len(delta_t_lines) or len(delta_t_lines[i]) == 0):
-                            # Ensure minimum time for final arc segment (similar to Planning_deltaT.py)
-                            t_min_final = np.sqrt(2*arc_segment_length / calculate_angular_acceleration_limit(r0[i]) / abs(r0[i]))
-                            opti.subject_to(delta_t_arcs[i][-1] >= t_min_final)
-                            opti.subject_to(delta_t_arcs[i][-1] <= 10.0)
+            # Line time bounds (vectorized)  
+            if i < len(delta_t_lines) and delta_t_lines[i]:
+                line_vars = ca.vertcat(*delta_t_lines[i])
+                opti.subject_to(opti.bounded(0.1, line_vars, 5.0))
+        
+        # Optimized velocity and acceleration constraints
+        for i in range(max_segments):
+            if i >= len(r0) or i >= len(l) or i >= len(phi):
+                continue
+                
+            # Arc constraints - optimized processing
+            if i < len(delta_t_arcs) and delta_t_arcs[i] and r0_valid[i] > 0:
+                delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
+                arc_length = r0_valid[i] * abs(delta_phi)
+                arc_segment_length = arc_length / len(delta_t_arcs[i])
+                
+                if arc_segment_length > 0:
+                    # Vectorized angular velocity constraints
+                    arc_vars = ca.vertcat(*delta_t_arcs[i])
+                    omega_terms = arc_segment_length / r0_valid[i] / arc_vars
+                    opti.subject_to(omega_terms <= angular_limits[i]['w_max'])
                     
-                    # Line constraints
-                    if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
-                        line_length = l[i] if i < len(l) else 0
-                        line_segment_length = line_length / len(delta_t_lines[i])
-                        
-                        # Arc-to-line continuity within the same segment i
-                        if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
-                            # Velocity transition from arc end to line start within same segment
-                            arc_segment_length = abs(r0[i] * (phi[i+1] - phi_new[i])) / len(delta_t_arcs[i])
-                            v_end_arc_i = arc_segment_length / delta_t_arcs[i][-1]  # Last arc subsegment
-                            v_start_line_i = line_segment_length / delta_t_lines[i][0]  # First line subsegment
+                    # Simplified acceleration constraints (consecutive pairs only)
+                    if len(delta_t_arcs[i]) > 1:
+                        for j in range(1, len(delta_t_arcs[i])):
+                            dt_prev, dt_curr = delta_t_arcs[i][j-1], delta_t_arcs[i][j]
+                            v_diff = arc_segment_length * (1/dt_curr - 1/dt_prev)
+                            t_avg = (dt_prev + dt_curr) / 2
+                            alpha = v_diff / (r0_valid[i] * t_avg)
                             
-                            t_avg = (delta_t_arcs[i][-1] + delta_t_lines[i][0])/2
-                            a_transition = (v_start_line_i - v_end_arc_i) / t_avg
-                            all_accelerations.append(a_transition)
-                            
-                            opti.subject_to(a_transition >= -a_max)
-                            opti.subject_to(a_transition <= a_max)
+                            opti.subject_to(opti.bounded(-angular_limits[i]['aw_max'], alpha, angular_limits[i]['aw_max']))
+                            all_accelerations.append(alpha)
+                    
+                    # Initial state constraints for first segments
+                    if i == 0 or (i < len(Flagb) and Flagb[i] != 0):
+                        min_t_initial = np.sqrt(2*arc_segment_length / angular_limits[i]['aw_max'] / r0_valid[i])
+                        opti.subject_to(delta_t_arcs[i][0] >= min_t_initial)
+            
+            # Line constraints - optimized processing  
+            if i < len(delta_t_lines) and delta_t_lines[i] and l_valid[i] > 0:
+                line_segment_length = l_valid[i] / len(delta_t_lines[i])
+                
+                # Vectorized velocity constraints
+                line_vars = ca.vertcat(*delta_t_lines[i])
+                velocity_terms = line_segment_length / line_vars
+                opti.subject_to(velocity_terms <= v_max)
+                
+                # Simplified acceleration constraints (consecutive pairs only)
+                if len(delta_t_lines[i]) > 1:
+                    for j in range(1, len(delta_t_lines[i])):
+                        dt_prev, dt_curr = delta_t_lines[i][j-1], delta_t_lines[i][j]
+                        accel_term = (dt_curr**2 - dt_prev**2) / (dt_prev * dt_curr)
+                        constraint_bound = a_max / (2 * line_segment_length)
+                        opti.subject_to(opti.bounded(-constraint_bound, accel_term, constraint_bound))
                         
-                        # Ensure starting from zero velocity for line segments at relay points
-                        if len(delta_t_arcs[i]) == 0 and (i == 0 or (i < len(Flagb) and Flagb[i] != 0)):
-                            # Line segment starting from zero velocity (similar to Planning_deltaT.py)
-                            t_min = np.sqrt(2*line_segment_length/a_max)
-                            opti.subject_to(delta_t_lines[i][0] >= t_min)
-                            opti.subject_to(delta_t_lines[i][0] <= 5.0)
-                        
-                        for j, dt_line in enumerate(delta_t_lines[i]):
-                            # Time bounds (similar to Planning_deltaT.py)
-                            opti.subject_to(dt_line >= 0.1)  # Minimum time (same as Planning_deltaT.py)
-                            opti.subject_to(dt_line <= 5.0)   # Maximum time (same as Planning_deltaT.py)
-                            
-                            # Linear velocity constraint: v = line_segment_length / delta_t <= v_max
-                            velocity_expr = line_segment_length / dt_line
-                            opti.subject_to(velocity_expr >= 0)
-                            opti.subject_to(velocity_expr <= v_max)
-                            
-                            # Linear acceleration constraint between consecutive line subsegments
-                            if j > 0:
-                                # Similar to Planning_deltaT.py: acceleration constraint
-                                a_lin = line_segment_length * (1/dt_line - 1/delta_t_lines[i][j-1]) / ((dt_line + delta_t_lines[i][j-1])/2)
-                                all_accelerations.append(a_lin)
-                                
-                                # Constraint using the same form as Planning_deltaT.py
-                                constraint_expr = (dt_line**2 - delta_t_lines[i][j-1]**2) / delta_t_lines[i][j-1] / dt_line
-                                opti.subject_to(constraint_expr >= -a_max/2/line_segment_length)
-                                opti.subject_to(constraint_expr <= a_max/2/line_segment_length)
-                        
-                        # Ensure stopping at the end of line segments at relay points or final point
-                        if i == len(time_segments)-1 or (i+1 < len(Flagb) and Flagb[i+1] != 0):
-                            # Minimum time for final line segment (similar to Planning_deltaT.py)
-                            t_min = np.sqrt(2*line_segment_length/a_max)
-                            opti.subject_to(delta_t_lines[i][-1] >= t_min)
-                            opti.subject_to(delta_t_lines[i][-1] <= 5.0)
+                        # Store simplified acceleration for penalty
+                        a_simple = line_segment_length * (1/dt_curr - 1/dt_prev) / ((dt_curr + dt_prev)/2)
+                        all_accelerations.append(a_simple)
+                
+                # Arc-to-line continuity (simplified)
+                if i < len(delta_t_arcs) and delta_t_arcs[i] and r0_valid[i] > 0:
+                    arc_length = r0_valid[i] * abs(phi[i+1] - phi_new[i] if i+1 < len(phi) else 0)
+                    arc_seg_len = arc_length / len(delta_t_arcs[i]) if arc_length > 0 else 0
+                    
+                    if arc_seg_len > 0:
+                        v_arc_end = arc_seg_len / delta_t_arcs[i][-1]
+                        v_line_start = line_segment_length / delta_t_lines[i][0]
+                        t_transition = (delta_t_arcs[i][-1] + delta_t_lines[i][0]) / 2
+                        a_transition = (v_line_start - v_arc_end) / t_transition
+                        opti.subject_to(opti.bounded(-a_max, a_transition, a_max))
+                        all_accelerations.append(a_transition)
             
             # Calculate total time for detailed optimization
             total_time = 0
@@ -365,63 +388,43 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
         opti.subject_to(total_time >= target_time * 0.8)
         opti.subject_to(total_time <= target_time * 1.2)
         
-        # Initial guess: use loaded time segments and calculate initial values based on constraints
-        if 'T' in locals():
-            # Simple segment optimization - use current segment times as initial guess
-            for i in range(num_segments):
-                initial_time = max(0.1, current_segment_times[i])  # No scaling
-                opti.set_initial(T[i], initial_time)
-        else:
-            # Detailed subsegment optimization - use loaded data and physics-based estimates
-            for i in range(len(time_segments)):
-                segment = time_segments[i]
-                
-                # Set initial values for arc variables using loaded data and physical constraints
-                if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
-                    orig_arc_times = segment.get('arc', [])
-                    if orig_arc_times:
-                        # Calculate average velocity from the loaded data for initial guess
-                        delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
-                        arc_length = abs(r0[i] * delta_phi) if abs(r0[i]) > 0 else 0
-                        arc_segment_length = arc_length / len(delta_t_arcs[i]) if len(delta_t_arcs[i]) > 0 else 0
-                        
-                        # Use loaded times as baseline but ensure they respect physical limits
-                        for j, arc_var in enumerate(delta_t_arcs[i]):
-                            if j < len(orig_arc_times):
-                                # Use loaded time but ensure it meets minimum time constraints
-                                loaded_time = orig_arc_times[j]
+
+        # Detailed subsegment optimization - use loaded data and physics-based estimates
+        for i in range(len(time_segments)):
+            segment = time_segments[i]
+            
+            # Set initial values for arc variables using loaded data and physical constraints
+            if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
+                orig_arc_times = segment.get('arc', [])
+                if orig_arc_times:
+                    # Calculate average velocity from the loaded data for initial guess
+                    delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
+                    arc_length = abs(r0[i] * delta_phi) if abs(r0[i]) > 0 else 0
+                    arc_segment_length = arc_length / len(delta_t_arcs[i]) if len(delta_t_arcs[i]) > 0 else 0
+                    
+                    # Use loaded times as baseline but ensure they respect physical limits
+                    for j, arc_var in enumerate(delta_t_arcs[i]):
+                        if j < len(orig_arc_times):
+                            # Use loaded time but ensure it meets minimum time constraints
+                            loaded_time = orig_arc_times[j]
+                            
+                            # Check angular velocity constraint
+                            if abs(r0[i]) > 0 and arc_segment_length > 0:
+                                omega_c = arc_segment_length / abs(r0[i]) / loaded_time
+                                w_max_arc = calculate_angular_velocity_limit(abs(r0[i]))
                                 
-                                # Check angular velocity constraint
-                                if abs(r0[i]) > 0 and arc_segment_length > 0:
-                                    omega_c = arc_segment_length / abs(r0[i]) / loaded_time
-                                    w_max_arc = calculate_angular_velocity_limit(abs(r0[i]))
-                                    
-                                    # If loaded time violates velocity constraint, adjust it
-                                    if omega_c > w_max_arc:
-                                        min_time_vel = arc_segment_length / abs(r0[i]) / w_max_arc
-                                        initial_time = max(loaded_time, min_time_vel * 1.1)  # 10% safety margin
-                                    else:
-                                        initial_time = max(0.05, loaded_time)
+                                # If loaded time violates velocity constraint, adjust it
+                                if omega_c > w_max_arc:
+                                    min_time_vel = arc_segment_length / abs(r0[i]) / w_max_arc
+                                    initial_time = max(loaded_time, min_time_vel * 1.1)  # 10% safety margin
                                 else:
                                     initial_time = max(0.05, loaded_time)
-                                
-                                opti.set_initial(arc_var, initial_time)
                             else:
-                                # For extra variables beyond loaded data, use physics-based estimate
-                                if abs(r0[i]) > 0 and arc_segment_length > 0:
-                                    # Conservative initial guess based on 50% of max angular velocity
-                                    w_conservative = calculate_angular_velocity_limit(abs(r0[i])) * 0.5
-                                    initial_time = arc_segment_length / abs(r0[i]) / w_conservative
-                                else:
-                                    initial_time = 0.5
-                                opti.set_initial(arc_var, max(0.05, initial_time))
-                    else:
-                        # No loaded arc data, use physics-based estimates
-                        delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
-                        arc_length = abs(r0[i] * delta_phi) if abs(r0[i]) > 0 else 0
-                        arc_segment_length = arc_length / len(delta_t_arcs[i]) if len(delta_t_arcs[i]) > 0 else 0
-                        
-                        for arc_var in delta_t_arcs[i]:
+                                initial_time = max(0.05, loaded_time)
+                            
+                            opti.set_initial(arc_var, initial_time)
+                        else:
+                            # For extra variables beyond loaded data, use physics-based estimate
                             if abs(r0[i]) > 0 and arc_segment_length > 0:
                                 # Conservative initial guess based on 50% of max angular velocity
                                 w_conservative = calculate_angular_velocity_limit(abs(r0[i])) * 0.5
@@ -429,99 +432,118 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                             else:
                                 initial_time = 0.5
                             opti.set_initial(arc_var, max(0.05, initial_time))
-                
-                # Set initial values for line variables using loaded data and physical constraints
-                if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
-                    orig_line_times = segment.get('line', [])
-                    if orig_line_times:
-                        # Calculate line segment parameters
-                        line_length = l[i] if i < len(l) else 0
-                        line_segment_length = line_length / len(delta_t_lines[i]) if len(delta_t_lines[i]) > 0 else 0
-                        
-                        # Use loaded times as baseline but ensure they respect physical limits
-                        for j, line_var in enumerate(delta_t_lines[i]):
-                            if j < len(orig_line_times):
-                                # Use loaded time but ensure it meets minimum time constraints
-                                loaded_time = orig_line_times[j]
+                else:
+                    # No loaded arc data, use physics-based estimates
+                    delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
+                    arc_length = abs(r0[i] * delta_phi) if abs(r0[i]) > 0 else 0
+                    arc_segment_length = arc_length / len(delta_t_arcs[i]) if len(delta_t_arcs[i]) > 0 else 0
+                    
+                    for arc_var in delta_t_arcs[i]:
+                        if abs(r0[i]) > 0 and arc_segment_length > 0:
+                            # Conservative initial guess based on 50% of max angular velocity
+                            w_conservative = calculate_angular_velocity_limit(abs(r0[i])) * 0.5
+                            initial_time = arc_segment_length / abs(r0[i]) / w_conservative
+                        else:
+                            initial_time = 0.5
+                        opti.set_initial(arc_var, max(0.05, initial_time))
+            
+            # Set initial values for line variables using loaded data and physical constraints
+            if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
+                orig_line_times = segment.get('line', [])
+                if orig_line_times:
+                    # Calculate line segment parameters
+                    line_length = l[i] if i < len(l) else 0
+                    line_segment_length = line_length / len(delta_t_lines[i]) if len(delta_t_lines[i]) > 0 else 0
+                    
+                    # Use loaded times as baseline but ensure they respect physical limits
+                    for j, line_var in enumerate(delta_t_lines[i]):
+                        if j < len(orig_line_times):
+                            # Use loaded time but ensure it meets minimum time constraints
+                            loaded_time = orig_line_times[j]
+                            
+                            # Check velocity constraint
+                            if line_segment_length > 0:
+                                velocity = line_segment_length / loaded_time
                                 
-                                # Check velocity constraint
-                                if line_segment_length > 0:
-                                    velocity = line_segment_length / loaded_time
-                                    
-                                    # If loaded time violates velocity constraint, adjust it
-                                    if velocity > v_max:
-                                        min_time_vel = line_segment_length / v_max
-                                        initial_time = max(loaded_time, min_time_vel * 1.1)  # 10% safety margin
-                                    else:
-                                        initial_time = max(0.05, loaded_time)
+                                # If loaded time violates velocity constraint, adjust it
+                                if velocity > v_max:
+                                    min_time_vel = line_segment_length / v_max
+                                    initial_time = max(loaded_time, min_time_vel * 1.1)  # 10% safety margin
                                 else:
                                     initial_time = max(0.05, loaded_time)
-                                
-                                opti.set_initial(line_var, initial_time)
                             else:
-                                # For extra variables beyond loaded data, use physics-based estimate
-                                if line_segment_length > 0:
-                                    # Conservative initial guess based on 50% of max velocity
-                                    initial_time = line_segment_length / (v_max * 0.5)
-                                else:
-                                    initial_time = 0.5
-                                opti.set_initial(line_var, max(0.05, initial_time))
-                    else:
-                        # No loaded line data, use physics-based estimates
-                        line_length = l[i] if i < len(l) else 0
-                        line_segment_length = line_length / len(delta_t_lines[i]) if len(delta_t_lines[i]) > 0 else 0
-                        
-                        for line_var in delta_t_lines[i]:
+                                initial_time = max(0.05, loaded_time)
+                            
+                            opti.set_initial(line_var, initial_time)
+                        else:
+                            # For extra variables beyond loaded data, use physics-based estimate
                             if line_segment_length > 0:
                                 # Conservative initial guess based on 50% of max velocity
                                 initial_time = line_segment_length / (v_max * 0.5)
                             else:
                                 initial_time = 0.5
                             opti.set_initial(line_var, max(0.05, initial_time))
-                if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
-                    orig_arc_times = segment.get('arc', [])
-                    if orig_arc_times and len(orig_arc_times) == len(delta_t_arcs[i]):
-                        # Use exact loaded arc times WITHOUT scaling
-                        for j, arc_var in enumerate(delta_t_arcs[i]):
-                            initial_value = max(0.05, orig_arc_times[j])  # No scaling
-                            opti.set_initial(arc_var, initial_value)
-                    elif orig_arc_times:
-                        # Distribute total arc time evenly if mismatch in count
-                        total_arc_time = sum(orig_arc_times)  # No scaling
-                        avg_arc_time = total_arc_time / len(delta_t_arcs[i])
-                        for arc_var in delta_t_arcs[i]:
-                            opti.set_initial(arc_var, max(0.05, avg_arc_time))
-                    else:
-                        # Default fallback
-                        for arc_var in delta_t_arcs[i]:
-                            opti.set_initial(arc_var, 0.5)
-                
-                # Use actual line times from loaded data WITHOUT scaling
-                if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
-                    orig_line_times = segment.get('line', [])
-                    if orig_line_times and len(orig_line_times) == len(delta_t_lines[i]):
-                        # Use exact loaded line times WITHOUT scaling
-                        for j, line_var in enumerate(delta_t_lines[i]):
-                            initial_value = max(0.05, orig_line_times[j])  # No scaling
-                            opti.set_initial(line_var, initial_value)
-                    elif orig_line_times:
-                        # Distribute total line time evenly if mismatch in count
-                        total_line_time = sum(orig_line_times)  # No scaling
-                        avg_line_time = total_line_time / len(delta_t_lines[i])
-                        for line_var in delta_t_lines[i]:
-                            opti.set_initial(line_var, max(0.05, avg_line_time))
-                    else:
-                        # Default fallback
-                        for line_var in delta_t_lines[i]:
-                            opti.set_initial(line_var, 0.5)
+                else:
+                    # No loaded line data, use physics-based estimates
+                    line_length = l[i] if i < len(l) else 0
+                    line_segment_length = line_length / len(delta_t_lines[i]) if len(delta_t_lines[i]) > 0 else 0
+                    
+                    for line_var in delta_t_lines[i]:
+                        if line_segment_length > 0:
+                            # Conservative initial guess based on 50% of max velocity
+                            initial_time = line_segment_length / (v_max * 0.5)
+                        else:
+                            initial_time = 0.5
+                        opti.set_initial(line_var, max(0.05, initial_time))
+            if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
+                orig_arc_times = segment.get('arc', [])
+                if orig_arc_times and len(orig_arc_times) == len(delta_t_arcs[i]):
+                    # Use exact loaded arc times WITHOUT scaling
+                    for j, arc_var in enumerate(delta_t_arcs[i]):
+                        initial_value = max(0.05, orig_arc_times[j])  # No scaling
+                        opti.set_initial(arc_var, initial_value)
+                elif orig_arc_times:
+                    # Distribute total arc time evenly if mismatch in count
+                    total_arc_time = sum(orig_arc_times)  # No scaling
+                    avg_arc_time = total_arc_time / len(delta_t_arcs[i])
+                    for arc_var in delta_t_arcs[i]:
+                        opti.set_initial(arc_var, max(0.05, avg_arc_time))
+                else:
+                    # Default fallback
+                    for arc_var in delta_t_arcs[i]:
+                        opti.set_initial(arc_var, 0.5)
+            
+            # Use actual line times from loaded data WITHOUT scaling
+            if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
+                orig_line_times = segment.get('line', [])
+                if orig_line_times and len(orig_line_times) == len(delta_t_lines[i]):
+                    # Use exact loaded line times WITHOUT scaling
+                    for j, line_var in enumerate(delta_t_lines[i]):
+                        initial_value = max(0.05, orig_line_times[j])  # No scaling
+                        opti.set_initial(line_var, initial_value)
+                elif orig_line_times:
+                    # Distribute total line time evenly if mismatch in count
+                    total_line_time = sum(orig_line_times)  # No scaling
+                    avg_line_time = total_line_time / len(delta_t_lines[i])
+                    for line_var in delta_t_lines[i]:
+                        opti.set_initial(line_var, max(0.05, avg_line_time))
+                else:
+                    # Default fallback
+                    for line_var in delta_t_lines[i]:
+                        opti.set_initial(line_var, 0.5)
         
-        # Solver settings
+        # Optimized solver settings for faster convergence
         opts = {
             'ipopt.print_level': 0,
             'print_time': 0,
             'ipopt.sb': 'yes',
-            'ipopt.max_iter': 3000,
-            'ipopt.acceptable_tol': 1e-4
+            'ipopt.max_iter': 1500,              # Reduced from 3000
+            'ipopt.acceptable_tol': 1e-3,        # Relaxed from 1e-4
+            'ipopt.tol': 1e-5,                   # Added main tolerance
+            'ipopt.dual_inf_tol': 1e-3,          # Added dual tolerance
+            'ipopt.constr_viol_tol': 1e-3,       # Added constraint violation tolerance
+            'ipopt.acceptable_iter': 15,         # Accept solution after 15 iterations at acceptable tolerance
+            'ipopt.warm_start_init_point': 'yes' # Enable warm start for faster convergence
         }
         opti.solver('ipopt', opts)
         
@@ -531,37 +553,22 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
         # Extract solution
         optimized_total_time = float(sol.value(total_time))
         
-        if 'T' in locals():
-            # Simple segment optimization
-            T_opt = sol.value(T)
-            if num_segments == 1:
-                T_opt_list = [float(T_opt)]
-            else:
-                T_opt_list = T_opt.tolist()
-        else:
-            # Detailed subsegment optimization - reconstruct segment times
-            T_opt_list = []
-            for i in range(len(time_segments)):
-                segment_time = 0.0
-                if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
-                    for arc_var in delta_t_arcs[i]:
-                        segment_time += float(sol.value(arc_var))
-                if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
-                    for line_var in delta_t_lines[i]:
-                        segment_time += float(sol.value(line_var))
-                T_opt_list.append(max(0.1, segment_time))
+        # Detailed subsegment optimization - reconstruct segment times
+        T_opt_list = []
+        for i in range(len(time_segments)):
+            segment_time = 0.0
+            if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
+                for arc_var in delta_t_arcs[i]:
+                    segment_time += float(sol.value(arc_var))
+            if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
+                for line_var in delta_t_lines[i]:
+                    segment_time += float(sol.value(line_var))
+            T_opt_list.append(max(0.1, segment_time))
         
-        # Create replanned trajectory data
-        if 'T' in locals():
-            # Use simple segment approach
-            replanned_trajectory = create_replanned_trajectory_from_optimization(
-                robot_data, T_opt_list, optimized_total_time
-            )
-        else:
-            # Create detailed trajectory with subsegment times
-            replanned_trajectory = create_detailed_replanned_trajectory(
-                robot_data, delta_t_arcs, delta_t_lines, sol, optimized_total_time
-            )
+        # Create detailed trajectory with subsegment times
+        replanned_trajectory = create_detailed_replanned_trajectory(
+            robot_data, delta_t_arcs, delta_t_lines, sol, optimized_total_time
+        )
         
         
         optimization_results = {
