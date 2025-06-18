@@ -305,7 +305,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             self.current_parcel_index = 0
         
         # Dynamic feedback message that includes current status
-        self.feedback_message = f"PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
+        self.feedback_message = f"[{self.robot_namespace}] PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
         print(f"[{self.name}] Starting PUSH wait for {self.duration}s...")
         print(f"[{self.name}] Monitoring parcel{self.current_parcel_index} -> Relaypoint{self.relay_number}")
         if not self.is_first_robot:
@@ -321,6 +321,14 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         elapsed = time.time() - self.start_time
         
+        # Check timeout condition first
+        if elapsed >= self.duration:
+            from .tree_builder import report_node_failure
+            error_msg = f"WaitForPush timeout after {elapsed:.1f}s - previous robot coordination failed"
+            report_node_failure(self.name, error_msg, self.robot_namespace)
+            print(f"[{self.name}] FAILURE: {error_msg}")
+            return py_trees.common.Status.FAILURE
+        
         # First check if previous robot has finished pushing
         previous_finished = self.check_previous_robot_finished()
         previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
@@ -329,7 +337,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         if not previous_finished:
             print(f"[{self.name}] DEBUG: Still waiting for {previous_robot_namespace} to finish pushing")
-            self.feedback_message = f"Waiting for {previous_robot_namespace} to finish pushing..."
+            self.feedback_message = f"[{self.robot_namespace}] Waiting for {previous_robot_namespace} to finish pushing..."
             return py_trees.common.Status.RUNNING
         
         # For non-turtlebot0 robots, also check if last robot is out of relay range
@@ -339,7 +347,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             
             if not last_robot_out:
                 print(f"[{self.name}] DEBUG: Still waiting for last robot (tb{self.last_robot_number}) to move out of relay range")
-                self.feedback_message = f"Waiting for tb{self.last_robot_number} to move out of relay range..."
+                self.feedback_message = f"[{self.robot_namespace}] Waiting for tb{self.last_robot_number} to move out of relay range..."
                 return py_trees.common.Status.RUNNING
         
         # Both conditions met (previous robot finished AND last robot out of range for non-turtlebot0)
@@ -468,7 +476,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
     def initialise(self):
         """Initialize the behavior when it starts running"""
         self.start_time = time.time()
-        self.feedback_message = "Waiting for pick phase"
+        self.feedback_message = f"[{self.robot_namespace}] Waiting for pick phase"
         print(f"[{self.name}] Starting PICK wait for {self.duration}s...")
         
         if self.is_first_robot:
@@ -497,6 +505,9 @@ class WaitForPick(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] WARNING: turtlebot0 timeout (should not happen)")
                 return py_trees.common.Status.SUCCESS
             else:
+                from .tree_builder import report_node_failure
+                error_msg = f"WaitForPick timeout after {elapsed:.1f}s - replanned file not found from tb{self.last_robot_number}"
+                report_node_failure(self.name, error_msg, self.robot_namespace)
                 print(f"[{self.name}] TIMEOUT: PICK wait FAILED - replanned file not found from tb{self.last_robot_number}")
                 return py_trees.common.Status.FAILURE
         
@@ -650,7 +661,7 @@ class WaitAction(py_trees.behaviour.Behaviour):
     
     def initialise(self):
         self.start_time = time.time()
-        self.feedback_message = f"Waiting for {self.duration}s and monitoring parcel proximity"
+        self.feedback_message = f"[{self.robot_namespace}] Waiting for {self.duration}s and monitoring parcel proximity"
         print(f"[{self.name}] Starting wait for {self.duration}s with parcel monitoring...")
         print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, relay: Relaypoint{self.relay_number}")
         
@@ -1385,6 +1396,9 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
                 if self._should_spawn_new_parcel(new_index):
                     spawn_success = self._spawn_new_parcel(new_index)
                     if not spawn_success:
+                        from .tree_builder import report_node_failure
+                        error_msg = f"Failed to spawn parcel{new_index} via service call"
+                        report_node_failure(self.name, error_msg, self.robot_namespace)
                         print(f"[{self.name}] Failed to request spawn for parcel{new_index}, keeping current index")
                         return py_trees.common.Status.FAILURE
                 
@@ -1399,6 +1413,9 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
                         print(f"[{self.name}] Parcel{new_index} not yet spawned, waiting...")
                         return py_trees.common.Status.RUNNING
                     else:
+                        from .tree_builder import report_node_failure
+                        error_msg = f"Reached maximum parcels ({self.max_parcels}) - operation complete"
+                        report_node_failure(self.name, error_msg, self.robot_namespace)
                         print(f"[{self.name}] Reached maximum parcels ({self.max_parcels}), stopping")
                         return py_trees.common.Status.FAILURE
             
@@ -1420,6 +1437,9 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.SUCCESS
             
         except Exception as e:
+            from .tree_builder import report_node_failure
+            error_msg = f"IncrementIndex error: {str(e)}"
+            report_node_failure(self.name, error_msg, self.robot_namespace)
             print(f"[{self.name}] Error incrementing index: {e}")
             return py_trees.common.Status.FAILURE
 

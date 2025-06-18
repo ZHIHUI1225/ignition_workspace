@@ -15,8 +15,31 @@ from .manipulation_behaviors import PushObject
 from .Pickup import PickObject
 
 
+def report_node_failure(node_name, error_info, robot_namespace, blackboard_client=None):
+    """Utility function to report node failure to blackboard"""
+    try:
+        if blackboard_client is None:
+            blackboard_client = py_trees.blackboard.Client(name="failure_reporter")
+            blackboard_client.register_key(
+                key=f"{robot_namespace}/failure_context",
+                access=py_trees.common.Access.WRITE
+            )
+        
+        failure_context = {
+            "failed_node": node_name,
+            "error_info": error_info,
+            "timestamp": __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        }
+        
+        blackboard_client.set(f"{robot_namespace}/failure_context", failure_context)
+        print(f"[FAILURE][{robot_namespace}] {node_name}: {error_info}")
+        
+    except Exception as e:
+        print(f"[ERROR][{robot_namespace}] Failed to report failure for {node_name}: {e}")
+
+
 class FailureHandler(py_trees.behaviour.Behaviour):
-    """Behavior to handle failures and set blackboard variables"""
+    """Simple behavior to handle failures and set blackboard variables"""
     
     def __init__(self, name, robot_namespace="turtlebot0"):
         super().__init__(name)
@@ -26,11 +49,27 @@ class FailureHandler(py_trees.behaviour.Behaviour):
             key=f"{robot_namespace}/system_failed",
             access=py_trees.common.Access.WRITE
         )
+        self.blackboard.register_key(
+            key=f"{robot_namespace}/failure_context",
+            access=py_trees.common.Access.READ
+        )
     
     def update(self):
-        print(f"[{self.name}] FAILURE DETECTED - Setting system_failed flag")
+        print(f"[{self.name}][{self.robot_namespace}] FAILURE DETECTED - STOPPING SYSTEM")
+        
+        # Set system failure flag
         self.blackboard.set(f"{self.robot_namespace}/system_failed", True)
-        return py_trees.common.Status.SUCCESS
+        
+        # Try to read failure context set by individual nodes
+        try:
+            failure_context = self.blackboard.get(f"{self.robot_namespace}/failure_context")
+            if failure_context:
+                print(f"[{self.name}][{self.robot_namespace}] Failure context: {failure_context}")
+        except KeyError:
+            print(f"[{self.name}][{self.robot_namespace}] No failure context available")
+        
+        # Return FAILURE to stop the loop from restarting
+        return py_trees.common.Status.FAILURE
 
 
 class LoopCondition(py_trees.behaviour.Behaviour):
@@ -49,7 +88,7 @@ class LoopCondition(py_trees.behaviour.Behaviour):
         try:
             system_failed = self.blackboard.get(f"{self.robot_namespace}/system_failed")
             if system_failed:
-                print(f"[{self.name}] System failure detected - stopping loop")
+                print(f"[{self.name}][{self.robot_namespace}] System failure detected - preventing loop restart")
                 return py_trees.common.Status.FAILURE
             else:
                 return py_trees.common.Status.SUCCESS
@@ -113,7 +152,7 @@ def create_root(robot_namespace="turtlebot0"):
     pushing_sequence.add_children([
         WaitForPush("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
         ApproachObject("ApproachingPush", robot_namespace),
-        PushObject("Pushing", robot_namespace, distance_threshold=0.1)
+        PushObject("Pushing", robot_namespace, distance_threshold=0.09)
     ])
     
     # Add pushing sequence and its failure handler
@@ -152,7 +191,7 @@ def create_root(robot_namespace="turtlebot0"):
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        PickObject("PickingUp", robot_namespace),
+        PickObject("PickingUp", robot_namespace, timeout=100.0),
         StopSystem("Stop", 1.5)
     ])
     
