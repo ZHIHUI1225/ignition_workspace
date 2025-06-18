@@ -7,8 +7,9 @@ import py_trees
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, PoseStamped, Pose
 from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Bool, Int32, Float64
 import time
 import threading
 import json
@@ -17,6 +18,7 @@ import casadi as ca
 import os
 import math
 from tf_transformations import euler_from_quaternion
+import tf_transformations as tf
 import re
 import copy
 import tf_transformations as tf
@@ -448,7 +450,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         json_file_path = f'/root/workspace/data/{self.case}/tb{self.number}_Trajectory.json'
         with open(json_file_path, 'r') as json_file:
             data = json.load(json_file)
-            self.ref_trajectory = data['Trajectory']
+            self.original_trajectory = data['Trajectory']  # Store original
+            self.ref_trajectory = data['Trajectory'].copy()  # Working copy
+            self.interpolation_added = False  # Flag to track if interpolation was added
             print(f"[{self.name}] Loaded trajectory with {len(self.ref_trajectory)} points")
             
             # Set initial pushing estimated time via ROS topic
@@ -456,6 +460,74 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.pushing_estimated_time = initial_estimated_time
             self.publish_pushing_estimated_time()
             print(f"[{self.name}] Set initial pushing_estimated_time: {initial_estimated_time:.2f}s")
+    
+    def _add_interpolation_to_trajectory(self):
+        """Add interpolation points for smoother approach between robot current position and first trajectory point"""
+        if self.interpolation_added or self.current_state is None or self.original_trajectory is None:
+            return
+        
+        # Get robot current position and first trajectory point
+        robot_pos = [self.current_state[0], self.current_state[1], self.current_state[2]]
+        first_traj_point = self.original_trajectory[0]
+        
+        # Calculate distance between robot and first trajectory point
+        distance = np.sqrt((robot_pos[0] - first_traj_point[0])**2 + 
+                          (robot_pos[1] - first_traj_point[1])**2)
+        
+        # Only add interpolation if distance is significant (> 2cm)
+        if distance > 0.02:
+            # Add interpolation points for smoother approach
+            num_interp_points = 5
+            interp_points = []
+            dt = 0.1  # Time interval in seconds
+            
+            print(f"[{self.name}] Adding {num_interp_points} interpolation points (distance: {distance:.3f}m)")
+            
+            for i in range(num_interp_points):
+                alpha = i / (num_interp_points - 1)  # Interpolation factor (0 to 1)
+                interp_x = robot_pos[0] * (1 - alpha) + first_traj_point[0] * alpha
+                interp_y = robot_pos[1] * (1 - alpha) + first_traj_point[1] * alpha
+                interp_theta = robot_pos[2]  # Keep orientation constant initially
+                
+                # Estimate velocity based on distance to next point
+                if i < num_interp_points - 1:
+                    # Calculate next point for velocity estimation
+                    next_alpha = (i + 1) / (num_interp_points - 1)
+                    next_x = robot_pos[0] * (1 - next_alpha) + first_traj_point[0] * next_alpha
+                    next_y = robot_pos[1] * (1 - next_alpha) + first_traj_point[1] * next_alpha
+                    
+                    # Calculate velocity as distance / time
+                    delta_x = next_x - interp_x
+                    delta_y = next_y - interp_y
+                    distance_to_next = np.sqrt(delta_x**2 + delta_y**2)
+                    estimated_v = distance_to_next / dt
+                    
+                    # Limit velocity to reasonable values
+                    estimated_v = min(estimated_v, 0.1)  # Max 0.1 m/s
+                else:
+                    # Last point: use velocity from first trajectory point
+                    estimated_v = first_traj_point[3]
+                
+                # Set angular velocity to zero for smooth motion
+                interp_omega = 0.0
+                
+                interpolated_point = [interp_x, interp_y, interp_theta, estimated_v, interp_omega]
+                interp_points.append(interpolated_point)
+            
+            # Insert interpolation points at the beginning of trajectory
+            self.ref_trajectory = interp_points + self.original_trajectory
+            self.interpolation_added = True
+            
+            # Update pushing estimated time with new trajectory length
+            new_estimated_time = len(self.ref_trajectory) * self.dt
+            self.pushing_estimated_time = new_estimated_time
+            self.publish_pushing_estimated_time()
+            
+            print(f"[{self.name}] Added interpolation: new trajectory length = {len(self.ref_trajectory)} points")
+            print(f"[{self.name}] Updated pushing_estimated_time: {new_estimated_time:.2f}s")
+        else:
+            print(f"[{self.name}] Robot close to first trajectory point ({distance:.3f}m), no interpolation needed")
+            self.interpolation_added = True
 
     
     def robot_pose_callback(self, msg):
@@ -527,7 +599,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         robot_y = self.current_state[1]
         distance = math.sqrt((robot_x - target_x)**2 + (robot_y - target_y)**2)
         
-        is_close = distance < 0.03  # 3cm threshold
+        is_close = distance < 0.05  # 2cm threshold
         
         if is_close:
             print(f"[{self.name}] Robot is close to target state (distance: {distance:.3f}m)")
@@ -699,14 +771,13 @@ class PushObject(py_trees.behaviour.Behaviour):
     def apply_stored_control(self):
         """Apply the current step from the stored control sequence"""
         if self.control_sequence is None or self.control_step >= self.mpc.N_c:
-            print(f"[{self.name}] DEBUG: Cannot apply stored control - sequence: {self.control_sequence is not None}, step: {self.control_step}/{self.mpc.N_c}")
             return False
         
         cmd_msg = Twist()
         cmd_msg.linear.x = float(self.control_sequence[0, self.control_step])
         cmd_msg.angular.z = float(self.control_sequence[1, self.control_step])
         
-        # Debug: Check if publisher exists
+        # Check if publisher exists
         if self.cmd_vel_pub is None:
             print(f"[{self.name}] ERROR: cmd_vel_pub is None, cannot publish command")
             return False
@@ -724,7 +795,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         if not hasattr(self, '_last_timer_time'):
             self._last_timer_time = current_time
             self._timer_call_count = 0
-            print(f"[{self.name}] TIMER DEBUG: First callback, timer period set to {self.dt}s")
         
         time_interval = current_time - self._last_timer_time
         self._timer_call_count += 1
@@ -776,6 +846,12 @@ class PushObject(py_trees.behaviour.Behaviour):
 
         with self.state_lock:
             try:
+                # Add interpolation points if not already done and robot state is available
+                if not self.interpolation_added and self.current_state is not None:
+                    # Check if robot state is properly initialized (not all zeros)
+                    if np.any(self.current_state[:3] != 0):  # Check x, y, theta
+                        self._add_interpolation_to_trajectory()
+                
                 # Calculate progress to determine if we should continue MPC control
                 curr_pos = np.array([self.current_state[0], self.current_state[1]])
                 final_pos = np.array([self.ref_trajectory[-1][0], self.ref_trajectory[-1][1]])
@@ -873,12 +949,12 @@ class PushObject(py_trees.behaviour.Behaviour):
                             cmd_msg.linear.x = float(u_sequence[0, 0])
                             cmd_msg.angular.z = float(u_sequence[1, 0])
                             
-                            # Check for goal proximity - slow down when close to final waypoint
-                            if dist_to_final < 0.25:
-                                slow_factor = max(0.3, dist_to_final / 0.25)
-                                cmd_msg.linear.x *= slow_factor
-                                cmd_msg.angular.z *= min(0.8, slow_factor * 1.2)
-                                print(f"[{self.name}] Close to goal ({dist_to_final:.2f}m), slowing down by factor {slow_factor:.2f}")
+                            # # Check for goal proximity - slow down when close to final waypoint
+                            # if dist_to_final < 0.25:
+                            #     slow_factor = max(0.3, dist_to_final / 0.25)
+                            #     cmd_msg.linear.x *= slow_factor
+                            #     cmd_msg.angular.z *= min(0.8, slow_factor * 1.2)
+                            #     print(f"[{self.name}] Close to goal ({dist_to_final:.2f}m), slowing down by factor {slow_factor:.2f}")
                             
                             # Publish command
                             self.cmd_vel_pub.publish(cmd_msg)
@@ -946,9 +1022,85 @@ class PushObject(py_trees.behaviour.Behaviour):
                 'current_angle_error': float('inf')
             }
     
+    def setup_parcel_subscription(self):
+        """Set up parcel subscription when blackboard is ready - matches ApproachObject and WaitForPush patterns"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup parcel subscription - no ROS node")
+            return False
+            
+        try:
+            # Get current parcel index from blackboard (with safe fallback)
+            current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            self.current_parcel_index = current_parcel_index
+            
+            # Clean up existing subscription if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
+                
+            # Create new parcel subscription
+            parcel_topic = f'/parcel{current_parcel_index}/pose'
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped,
+                parcel_topic,
+                self.parcel_pose_callback,
+                10
+            )
+            print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup parcel subscription: {e}")
+            return False
+
+    def setup_relay_subscription(self):
+        """Set up relay subscription - consistent with other behaviors"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup relay subscription - no ROS node")
+            return False
+            
+        try:
+            # Clean up existing subscription if it exists
+            if self.relay_pose_sub is not None:
+                self.node.destroy_subscription(self.relay_pose_sub)
+                self.relay_pose_sub = None
+            
+            # Subscribe to relay point pose
+            relay_number = self._extract_namespace_number() + 1  # Relaypoint{i+1}
+            relay_topic = f'/Relaypoint{relay_number}/pose'
+            self.relay_pose_sub = self.node.create_subscription(
+                PoseStamped, relay_topic,
+                self.relay_pose_callback, 10)
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup relay subscription: {e}")
+            return False
+
+    def setup_robot_subscription(self):
+        """Set up robot pose subscription - consistent with other behaviors"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup robot subscription - no ROS node")
+            return False
+            
+        try:
+            # Clean up existing subscription if it exists
+            if self.robot_pose_sub is not None:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
+            
+            # Subscribe to robot odometry
+            robot_odom_topic = f'/turtlebot{self._extract_namespace_number()}/odom_map'
+            self.robot_pose_sub = self.node.create_subscription(
+                Odometry, robot_odom_topic, self.robot_pose_callback, 10)
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup robot subscription: {e}")
+            return False
+
     def initialise(self):
         """Initialize the pushing behavior - reset all state variables and setup components"""
-        print(f"[{self.name}] INITIALISE DEBUG: Called at {time.time()}")
         
         # Reset state variables every time behavior launches
         self.current_state = np.zeros(5)  # [x, y, theta, v, omega]
@@ -958,11 +1110,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.last_time = self.node.get_clock().now() if self.node else None
         
         # Publish initial pushing_finished state via ROS topic (False at start)
-        if self.pushing_finished_pub:
-            msg = Bool()
-            msg.data = False
-            self.pushing_finished_pub.publish(msg)
-            print(f"[{self.name}] DEBUG: Published initial pushing_finished = False via ROS topic")
+        self.publish_pushing_finished(False)
         
         # Reset pose storage
         self.parcel_pose = None
@@ -1014,42 +1162,16 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.pushing_estimated_time_pub = self.node.create_publisher(
                 Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10)
             
-            print(f"[{self.name}] DEBUG: Created pushing coordination topic publishers")
-            
-            # Subscribe to robot odometry
-            robot_odom_topic = f'/turtlebot{self._extract_namespace_number()}/odom_map'
-            self.robot_pose_sub = self.node.create_subscription(
-                Odometry, robot_odom_topic, self.robot_pose_callback, 10)
-            
-            # Get current parcel index from blackboard
-            try:
-                current_parcel_index = getattr(self.blackboard, f"{self.robot_namespace}/current_parcel_index", 0)
-                print(f"[{self.name}] Retrieved current_parcel_index from blackboard: {current_parcel_index}")
-            except (KeyError, AttributeError) as e:
-                current_parcel_index = 0
-                print(f"[{self.name}] Blackboard key '{self.robot_namespace}/current_parcel_index' not found ({e}), using default value 0")
-            
-            self.current_parcel_index = current_parcel_index
-            
-            # Subscribe to parcel pose
-            self.parcel_pose_sub = self.node.create_subscription(
-                PoseStamped, f'/parcel{current_parcel_index}/pose', 
-                self.parcel_pose_callback, 10)
-            print(f"[{self.name}] Created parcel subscription to /parcel{current_parcel_index}/pose")
-            
-            # Subscribe to relay point pose
-            relay_number = self._extract_namespace_number()+1  # Relaypoint{i+1}
-            self.relay_pose_sub = self.node.create_subscription(
-                PoseStamped, f'/Relaypoint{relay_number}/pose',
-                self.relay_pose_callback, 10)
-            print(f"[{self.name}] Created relay subscription to /Relaypoint{relay_number}/pose")
+            # Setup subscriptions using dedicated methods (consistent with ApproachObject and WaitForPush)
+            success_robot = self.setup_robot_subscription()
+            success_parcel = self.setup_parcel_subscription()
+            success_relay = self.setup_relay_subscription()
             
             # Create and start ROS timer for control loop at 10Hz (0.1s)
             # Clean up any existing timer first
             if self.control_timer:
                 self.control_timer.cancel()
                 self.control_timer = None
-                print(f"[{self.name}] DEBUG: Cancelled existing ROS timer")
             
             # Create callback group for multi-threading
             callback_group = ReentrantCallbackGroup()
@@ -1060,14 +1182,13 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.control_timer_callback,
                 callback_group=callback_group
             )
-            print(f"[{self.name}] DEBUG: Created multi-threaded ROS timer for control loop at {1/self.dt:.1f} Hz (every {self.dt}s)")
         else:
             print(f"[{self.name}] WARNING: No ROS node available, cannot create subscriptions and timer")
         
         # Update pushing estimated time in blackboard when resetting trajectory index
         self._update_pushing_estimated_time()
         
-        self.feedback_message = "Starting push operation with MPC trajectory following..."
+        self.feedback_message = f"[{self.robot_namespace}] Starting push operation with MPC trajectory following..."
         print(f"[{self.name}] Push behavior initialized with fresh MPC controller and ROS components")
     
     def _cleanup_ros_components(self):
@@ -1117,7 +1238,6 @@ class PushObject(py_trees.behaviour.Behaviour):
             msg = Float64()
             msg.data = self.pushing_estimated_time
             self.pushing_estimated_time_pub.publish(msg)
-            print(f"[{self.name}] DEBUG: Published pushing_estimated_time = {self.pushing_estimated_time:.2f}s")
     
     def publish_pushing_finished(self, finished_status):
         """Publish the pushing finished status via ROS topic"""
@@ -1125,7 +1245,6 @@ class PushObject(py_trees.behaviour.Behaviour):
             msg = Bool()
             msg.data = finished_status
             self.pushing_finished_pub.publish(msg)
-            print(f"[{self.name}] DEBUG: Published pushing_finished = {finished_status}")
 
     def update(self):
         """Update pushing behavior status - behavior tree logic only"""
@@ -1134,6 +1253,17 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
         # which handles all callbacks including our timer automatically
+        
+        # Periodically publish pushing_finished = False while still running
+        # to ensure other robots know this robot is still pushing
+        if hasattr(self, '_last_false_publish_time'):
+            if time.time() - self._last_false_publish_time > 1.0:  # Publish every 1 second
+                self.publish_pushing_finished(False)
+                self._last_false_publish_time = time.time()
+        else:
+            # First time - publish False and set timer
+            self.publish_pushing_finished(False)
+            self._last_false_publish_time = time.time()
         
         # DUAL SUCCESS CONDITIONS: Check if either condition is met
         # Condition 1: Parcel has reached relay point
@@ -1146,21 +1276,15 @@ class PushObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] SUCCESS: Parcel has reached the relay point")
             self.pushing_active = False
             # Publish pushing_finished = True via ROS topic
-            if self.pushing_finished_pub:
-                msg = Bool()
-                msg.data = True
-                self.pushing_finished_pub.publish(msg)
-                print(f"[{self.name}] DEBUG: Published pushing_finished = True via ROS topic (parcel reached relay)")
+            self.publish_pushing_finished(True)
+            print(f"[{self.name}] DEBUG: Published pushing_finished = True via ROS topic (parcel reached relay)")
             return py_trees.common.Status.SUCCESS
         elif robot_close_to_target:
             print(f"[{self.name}] SUCCESS: Robot is close to target state (< 0.03m)")
             self.pushing_active = False
             # Publish pushing_finished = True via ROS topic
-            if self.pushing_finished_pub:
-                msg = Bool()
-                msg.data = True
-                self.pushing_finished_pub.publish(msg)
-                print(f"[{self.name}] DEBUG: Published pushing_finished = True via ROS topic (robot reached target)")
+            self.publish_pushing_finished(True)
+            print(f"[{self.name}] DEBUG: Published pushing_finished = True via ROS topic (robot reached target)")
             return py_trees.common.Status.SUCCESS
         
         # Always return RUNNING if parcel hasn't reached relay point yet
@@ -1172,9 +1296,27 @@ class PushObject(py_trees.behaviour.Behaviour):
             if self.parcel_pose and self.relay_pose:
                 distance = self._calculate_distance(self.parcel_pose, self.relay_pose)
                 trajectory_status = "trajectory complete" if (self.ref_trajectory and self.trajectory_index >= len(self.ref_trajectory) - 1) else f"trajectory index: {self.trajectory_index}"
-                self.feedback_message = f"Pushing object... {elapsed:.1f}s elapsed, {trajectory_status}, parcel-relay distance: {distance:.3f}m"
+                self.feedback_message = f"[{self.robot_namespace}] Pushing object... {elapsed:.1f}s elapsed, {trajectory_status}, parcel-relay distance: {distance:.3f}m"
             else:
-                self.feedback_message = f"Pushing object... {elapsed:.1f}s elapsed, waiting for pose data"
+                # More detailed debug for missing pose data
+                robot_pose_status = "✓" if (self.current_state is not None and np.any(self.current_state[:3] != 0)) else "✗"
+                parcel_pose_status = "✓" if self.parcel_pose is not None else "✗"
+                relay_pose_status = "✓" if self.relay_pose is not None else "✗"
+                self.feedback_message = f"[{self.robot_namespace}] Pushing object... {elapsed:.1f}s elapsed, waiting for pose data [robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}]"
+                
+                # Print detailed debug every 2 seconds for missing pose data
+                # if not hasattr(self, '_last_pose_debug_time'):
+                #     self._last_pose_debug_time = time.time()
+                #     # print(f"[{self.name}] DEBUG: Pose status - robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}")
+                # elif time.time() - self._last_pose_debug_time > 2.0:
+                #     print(f"[{self.name}] DEBUG: Pose status - robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}")
+                #     if self.current_state is not None:
+                #         print(f"[{self.name}] DEBUG: Current robot state: [{self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f}]")
+                #     if self.parcel_pose is not None:
+                #         print(f"[{self.name}] DEBUG: Parcel pose: ({self.parcel_pose.position.x:.3f}, {self.parcel_pose.position.y:.3f})")
+                #     if self.relay_pose is not None:
+                #         print(f"[{self.name}] DEBUG: Relay pose: ({self.relay_pose.position.x:.3f}, {self.relay_pose.position.y:.3f})")
+                #     self._last_pose_debug_time = time.time()
         
         # Even if trajectory is complete, we continue running until the parcel reaches the relay point
         # The control_timer_callback will maintain a minimal pushing force in the direction of the relay
@@ -1190,6 +1332,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # Timeout check (adjust based on expected trajectory duration)
         if elapsed >= 120.0: 
+            from .tree_builder import report_node_failure
+            error_msg = f"PushObject timeout after {elapsed:.1f}s - trajectory execution failed"
+            report_node_failure(self.name, error_msg, self.robot_namespace)
             print(f"[{self.name}] FAILURE: Push operation timed out after {elapsed:.1f} seconds")
             return py_trees.common.Status.FAILURE
         
@@ -1198,6 +1343,14 @@ class PushObject(py_trees.behaviour.Behaviour):
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
         self.pushing_active = False
+        
+        # Publish final pushing_finished state based on termination status
+        if new_status == py_trees.common.Status.SUCCESS:
+            # If terminating with success, ensure pushing_finished = True is published
+            self.publish_pushing_finished(True)
+        else:
+            # If terminating with failure or being interrupted, publish pushing_finished = False
+            self.publish_pushing_finished(False)
         
         # Stop the robot
         if self.cmd_vel_pub:
@@ -1257,6 +1410,44 @@ class PushObject(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] Closest point search ({search_scope}): range [{start_idx}:{end_idx}], found idx {best_idx}, dist: {min_dist:.3f}m")
         
         return best_idx, min_dist
+
+    def update_parcel_subscription(self, new_parcel_index=None):
+        """Update subscription to the correct parcel topic based on current index - matches ApproachObject pattern"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot update parcel subscription - no ROS node")
+            return False
+            
+        # Use provided index or get from blackboard
+        if new_parcel_index is not None:
+            parcel_index = new_parcel_index
+        else:
+            parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+        
+        # Only update if index has changed
+        if hasattr(self, 'current_parcel_index') and parcel_index == self.current_parcel_index:
+            return True
+            
+        try:
+            # Clean up existing subscription if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
+            
+            # Create new subscription to the correct parcel topic
+            parcel_topic = f'/parcel{parcel_index}/pose'
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+            
+            # Update stored index
+            old_index = getattr(self, 'current_parcel_index', 'unknown')
+            self.current_parcel_index = parcel_index
+            
+            print(f"[{self.name}] ✓ Updated parcel subscription: parcel{old_index} -> parcel{parcel_index}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to update parcel subscription: {e}")
+            return False
 
 
 

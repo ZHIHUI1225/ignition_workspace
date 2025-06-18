@@ -78,7 +78,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         self.target_time = target_time
         self.robot_id = robot_id
         
-        self.feedback_message = f"Initializing replanning for Robot {robot_id}..."
+        self.feedback_message = f"[{self.robot_namespace}] Initializing replanning for Robot {robot_id}..."
     
     def update(self):
         """Update the behavior state."""
@@ -121,6 +121,9 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     self.replanning_completed = True
                     self.replanning_successful = False
                     
+                    from .tree_builder import report_node_failure
+                    error_msg = "Replanning failed - optimization returned None (infeasible constraints or missing data)"
+                    report_node_failure(self.name, error_msg, self.robot_namespace)
                     print(f"[{self.name}] Replanning failed - optimization returned None")
                     print(f"[{self.name}] This could be due to infeasible constraints or missing data")
                 
@@ -130,7 +133,9 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                 self.replanning_completed = True
                 self.replanning_successful = False
                 
+                from .tree_builder import report_node_failure
                 error_msg = f"Replanning failed with exception: {str(e)}"
+                report_node_failure(self.name, error_msg, self.robot_namespace)
                 print(f"[{self.name}] {error_msg}")
                 
                 return py_trees.common.Status.FAILURE

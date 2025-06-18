@@ -26,6 +26,27 @@ def extract_namespace_number(namespace):
     match = re.search(r'turtlebot(\d+)', namespace)
     return int(match.group(1)) if match else 0
 
+def report_node_failure(node_name, error_info, robot_namespace):
+    """Report node failure to blackboard"""
+    try:
+        blackboard_client = py_trees.blackboard.Client(name="failure_reporter")
+        blackboard_client.register_key(
+            key=f"{robot_namespace}/failure_context",
+            access=py_trees.common.Access.WRITE
+        )
+        
+        failure_context = {
+            "failed_node": node_name,
+            "error_info": error_info,
+            "timestamp": __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        }
+        
+        blackboard_client.set(f"{robot_namespace}/failure_context", failure_context)
+        print(f"[FAILURE] {node_name}: {error_info}")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to report failure for {node_name}: {e}")
+
 class MobileRobotMPC:
     def __init__(self):
         # MPC parameters - 5-state control (x, y, theta, v, omega)
@@ -227,7 +248,7 @@ class MobileRobotMPC:
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name, robot_namespace="turtlebot0"):
+    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
@@ -236,6 +257,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.picking_complete = False
         self.robot_namespace = robot_namespace  # Use provided robot_namespace
         self.case = "simple_maze"  # Default case
+        self.timeout = timeout  # Timeout in seconds
         
         # MPC and trajectory following variables
         self.trajectory_data = None
@@ -291,13 +313,19 @@ class PickObject(py_trees.behaviour.Behaviour):
             self._setup_ros_connections()
             
             # Load trajectory data (with replanned trajectory support)
-            self._load_trajectory_data()
+            if not self._load_trajectory_data():
+                print(f"[{self.name}] CRITICAL ERROR: Failed to load trajectory data for {self.robot_namespace}")
+                print(f"[{self.name}] Expected file: /root/workspace/data/{self.case}/tb{self.number}_Trajectory_replanned.json")
+                return False
             
             # Initialize MPC controller
             self._setup_simple_mpc()
             
             print(f"[{self.name}] Setting up pick controller for {self.robot_namespace}, case: {self.case}")
-    
+            return True
+        
+        print(f"[{self.name}] ERROR: No ROS node provided in setup")
+        return False
     def _setup_ros_connections(self):
         """Setup ROS publishers and subscribers for MPC trajectory following"""
         try:
@@ -479,7 +507,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.start_time = time.time()
         self.picking_active = True
         self.picking_complete = False
-        self.feedback_message = "Starting pick operation..."
+        self.feedback_message = f"[{self.robot_namespace}] Starting pick operation..."
         
         # Reset trajectory index and initial index finding flag
         self.trajectory_index = 0
@@ -512,11 +540,30 @@ class PickObject(py_trees.behaviour.Behaviour):
         if self.start_time is None:
             self.start_time = time.time()
         
+        # Check if trajectory data was loaded successfully
+        if self.trajectory_data is None:
+            report_node_failure(self.name, "No trajectory data available - cannot proceed with picking", self.robot_namespace)
+            print(f"[{self.name}] FAILURE: No trajectory data available - cannot proceed with picking")
+            return py_trees.common.Status.FAILURE
+        
         if not self.picking_active:
+            report_node_failure(self.name, "Picking is not active", self.robot_namespace)
+            print(f"[{self.name}] FAILURE: Picking is not active")
+            return py_trees.common.Status.FAILURE
+        
+        # Check if setup was successful
+        if not hasattr(self, 'mpc') or self.mpc is None:
+            report_node_failure(self.name, "MPC controller not initialized", self.robot_namespace)
+            print(f"[{self.name}] FAILURE: MPC controller not initialized")
+            return py_trees.common.Status.FAILURE
+        
+        if not hasattr(self, 'target_pose') or self.target_pose is None:
+            report_node_failure(self.name, "Target pose not set", self.robot_namespace)
+            print(f"[{self.name}] FAILURE: Target pose not set")
             return py_trees.common.Status.FAILURE
         
         elapsed = time.time() - self.start_time
-        self.feedback_message = f"Following trajectory to pick object... {elapsed:.1f}s elapsed"
+        self.feedback_message = f"[{self.robot_namespace}] Following trajectory to pick object... {elapsed:.1f}s elapsed"
         
         # Check if robot is close to target
         with self.state_lock:
@@ -533,7 +580,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             out_of_range = distance_to_relay > self.distance_threshold
         
         # Success condition: close to target and out of relay range
-        if distance_to_target <= 0.05 and out_of_range:
+        if distance_to_target <= 0.03 and out_of_range:
             # Stop robot
             cmd_msg = Twist()
             cmd_msg.linear.x = 0.0
@@ -545,8 +592,9 @@ class PickObject(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.SUCCESS
         
         # Timeout check
-        if elapsed >= 50.0:
-            print(f"[{self.name}] Pick operation timed out")
+        if elapsed >= self.timeout:
+            report_node_failure(self.name, f"PickObject timeout after {self.timeout}s - failed to reach target", self.robot_namespace)
+            print(f"[{self.name}] Pick operation timed out after {self.timeout}s")
             return py_trees.common.Status.FAILURE
         
         return py_trees.common.Status.RUNNING
@@ -592,8 +640,8 @@ class PickObject(py_trees.behaviour.Behaviour):
             
             # Timeout check
             elapsed = time.time() - self.start_time
-            if elapsed >= 30.0:  # Extended timeout for trajectory following
-                print(f"[{self.name}] Pick operation timed out")
+            if elapsed >= self.timeout:  # Extended timeout for trajectory following
+                print(f"[{self.name}] Pick operation timed out after {self.timeout}s")
                 return py_trees.common.Status.FAILURE
             
             return py_trees.common.Status.RUNNING

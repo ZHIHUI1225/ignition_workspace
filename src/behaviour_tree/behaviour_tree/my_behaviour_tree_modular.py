@@ -45,6 +45,33 @@ def setup_snapshot_streams(node, robot_namespace=""):
     return snapshot_topic
 
 
+def setup_behaviors_with_node(root, ros_node):
+    """
+    Recursively traverse the behavior tree and call setup(node=ros_node) on all behaviors.
+    This fixes the issue where PyTrees tree.setup() doesn't pass the node to individual behaviors.
+    """
+    def setup_behavior_recursive(behavior):
+        # Call setup on this behavior if it has a setup method
+        if hasattr(behavior, 'setup') and callable(getattr(behavior, 'setup')):
+            try:
+                result = behavior.setup(node=ros_node)
+                if result:
+                    print(f"[SETUP] ✓ Successfully setup behavior: {behavior.name}")
+                else:
+                    print(f"[SETUP] ✗ Failed to setup behavior: {behavior.name}")
+            except Exception as e:
+                print(f"[SETUP] ✗ Error setting up behavior {behavior.name}: {e}")
+        
+        # Recursively setup children if this is a composite behavior
+        if hasattr(behavior, 'children'):
+            for child in behavior.children:
+                setup_behavior_recursive(child)
+    
+    print(f"[SETUP] Starting recursive behavior setup with shared ROS node...")
+    setup_behavior_recursive(root)
+    print(f"[SETUP] Completed recursive behavior setup")
+
+
 def main():
     """Main function - start behavior tree with PyTrees Viewer support"""
     
@@ -104,6 +131,10 @@ def main():
         
         # Setup behavior tree - pass ROS node to enable snapshot streams
         tree.setup(timeout=15.0, node=ros_node)
+        
+        # CRITICAL FIX: Manually setup all behaviors with the shared ROS node
+        # PyTrees tree.setup() doesn't automatically pass node parameter to individual behaviors
+        setup_behaviors_with_node(root, ros_node)
         
         # Setup snapshot streams for PyTrees Viewer (with error handling)
         try:
