@@ -33,15 +33,15 @@ def extract_namespace_number(namespace):
     return int(match.group(1)) if match else 0
 class MobileRobotMPC:
     def __init__(self):
-        # MPC parameters - optimized for numerical stability and convergence
-        self.N = 6           # Shorter horizon for stability
-        self.N_c = 2         # Shorter control horizon for simplicity
+        # MPC parameters - optimized for position convergence
+        self.N = 8           # Longer horizon for better convergence
+        self.N_c = 3         # Longer control horizon for smoother control
         self.dt = 0.1        # Time step
         
-        # Conservative weights to prevent numerical issues
-        self.Q = np.diag([50.0, 50.0, 20.0, 1.0, 1.0])  # State weights (x, y, theta, v, omega)
-        self.R = np.diag([1.0, 1.0])                     # Control input weights - higher for stability
-        self.F = np.diag([100.0, 100.0, 30.0, 2.0, 2.0]) # Terminal cost weights
+        # Increased weights for better position convergence
+        self.Q = np.diag([150.0, 150.0, 20.0, 1.0, 1.0])  # Higher position weights (x, y, theta, v, omega)
+        self.R = np.diag([0.5, 0.5])                       # Lower control weights for more aggressive control
+        self.F = np.diag([300.0, 300.0, 50.0, 2.0, 2.0])  # Much higher terminal cost weights for convergence
         
         # Conservative velocity constraints for numerical stability
         self.max_vel = 0.2       # m/s
@@ -82,10 +82,14 @@ class MobileRobotMPC:
         cost = 0
         
         for k in range(self.N):
-            # Position tracking - simple quadratic cost
+            # Progressive weighting - higher weights later in the horizon for convergence
+            progress_factor = 1.0 + 2.0 * k / self.N  # Increases from 1.0 to 3.0
+            
+            # Position tracking - higher weighted with progressive emphasis
             pos_error_x = self.X[0, k] - self.ref[0, k]
             pos_error_y = self.X[1, k] - self.ref[1, k] 
-            cost += self.Q[0,0] * pos_error_x**2 + self.Q[1,1] * pos_error_y**2
+            cost += progress_factor * self.Q[0,0] * pos_error_x**2 
+            cost += progress_factor * self.Q[1,1] * pos_error_y**2
             
             # Orientation tracking - simplified without complex angle wrapping
             theta_error = self.X[2, k] - self.ref[2, k]
@@ -110,9 +114,15 @@ class MobileRobotMPC:
         pos_error_x_f = self.X[0, -1] - self.ref[0, -1]
         pos_error_y_f = self.X[1, -1] - self.ref[1, -1]
         theta_error_f = self.X[2, -1] - self.ref[2, -1]
-        cost += (self.F[0,0] * pos_error_x_f**2 + 
-                self.F[1,1] * pos_error_y_f**2 + 
-                self.F[2,2] * ca.fmin(ca.fmax(theta_error_f**2, 0), 10.0))
+        
+        # Very strong terminal position cost to force convergence
+        cost += 5.0 * self.F[0,0] * pos_error_x_f**2 
+        cost += 5.0 * self.F[1,1] * pos_error_y_f**2 
+        cost += self.F[2,2] * ca.fmin(ca.fmax(theta_error_f**2, 0), 10.0)
+        
+        # Additional strong terminal position constraint for final convergence
+        terminal_pos_error = ca.sqrt(pos_error_x_f**2 + pos_error_y_f**2)
+        cost += 1000.0 * terminal_pos_error**2  # Very high weight for final position
 
         # Constraints
         self.opti.subject_to(self.X[:, 0] == self.x0)  # Initial condition
@@ -420,7 +430,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.last_control_errors = {}
     
     def setup(self, **kwargs):
-        """Setup ROS connections - store node reference only"""
+        """Setup ROS connections and subscriptions"""
         if 'node' in kwargs:
             self.node = kwargs['node']
             
@@ -435,7 +445,29 @@ class PushObject(py_trees.behaviour.Behaviour):
             except:
                 self.case = "simple_maze"
             
-            print(f"[{self.name}] Setup complete for {self.robot_namespace}, case: {self.case}")
+            # Create ROS publishers in setup
+            self.cmd_vel_pub = self.node.create_publisher(
+                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            
+            self.prediction_pub = self.node.create_publisher(
+                Path, f'/tb{self._extract_namespace_number()}/pushing/pred_path', 10)
+            
+            self.reference_pub = self.node.create_publisher(
+                Path, f'/tb{self._extract_namespace_number()}/pushing/ref_path', 10)
+            
+            # Create publishers for pushing coordination
+            self.pushing_finished_pub = self.node.create_publisher(
+                Bool, f'/{self.robot_namespace}/pushing_finished', 10)
+            
+            self.pushing_estimated_time_pub = self.node.create_publisher(
+                Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10)
+            
+            # Setup ROS subscriptions in setup method (moved from initialise)
+            success_robot = self.setup_robot_subscription()
+            success_parcel = self.setup_parcel_subscription()
+            success_relay = self.setup_relay_subscription()
+            
+            # Setup debug output removed - keep only error messages
             return True
         
         return False
@@ -453,13 +485,11 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.original_trajectory = data['Trajectory']  # Store original
             self.ref_trajectory = data['Trajectory'].copy()  # Working copy
             self.interpolation_added = False  # Flag to track if interpolation was added
-            print(f"[{self.name}] Loaded trajectory with {len(self.ref_trajectory)} points")
             
             # Set initial pushing estimated time via ROS topic
             initial_estimated_time = len(self.ref_trajectory) * self.dt
             self.pushing_estimated_time = initial_estimated_time
             self.publish_pushing_estimated_time()
-            print(f"[{self.name}] Set initial pushing_estimated_time: {initial_estimated_time:.2f}s")
     
     def _add_interpolation_to_trajectory(self):
         """Add interpolation points for smoother approach between robot current position and first trajectory point"""
@@ -474,92 +504,88 @@ class PushObject(py_trees.behaviour.Behaviour):
         distance = np.sqrt((robot_pos[0] - first_traj_point[0])**2 + 
                           (robot_pos[1] - first_traj_point[1])**2)
         
-        # Only add interpolation if distance is significant (> 2cm)
-        if distance > 0.02:
-            # Add interpolation points for smoother approach
-            num_interp_points = 5
+        # Only add interpolation if distance is significant (> 1cm)
+        if distance > 0.01:
+            # Bezier interpolation for smoother approach, preserving start/end orientation
+            p0 = np.array(robot_pos[:3], dtype=float)
+            p1 = np.array(first_traj_point[:3], dtype=float)
+            d = np.linalg.norm(p1[:2] - p0[:2])
+            handle_len = 0.3 * d
+            ctrl1 = p0[:2] + handle_len * np.array([np.cos(p0[2]), np.sin(p0[2])])
+            ctrl2 = p1[:2] - handle_len * np.array([np.cos(p1[2]), np.sin(p1[2])])
+            bezier_points = np.array([p0[:2], ctrl1, ctrl2, p1[:2]])
+            n_points = max(int(d / 0.01), 1)
+            ts = np.linspace(0, 1, n_points + 1)
+            def bezier(t, points):
+                return (
+                    (1 - t) ** 3 * points[0] +
+                    3 * (1 - t) ** 2 * t * points[1] +
+                    3 * (1 - t) * t ** 2 * points[2] +
+                    t ** 3 * points[3]
+                )
             interp_points = []
-            dt = 0.1  # Time interval in seconds
-            
-            print(f"[{self.name}] Adding {num_interp_points} interpolation points (distance: {distance:.3f}m)")
-            
-            for i in range(num_interp_points):
-                alpha = i / (num_interp_points - 1)  # Interpolation factor (0 to 1)
-                interp_x = robot_pos[0] * (1 - alpha) + first_traj_point[0] * alpha
-                interp_y = robot_pos[1] * (1 - alpha) + first_traj_point[1] * alpha
-                interp_theta = robot_pos[2]  # Keep orientation constant initially
-                
-                # Estimate velocity based on distance to next point
-                if i < num_interp_points - 1:
-                    # Calculate next point for velocity estimation
-                    next_alpha = (i + 1) / (num_interp_points - 1)
-                    next_x = robot_pos[0] * (1 - next_alpha) + first_traj_point[0] * next_alpha
-                    next_y = robot_pos[1] * (1 - next_alpha) + first_traj_point[1] * next_alpha
-                    
-                    # Calculate velocity as distance / time
-                    delta_x = next_x - interp_x
-                    delta_y = next_y - interp_y
-                    distance_to_next = np.sqrt(delta_x**2 + delta_y**2)
-                    estimated_v = distance_to_next / dt
-                    
-                    # Limit velocity to reasonable values
-                    estimated_v = min(estimated_v, 0.1)  # Max 0.1 m/s
+            dt = self.dt if hasattr(self, 'dt') else 0.1
+            for i, t in enumerate(ts):
+                pos = bezier(t, bezier_points)
+                theta = (1 - t) * p0[2] + t * p1[2]
+                if i < n_points:
+                    pos_next = bezier(ts[i+1], bezier_points)
+                    distance_to_next = np.linalg.norm(pos_next - pos)
+                    estimated_v = min(distance_to_next / dt, 0.1)
                 else:
-                    # Last point: use velocity from first trajectory point
                     estimated_v = first_traj_point[3]
-                
-                # Set angular velocity to zero for smooth motion
                 interp_omega = 0.0
-                
-                interpolated_point = [interp_x, interp_y, interp_theta, estimated_v, interp_omega]
-                interp_points.append(interpolated_point)
-            
-            # Insert interpolation points at the beginning of trajectory
+                interp_points.append([pos[0], pos[1], theta, estimated_v, interp_omega])
             self.ref_trajectory = interp_points + self.original_trajectory
             self.interpolation_added = True
-            
-            # Update pushing estimated time with new trajectory length
             new_estimated_time = len(self.ref_trajectory) * self.dt
             self.pushing_estimated_time = new_estimated_time
             self.publish_pushing_estimated_time()
-            
-            print(f"[{self.name}] Added interpolation: new trajectory length = {len(self.ref_trajectory)} points")
-            print(f"[{self.name}] Updated pushing_estimated_time: {new_estimated_time:.2f}s")
         else:
-            print(f"[{self.name}] Robot close to first trajectory point ({distance:.3f}m), no interpolation needed")
             self.interpolation_added = True
 
     
     def robot_pose_callback(self, msg):
         """Update robot state from odometry message"""
-        with self.state_lock:
-            # Position
-            self.current_state[0] = msg.pose.pose.position.x
-            self.current_state[1] = msg.pose.pose.position.y
-            
-            # Orientation (yaw)
-            quat = [
-                msg.pose.pose.orientation.x,
-                msg.pose.pose.orientation.y,
-                msg.pose.pose.orientation.z,
-                msg.pose.pose.orientation.w
-            ]
-            euler = tf.euler_from_quaternion(quat)
-            self.current_state[2] = euler[2]  # yaw
-            
-            # Velocities
-            self.current_state[3] = msg.twist.twist.linear.x   # Linear velocity
-            self.current_state[4] = msg.twist.twist.angular.z  # Angular velocity
-    
+        # Ensure current_state is initialized before accessing it
+        if self.current_state is None:
+            self.current_state = np.zeros(5)  # [x, y, theta, v, omega]
+        
+        try:
+            with self.state_lock:
+                # Position
+                self.current_state[0] = msg.pose.pose.position.x
+                self.current_state[1] = msg.pose.pose.position.y
+                
+                # Orientation (yaw)
+                quat = [
+                    msg.pose.pose.orientation.x,
+                    msg.pose.pose.orientation.y,
+                    msg.pose.pose.orientation.z,
+                    msg.pose.pose.orientation.w
+                ]
+                euler = tf.euler_from_quaternion(quat)
+                self.current_state[2] = euler[2]  # yaw
+                
+                # Velocities
+                self.current_state[3] = msg.twist.twist.linear.x   # Linear velocity
+                self.current_state[4] = msg.twist.twist.angular.z  # Angular velocity
+        except Exception as e:
+            print(f"[{self.name}] ERROR in robot_pose_callback: {e}")
+            import traceback
+            traceback.print_exc()
+
     def parcel_pose_callback(self, msg):
         """Update parcel pose from PoseStamped message"""
         with self.state_lock:
             self.parcel_pose = msg.pose
-    
+            # print(f"[DEBUG][{self.name}] parcel_pose_callback: parcel_pose = {self.parcel_pose}")
+
     def relay_pose_callback(self, msg):
         """Update relay point pose from PoseStamped message"""
         with self.state_lock:
             self.relay_pose = msg.pose
+            # print(f"[DEBUG][{self.name}] relay_pose_callback: relay_pose = {self.relay_pose}")
     
     def _calculate_distance(self, pose1, pose2):
         """Calculate Euclidean distance between two poses"""
@@ -579,9 +605,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         is_in_range = distance <= self.distance_threshold
         
         if is_in_range:
-            print(f"[{self.name}] SUCCESS: Parcel is within {self.distance_threshold}m of relay point (distance: {distance:.3f}m)")
-        
-        return is_in_range
+            return is_in_range
     
     def _check_robot_close_to_target(self):
         """Check if robot is close to its target state (distance < 0.03m)"""
@@ -599,10 +623,10 @@ class PushObject(py_trees.behaviour.Behaviour):
         robot_y = self.current_state[1]
         distance = math.sqrt((robot_x - target_x)**2 + (robot_y - target_y)**2)
         
-        is_close = distance < 0.05  # 2cm threshold
+        is_close = distance < 0.02  # 5cm threshold
         
         if is_close:
-            print(f"[{self.name}] Robot is close to target state (distance: {distance:.3f}m)")
+            print(f"[{self.name}] SUCCESS: Robot is close to target state(x:{target_x},y:{target_y}) (distance: {distance:.3f}m)")
         
         return is_close
     
@@ -624,15 +648,13 @@ class PushObject(py_trees.behaviour.Behaviour):
                 msg.data = estimated_time
                 self.pushing_estimated_time_pub.publish(msg)
             
-            # Only print updates every 20 calls
+            # Debug output removed - only show update time periodically
             if not hasattr(self, '_print_call_count'):
                 self._print_call_count = 0
-                # Print immediately on first call
-                print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
             
             self._print_call_count += 1
             if self._print_call_count >= 20:  # Print every 20 calls
-                print(f"[{self.name}] Updated pushing_estimated_time: {estimated_time:.2f}s (remaining points: {remaining_points})")
+                # Silent update - no debug output
                 self._print_call_count = 0
     
     def _publish_reference_trajectory(self):
@@ -672,7 +694,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         try:
             pred_traj = self.mpc.get_predicted_trajectory()
             if pred_traj is None:
-                print(f"[{self.name}] WARNING: get_predicted_trajectory() returned None")
+                # Silent return - no debug output
                 return
             
             # Use the same timestamp as the reference trajectory for proper alignment
@@ -707,10 +729,10 @@ class PushObject(py_trees.behaviour.Behaviour):
                 # Publish the predicted trajectory
                 if len(self.pred_path.poses) > 0:
                     self.prediction_pub.publish(self.pred_path)
-                else:
-                    print(f"[{self.name}] No valid poses generated for predicted trajectory")
+                # Silent - no debug output for empty poses
             else:
-                print(f"[{self.name}] WARNING: Predicted trajectory contains invalid data or NaN values")
+                # Silent - no debug output for invalid trajectory data
+                pass
             
         except Exception as e:
             print(f"[{self.name}] Error publishing predicted trajectory: {e}")
@@ -753,8 +775,8 @@ class PushObject(py_trees.behaviour.Behaviour):
         if self.trajectory_index < len(self.ref_trajectory) - 1:
             self.trajectory_index += 1
         else:
-            # At end of trajectory, keep using last state as target
-            print(f"[{self.name}] At end of trajectory in advance_control_step, maintaining last state as target")
+            # At end of trajectory, keep using last state as target - no debug output
+            pass
         
         # Update pushing estimated time in blackboard
         self._update_pushing_estimated_time()
@@ -790,24 +812,17 @@ class PushObject(py_trees.behaviour.Behaviour):
     
     def control_timer_callback(self):
         """ROS timer callback for MPC control loop - runs at 10Hz"""
-        # Add timing debug info
-        current_time = time.time()
-        if not hasattr(self, '_last_timer_time'):
-            self._last_timer_time = current_time
-            self._timer_call_count = 0
-        
-        time_interval = current_time - self._last_timer_time
-        self._timer_call_count += 1
-        self._last_timer_time = current_time
-        
-        # Log timing every single call to see frequency clearly
-        frequency = 1.0 / time_interval if time_interval > 0 else 0
-        # print(f"[{self.name}] Timer callback #{self._timer_call_count}, "
-        #       f"interval: {time_interval:.3f}s, frequency: {frequency:.1f}Hz, "
-        #       f"expected_freq: {1/self.dt:.1f}Hz")
+        # Add debug counter for control loop calls
+        if not hasattr(self, '_control_loop_call_count'):
+            self._control_loop_call_count = 0
+        self._control_loop_call_count += 1
         
         # Only execute control loop if pushing is active
         if self.pushing_active:
+            # Log every 10th call to avoid spam but show activity
+            # if self._control_loop_call_count % 10 == 1:
+            #     print(f"[{self.name}] Control loop active - call #{self._control_loop_call_count}, trajectory_index: {self.trajectory_index}")
+            
             # Use timeout protection to ensure timer doesn't get blocked
             start_time = time.time()
             try:
@@ -816,7 +831,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 if execution_time > 0.1:  # Warn if control loop takes longer than 100ms
                     print(f"[{self.name}] WARNING: Control loop took {execution_time:.3f}s (> 0.1s)")
             except Exception as e:
-                print(f"[{self.name}] ERROR in control loop: {e}")
+                # print(f"[{self.name}] ERROR in control loop: {e}")
                 # Emergency stop on error
                 if self.cmd_vel_pub:
                     cmd_msg = Twist()
@@ -833,8 +848,11 @@ class PushObject(py_trees.behaviour.Behaviour):
 
     def control_loop(self):
         """Main MPC control loop - optimized with reduced solving frequency"""
+        # print(f"[{self.name}] Control loop called - trajectory_index: {self.trajectory_index}, pushing_active: {self.pushing_active}")
+        
         # Check if we have a valid stored control sequence we can use
         if self.control_sequence is not None:
+            # print(f"[{self.name}] Using stored control sequence (step {self.control_step})")
             # Use the stored control sequence if available
             if self.apply_stored_control():
                 self.advance_control_step()
@@ -847,10 +865,10 @@ class PushObject(py_trees.behaviour.Behaviour):
         with self.state_lock:
             try:
                 # Add interpolation points if not already done and robot state is available
-                if not self.interpolation_added and self.current_state is not None:
-                    # Check if robot state is properly initialized (not all zeros)
-                    if np.any(self.current_state[:3] != 0):  # Check x, y, theta
-                        self._add_interpolation_to_trajectory()
+                # if not self.interpolation_added and self.current_state is not None:
+                #     # Check if robot state is properly initialized (not all zeros)
+                #     if np.any(self.current_state[:3] != 0):  # Check x, y, theta
+                #         self._add_interpolation_to_trajectory()
                 
                 # Calculate progress to determine if we should continue MPC control
                 curr_pos = np.array([self.current_state[0], self.current_state[1]])
@@ -859,18 +877,21 @@ class PushObject(py_trees.behaviour.Behaviour):
                 
                 # Check for success condition first
                 pushing_complete = self._check_parcel_in_relay_range()
+                print(f"[{self.name}] pushing_complete: {pushing_complete}, dist_to_final: {dist_to_final:.3f}m")
                 
                 # Only run MPC if not complete and trajectory index is valid
                 if not pushing_complete:
-                    # print(f"[{self.name}] MPC control - index: {self.trajectory_index}/{len(self.ref_trajectory)}, dist_to_final: {dist_to_final:.3f}m")
+                    # print(f"[{self.name}] Running MPC control - index: {self.trajectory_index}/{len(self.ref_trajectory)}")
                     
                     # Check if we need replanning
                     needs_replanning = (
                         self.control_sequence is None or 
                         self.control_step >= self.mpc.N_c - 1
                     )
+                    # print(f"[{self.name}] needs_replanning: {needs_replanning} (control_sequence is None: {self.control_sequence is None}, control_step: {getattr(self, 'control_step', 'undefined')} >= N_c-1: {self.mpc.N_c - 1})")
                     
                     if needs_replanning:
+                        # print(f"[{self.name}] Replanning MPC trajectory...")
                         # Calculate current position error to determine search strategy
                         if self.trajectory_index < len(self.ref_trajectory):
                             ref_pos = np.array([self.ref_trajectory[self.trajectory_index][0], 
@@ -883,13 +904,16 @@ class PushObject(py_trees.behaviour.Behaviour):
                             curr_pos = np.array([self.current_state[0], self.current_state[1]])
                             current_error = np.linalg.norm(curr_pos - ref_pos)
                         
+                        print(f"[{self.name}] Current position error: {current_error:.4f}m")
+                        
                         # Only find closest reference point if error is bigger than 0.02m
                         if current_error > 0.02:
                             best_idx, min_dist = self._find_closest_reference_point(current_error)
                             
                             # Update index based on closest point for optimal MPC reference
+                            old_idx = self.trajectory_index
                             self.trajectory_index = best_idx
-                            print(f"[{self.name}] Error {current_error:.3f}m > 0.02m, found closest reference point at index {best_idx}, distance: {min_dist:.3f}m")
+                            print(f"[{self.name}] Error {current_error:.3f}m > 0.02m, updated trajectory index {old_idx} -> {best_idx}, closest distance: {min_dist:.3f}m")
                         else:
                             # Error is small, keep current trajectory index
                             best_idx = self.trajectory_index
@@ -928,16 +952,11 @@ class PushObject(py_trees.behaviour.Behaviour):
                             
                             # Check if controls are valid
                             if u_sequence is None or np.isnan(u_sequence).any():
-                                print(f"[{self.name}] ERROR: MPC returned invalid control values - using safe fallback controls")
-                                print(f"[{self.name}] Control sequence type: {type(u_sequence)}, shape: {u_sequence.shape if u_sequence is not None else 'None'}")
-                                if u_sequence is not None:
-                                    print(f"[{self.name}] Control sequence values: {u_sequence}")
-                                    print(f"[{self.name}] NaN values present: {np.isnan(u_sequence).any()}")
                                 cmd_msg = Twist()
                                 cmd_msg.linear.x = 0.0
                                 cmd_msg.angular.z = 0.0
                                 self.cmd_vel_pub.publish(cmd_msg)
-                                print(f"[{self.name}] Fallback control applied: v={cmd_msg.linear.x:.2f}, ω={cmd_msg.angular.z:.2f}")
+                                # print(f"[{self.name}] Fallback control applied: v={cmd_msg.linear.x:.2f}, ω={cmd_msg.angular.z:.2f}")
                                 return
                             
                             # Store the N_c control steps for future use
@@ -948,27 +967,22 @@ class PushObject(py_trees.behaviour.Behaviour):
                             cmd_msg = Twist()
                             cmd_msg.linear.x = float(u_sequence[0, 0])
                             cmd_msg.angular.z = float(u_sequence[1, 0])
-                            
-                            # # Check for goal proximity - slow down when close to final waypoint
-                            # if dist_to_final < 0.25:
-                            #     slow_factor = max(0.3, dist_to_final / 0.25)
-                            #     cmd_msg.linear.x *= slow_factor
-                            #     cmd_msg.angular.z *= min(0.8, slow_factor * 1.2)
-                            #     print(f"[{self.name}] Close to goal ({dist_to_final:.2f}m), slowing down by factor {slow_factor:.2f}")
-                            
+                        
                             # Publish command
                             self.cmd_vel_pub.publish(cmd_msg)
                             
                             # Log the control action
                             # print(f'[{self.name}] MPC control: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f} [PUBLISHED]')
                             
-                            # Ensure we make progress, but don't go beyond trajectory length
+                            # CRITICAL: Ensure we make progress, but don't go beyond trajectory length
                             # When at the end, keep trajectory_index at the last valid index
+                            old_trajectory_index = self.trajectory_index
                             if self.trajectory_index < len(self.ref_trajectory) - 1:
                                 self.trajectory_index = max(self.trajectory_index + 1, best_idx)
+                                # print(f"[{self.name}] TRAJECTORY INDEX ADVANCED: {old_trajectory_index} -> {self.trajectory_index}")
                             else:
                                 # At end of trajectory, keep using last state as target
-                                print(f"[{self.name}] At end of trajectory, maintaining last state as target")
+                                print(f"[{self.name}] At end of trajectory, maintaining last state as target (index: {self.trajectory_index})")
                             
                             # print(f"[{self.name}] Trajectory index: {self.trajectory_index}/{len(self.ref_trajectory)} (max: {len(self.ref_trajectory)-1})")
                             
@@ -990,10 +1004,12 @@ class PushObject(py_trees.behaviour.Behaviour):
                     cmd_msg.linear.x = 0.0
                     cmd_msg.angular.z = 0.0
                     self.cmd_vel_pub.publish(cmd_msg)
-                    print(f"[{self.name}] Push complete or trajectory finished - stopping robot")
+                    # print(f"[{self.name}] Push complete or trajectory finished - stopping robot")
                 
             except Exception as e:
                 print(f"[{self.name}] Error in control loop: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _calculate_and_output_control_errors(self, current_state, ref_array):
         """Calculate and output control errors between current state and reference state"""
@@ -1029,8 +1045,14 @@ class PushObject(py_trees.behaviour.Behaviour):
             return False
             
         try:
-            # Get current parcel index from blackboard (with safe fallback)
-            current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            # Try to get current parcel index from blackboard, but handle if it doesn't exist yet
+            try:
+                current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            except Exception as bb_error:
+                # Blackboard key doesn't exist yet - this is normal during setup
+                print(f"[{self.name}] INFO: Blackboard key not ready during setup, will create parcel subscription in initialise(): {bb_error}")
+                return False  # Return False to indicate subscription not yet created
+            
             self.current_parcel_index = current_parcel_index
             
             # Clean up existing subscription if it exists
@@ -1127,7 +1149,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.last_control_errors = {}
         
         # Create fresh MPC controller every time the behavior launches
-        print(f"[{self.name}] Creating fresh MPC controller instance")
         self.mpc = MobileRobotMPC()
         self.P_HOR = self.mpc.N
         
@@ -1142,95 +1163,36 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # Setup ROS components if node is available
         if self.node:
-            # Clean up existing subscriptions and publishers
-            self._cleanup_ros_components()
-            
-            # Create ROS publishers
-            self.cmd_vel_pub = self.node.create_publisher(
-                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
-            
-            self.prediction_pub = self.node.create_publisher(
-                Path, f'/tb{self._extract_namespace_number()}/pushing/pred_path', 10)
-            
-            self.reference_pub = self.node.create_publisher(
-                Path, f'/tb{self._extract_namespace_number()}/pushing/ref_path', 10)
-            
-            # Create publishers for pushing coordination
-            self.pushing_finished_pub = self.node.create_publisher(
-                Bool, f'/{self.robot_namespace}/pushing_finished', 10)
-            
-            self.pushing_estimated_time_pub = self.node.create_publisher(
-                Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10)
-            
-            # Setup subscriptions using dedicated methods (consistent with ApproachObject and WaitForPush)
-            success_robot = self.setup_robot_subscription()
-            success_parcel = self.setup_parcel_subscription()
-            success_relay = self.setup_relay_subscription()
-            
-            # Create and start ROS timer for control loop at 10Hz (0.1s)
-            # Clean up any existing timer first
+            # Clean up existing subscriptions and timer
             if self.control_timer:
                 self.control_timer.cancel()
                 self.control_timer = None
-            
-            # Create callback group for multi-threading
-            callback_group = ReentrantCallbackGroup()
-            
-            # Create new timer for 10Hz control frequency with multi-threading support
-            self.control_timer = self.node.create_timer(
-                self.dt, 
-                self.control_timer_callback,
-                callback_group=callback_group
-            )
+            if self.robot_pose_sub is not None:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
+            if self.relay_pose_sub is not None:
+                self.node.destroy_subscription(self.relay_pose_sub)
+                self.relay_pose_sub = None
+        
+            #success_robot = self.setup_robot_subscription()
+            success_robot = self.setup_robot_subscription()
+            success_parcel = self.setup_parcel_subscription()
+            success_relay = self.setup_relay_subscription()
+
+            # Create and start ROS timer for control loop at 10Hz
+            self.control_timer = self.node.create_timer(self.dt, self.control_timer_callback)
+            print(f"[{self.name}][{self.robot_namespace}] DEBUG: Created ROS timer for control loop at {1/self.dt:.1f} Hz (every {self.dt}s)")
         else:
-            print(f"[{self.name}] WARNING: No ROS node available, cannot create subscriptions and timer")
+            print(f"[{self.name}][{self.robot_namespace}] WARNING: No ROS node available, cannot create control timer")
         
         # Update pushing estimated time in blackboard when resetting trajectory index
         self._update_pushing_estimated_time()
         
         self.feedback_message = f"[{self.robot_namespace}] Starting push operation with MPC trajectory following..."
-        print(f"[{self.name}] Push behavior initialized with fresh MPC controller and ROS components")
-    
-    def _cleanup_ros_components(self):
-        """Clean up existing ROS subscriptions and publishers"""
-        try:
-            if self.robot_pose_sub:
-                self.node.destroy_subscription(self.robot_pose_sub)
-                self.robot_pose_sub = None
-                print(f"[{self.name}] Cleaned up robot pose subscription")
-            
-            if self.parcel_pose_sub:
-                self.node.destroy_subscription(self.parcel_pose_sub)
-                self.parcel_pose_sub = None
-                print(f"[{self.name}] Cleaned up parcel pose subscription")
-            
-            if self.relay_pose_sub:
-                self.node.destroy_subscription(self.relay_pose_sub)
-                self.relay_pose_sub = None
-                print(f"[{self.name}] Cleaned up relay pose subscription")
-            
-            if self.cmd_vel_pub:
-                self.node.destroy_publisher(self.cmd_vel_pub)
-                self.cmd_vel_pub = None
-                print(f"[{self.name}] Cleaned up cmd_vel publisher")
-            
-            if self.prediction_pub:
-                self.node.destroy_publisher(self.prediction_pub)
-                self.prediction_pub = None
-                print(f"[{self.name}] Cleaned up prediction publisher")
-            
-            if self.reference_pub:
-                self.node.destroy_publisher(self.reference_pub)
-                self.reference_pub = None
-                print(f"[{self.name}] Cleaned up reference publisher")
-            
-            if self.control_timer:
-                self.control_timer.cancel()
-                self.control_timer = None
-                print(f"[{self.name}] Cleaned up control timer")
-                
-        except Exception as e:
-            print(f"[{self.name}] Warning during ROS cleanup: {e}")
+        print(f"[{self.name}] Push behavior initialized with fresh MPC controller and updated parcel subscription")
     
     def publish_pushing_estimated_time(self):
         """Publish the pushing estimated time via ROS topic"""
@@ -1298,26 +1260,23 @@ class PushObject(py_trees.behaviour.Behaviour):
                 trajectory_status = "trajectory complete" if (self.ref_trajectory and self.trajectory_index >= len(self.ref_trajectory) - 1) else f"trajectory index: {self.trajectory_index}"
                 self.feedback_message = f"[{self.robot_namespace}] Pushing object... {elapsed:.1f}s elapsed, {trajectory_status}, parcel-relay distance: {distance:.3f}m"
             else:
-                # More detailed debug for missing pose data
+                # More detailed debug for missing pose data, but still try to calculate distance if possible
                 robot_pose_status = "✓" if (self.current_state is not None and np.any(self.current_state[:3] != 0)) else "✗"
                 parcel_pose_status = "✓" if self.parcel_pose is not None else "✗"
                 relay_pose_status = "✓" if self.relay_pose is not None else "✗"
-                self.feedback_message = f"[{self.robot_namespace}] Pushing object... {elapsed:.1f}s elapsed, waiting for pose data [robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}]"
                 
-                # Print detailed debug every 2 seconds for missing pose data
-                # if not hasattr(self, '_last_pose_debug_time'):
-                #     self._last_pose_debug_time = time.time()
-                #     # print(f"[{self.name}] DEBUG: Pose status - robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}")
-                # elif time.time() - self._last_pose_debug_time > 2.0:
-                #     print(f"[{self.name}] DEBUG: Pose status - robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}")
-                #     if self.current_state is not None:
-                #         print(f"[{self.name}] DEBUG: Current robot state: [{self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f}]")
-                #     if self.parcel_pose is not None:
-                #         print(f"[{self.name}] DEBUG: Parcel pose: ({self.parcel_pose.position.x:.3f}, {self.parcel_pose.position.y:.3f})")
-                #     if self.relay_pose is not None:
-                #         print(f"[{self.name}] DEBUG: Relay pose: ({self.relay_pose.position.x:.3f}, {self.relay_pose.position.y:.3f})")
-                #     self._last_pose_debug_time = time.time()
-        
+                # Try to calculate distance even if one pose is missing for better feedback
+                distance_info = ""
+                if self.parcel_pose and self.relay_pose:
+                    distance = self._calculate_distance(self.parcel_pose, self.relay_pose)
+                    distance_info = f", distance: {distance:.3f}m"
+                elif self.parcel_pose or self.relay_pose:
+                    distance_info = ", distance: N/A (missing pose)"
+                else:
+                    distance_info = ", distance: N/A (no poses)"
+                
+                self.feedback_message = f"[{self.robot_namespace}] Pushing object... {elapsed:.1f}s elapsed, waiting for pose data [robot:{robot_pose_status}, parcel:{parcel_pose_status}, relay:{relay_pose_status}]{distance_info}"
+            
         # Even if trajectory is complete, we continue running until the parcel reaches the relay point
         # The control_timer_callback will maintain a minimal pushing force in the direction of the relay
         if self.ref_trajectory and self.trajectory_index >= len(self.ref_trajectory) - 1:
@@ -1411,43 +1370,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         return best_idx, min_dist
 
-    def update_parcel_subscription(self, new_parcel_index=None):
-        """Update subscription to the correct parcel topic based on current index - matches ApproachObject pattern"""
-        if self.node is None:
-            print(f"[{self.name}] WARNING: Cannot update parcel subscription - no ROS node")
-            return False
-            
-        # Use provided index or get from blackboard
-        if new_parcel_index is not None:
-            parcel_index = new_parcel_index
-        else:
-            parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-        
-        # Only update if index has changed
-        if hasattr(self, 'current_parcel_index') and parcel_index == self.current_parcel_index:
-            return True
-            
-        try:
-            # Clean up existing subscription if it exists
-            if self.parcel_pose_sub is not None:
-                self.node.destroy_subscription(self.parcel_pose_sub)
-                self.parcel_pose_sub = None
-            
-            # Create new subscription to the correct parcel topic
-            parcel_topic = f'/parcel{parcel_index}/pose'
-            self.parcel_pose_sub = self.node.create_subscription(
-                PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
-            
-            # Update stored index
-            old_index = getattr(self, 'current_parcel_index', 'unknown')
-            self.current_parcel_index = parcel_index
-            
-            print(f"[{self.name}] ✓ Updated parcel subscription: parcel{old_index} -> parcel{parcel_index}")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] ERROR: Failed to update parcel subscription: {e}")
-            return False
 
 
 

@@ -6,16 +6,12 @@ Contains robot movement and navigation behaviors with MPC-based control.
 
 import py_trees
 import rclpy
+import re
+import traceback
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Int32
-import math
-import time
-import threading
-import tf_transformations as tf
-import casadi as ca
-import numpy as np
+from std_msgs.msg import Int32, Float64
 import math
 import time
 import threading
@@ -135,58 +131,39 @@ class MobileRobotMPC:
         
     def update_control(self, current_state, target_state, position_achieved=False):
         # SEQUENTIAL APPROACH: Position first, then orientation
-        
-        # Check distance to target position
-        dist_to_target = np.sqrt((current_state[0] - target_state[0])**2 + 
-                                (current_state[1] - target_state[1])**2)
-        
-        # Check orientation alignment
+        # Improved for stability: smooth transition, reduced overshoot, slower approach near target
+        dist_to_target = np.sqrt((current_state[0] - target_state[0])**2 + (current_state[1] - target_state[1])**2)
         angle_diff = abs((current_state[2] - target_state[2] + np.pi) % (2 * np.pi) - np.pi)
-        
-        # If we're very close to the target and well-aligned, stop completely
-        if dist_to_target < 0.015 and angle_diff < 0.05:  # 1.5cm and ~3 degrees
-            return np.array([0.0, 0.0])  # Stop completely
-        
-        # PHASE 1: Focus on reaching target position first
-        # If position is not yet achieved, use position-only MPC
-        if not position_achieved and dist_to_target >= 0.02:  # 2cm threshold for position reaching
+
+        # PHASE 1: Position control (with smooth deceleration)
+        if not position_achieved and dist_to_target >= 0.015:
             # Use 2-state MPC for position control only
             cmd_vel_2d = self.solve_mpc(current_state, target_state)
-            
             # Convert 2D velocity command to [linear_x, angular_z] format
-            # For differential drive robot, we need to convert x,y velocities to linear/angular
             vx_global = cmd_vel_2d[0]
             vy_global = cmd_vel_2d[1]
-            
-            # Convert global velocities to robot frame
             theta = current_state[2]
             vx_robot = vx_global * np.cos(theta) + vy_global * np.sin(theta)
             vy_robot = -vx_global * np.sin(theta) + vy_global * np.cos(theta)
-            
-            # For differential drive, convert to linear and angular velocity
-            # Assuming robot can move sideways (like mecanum drive) or holonomic
-            # If purely differential drive, set vy_robot to 0 and convert to angular
-            linear_vel = vx_robot
-            angular_vel = vy_robot / 0.15  # Convert lateral motion to rotation (increased wheelbase factor for stability)
-            
+            # Decelerate as we approach the target
+            speed_scale = min(1.0, dist_to_target / 0.08)  # Slow down within 8cm
+            linear_vel = vx_robot * speed_scale
+            angular_vel = (vy_robot / 0.18) * speed_scale  # Larger divisor for gentler turns
+            # Clamp speeds for stability
+            linear_vel = np.clip(linear_vel, -0.04, 0.04)
+            angular_vel = np.clip(angular_vel, -0.15, 0.15)
             return np.array([linear_vel, angular_vel])
-                
-        # PHASE 2: Position achieved, now focus on orientation alignment
+        # PHASE 2: Orientation alignment (after position achieved)
         elif position_achieved:
-            # Pure rotation control - no linear motion
             angular_error = target_state[2] - current_state[2]
-            # Normalize angle error to [-pi, pi]
             while angular_error > np.pi:
                 angular_error -= 2 * np.pi
             while angular_error < -np.pi:
                 angular_error += 2 * np.pi
-            
-            # Proportional rotation control with damping - reduced gain for stability
-            angular_vel = 0.3 * angular_error  # Reduced proportional gain for smoother control
-            angular_vel = np.clip(angular_vel, -0.2, 0.2)  # Reduced rotation speed limit for stability
-            
-            return np.array([0.0, angular_vel])  # Pure rotation, no linear motion
-        
+            # Proportional rotation control with increased speed for faster orientation
+            angular_vel = 0.35 * angular_error  # Increased gain for faster response
+            angular_vel = np.clip(angular_vel, -0.2, 0.2)  # Higher max angular velocity
+            return np.array([0.0, angular_vel])
         # Fallback: stop if in between phases
         else:
             return np.array([0.0, 0.0])
@@ -225,16 +202,19 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             access=py_trees.common.Access.WRITE
         )
         
-        # Initialize only persistent variables that shouldn't reset
-        # State variables will be initialized in initialise() method
-        
         # ROS2 components (will be initialized in setup)
-        self.ros_node = None
+        self.node = None  # Changed from ros_node to node for consistency
         self.robot_pose_sub = None
         self.parcel_pose_sub = None
         self.cmd_vel_pub = None
+        self.pushing_estimated_time_pub = None
         
-        # MPC controller will be initialized in initialise() method
+        # Pose storage
+        self.robot_pose = None
+        self.parcel_pose = None
+        self.current_parcel_index = 0
+        
+        # MPC controller (will be initialized in initialise() method)
         self.mpc = None
         
         # Control loop timer
@@ -252,26 +232,6 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             cmd.angular.z = 0.0
             self.cmd_vel_pub.publish(cmd)
 
-    def _calculate_errors(self):
-        """Helper method to calculate position and orientation errors"""
-        pos_dist = np.sqrt((self.current_state[0] - self.target_state[0])**2 + 
-                          (self.current_state[1] - self.target_state[1])**2)
-        angle_diff = abs((self.current_state[2] - self.target_state[2] + np.pi) % (2 * np.pi) - np.pi)
-        return pos_dist, angle_diff
-
-    def _update_control_flags(self, pos_dist, angle_diff):
-        """Helper method to update position and orientation control flags"""
-        position_threshold = 0.02  # 2cm for position
-        orientation_threshold = 0.05  # ~3 degrees for orientation
-        
-        # SEQUENTIAL CONTROL: Position first, then orientation
-        if pos_dist < position_threshold:
-            self.position_control_achieved = True
-        
-        # Phase 2: Orientation control - only start after position is achieved
-        if self.position_control_achieved and angle_diff < orientation_threshold:
-            self.orientation_control_achieved = True
-
     def extract_namespace_number(self, namespace):
         """Extract numerical index from namespace string using regex"""
         import re
@@ -280,49 +240,124 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 
     def setup(self, **kwargs):
         """Setup ROS connections"""
-        try:
-            # Always use the shared ROS node from the behavior tree
-            if 'node' in kwargs:
-                self.ros_node = kwargs['node']
-                self.ros_node.get_logger().info(f'[{self.name}] Using shared ROS node: {self.ros_node.get_name()}')
+        if 'node' in kwargs:
+            self.node = kwargs['node']
+            
+            # Initialize state variables early to prevent callback race conditions
+            self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
+            self.target_state = np.array([0.0, 0.0, 0.0])   # [x, y, theta]
+            
+            # Create ROS publishers in setup
+            self.cmd_vel_pub = self.node.create_publisher(
+                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            
+            self.pushing_estimated_time_pub = self.node.create_publisher(
+                Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10)
+            
+            # Setup ROS subscriptions in setup method (moved from initialise)
+            success_robot = self.setup_robot_subscription()
+            success_parcel = self.setup_parcel_subscription()
+            
+            print(f"[{self.name}] Setup complete for {self.robot_namespace}")
+            if success_parcel:
+                print(f"[{self.name}] ROS subscriptions setup - Robot: {success_robot}, Parcel: {success_parcel}")
             else:
-                raise RuntimeError("No ROS node provided in kwargs. ApproachObject requires a shared node for proper callback processing.")
+                print(f"[{self.name}] ROS subscriptions setup - Robot: {success_robot}, Parcel: {success_parcel} (will retry in initialise)")
+            return True
+        
+        return False
+
+    def setup_robot_subscription(self):
+        """Set up robot pose subscription - consistent with other behaviors"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup robot subscription - no ROS node")
+            return False
             
-            # Create command velocity publisher
-            self.cmd_vel_pub = self.ros_node.create_publisher(
-                Twist, f'/turtlebot{self.namespace_number}/cmd_vel', 10)
+        try:
+            # Clean up existing subscription if it exists
+            if self.robot_pose_sub is not None:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
             
-            # Initialize subscriptions as None - will be set up in initialise() method
-            self.robot_pose_sub = None
-            self.parcel_pose_sub = None
-            self._last_parcel_index = None
-            
-            self.ros_node.get_logger().info(
-                f'ApproachObject setup complete for {self.robot_namespace}')
+            # Subscribe to robot odometry
+            robot_odom_topic = f'/turtlebot{self.namespace_number}/odom_map'
+            self.robot_pose_sub = self.node.create_subscription(
+                Odometry, robot_odom_topic, self.robot_pose_callback, 10)
+            print(f"[{self.name}] ✓ Robot subscription setup to {robot_odom_topic}")
             return True
             
         except Exception as e:
-            print(f"ApproachObject setup failed: {e}")
+            print(f"[{self.name}] ERROR: Failed to setup robot subscription: {e}")
             return False
 
-    def setup_parcel_subscription(self, parcel_index):
-        """Set up subscription to the correct parcel topic"""
-        if self.ros_node is None:
+    def setup_parcel_subscription(self):
+        """Set up parcel subscription when blackboard is ready - follows WaitForPush pattern"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup parcel subscription - no ROS node")
             return False
             
-        # Clean up existing subscription if it exists
-        if self.parcel_pose_sub is not None:
-            self.ros_node.destroy_subscription(self.parcel_pose_sub)
-            self.parcel_pose_sub = None
+        try:
+            # Get current parcel index from blackboard (with safe fallback)
+            current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            self.current_parcel_index = current_parcel_index
+            print(f"[{self.name}] DEBUG: Retrieved parcel index from blackboard: {current_parcel_index}")
+            
+            # Clean up existing subscription if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                print(f"[{self.name}] DEBUG: Destroyed existing parcel subscription")
+                
+            # Create new parcel subscription
+            parcel_topic = f'/parcel{current_parcel_index}/pose'
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+            print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic}")
+            print(f"[{self.name}] DEBUG: Parcel subscription object: {self.parcel_pose_sub}")
+            print(f"[{self.name}] DEBUG: Node name: {self.node.get_name()}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup parcel subscription: {e}")
+            return False
+
+    def update_parcel_subscription(self, new_parcel_index=None):
+        """Update subscription to the correct parcel topic based on current index - always uses blackboard"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot update parcel subscription - no ROS node")
+            return False
+            
+        # Always get the current parcel index from blackboard (ignore new_parcel_index parameter)
+        try:
+            parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+            print(f"[{self.name}] DEBUG: Retrieved parcel index from blackboard: {parcel_index}")
+        except Exception as bb_error:
+            # Blackboard key doesn't exist yet - this can happen during early initialization
+            print(f"[{self.name}] INFO: Blackboard key not ready yet, using default parcel index 0: {bb_error}")
+            parcel_index = 0
         
-        # Create new subscription to the correct parcel topic
-        parcel_topic = f'/parcel{parcel_index}/pose'
-        self.parcel_pose_sub = self.ros_node.create_subscription(
-            PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+        # Always update self.current_parcel_index from blackboard and (re)create subscription
+        # This ensures we're always subscribed to the correct topic, even after node restarts
+        old_index = getattr(self, 'current_parcel_index', 'none')
+        self.current_parcel_index = parcel_index
         
-        self.ros_node.get_logger().info(
-            f'[{self.name}] Subscribed to {parcel_topic}')
-        return True
+        try:
+            # Always clean up existing subscription if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
+                print(f"[{self.name}] DEBUG: Destroyed existing parcel subscription")
+            
+            # Always create new subscription using current blackboard index
+            parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+            self.parcel_pose_sub = self.node.create_subscription(
+                PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+            
+            print(f"[{self.name}] ✓ Updated parcel subscription: parcel{old_index} -> parcel{self.current_parcel_index} (topic: {parcel_topic})")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to update parcel subscription: {e}")
+            return False
 
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates (Odometry message)"""
@@ -352,11 +387,9 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 
     def control_timer_callback(self):
         """ROS timer callback for MPC control loop - runs at 10Hz"""
-        # Only execute control loop if approach is active AND not yet complete
         if self.control_active and not (self.position_control_achieved and self.orientation_control_achieved):
             self.control_loop()
         else:
-            # Stop the robot when not actively approaching or when approach is complete
             self._stop_robot()
 
     def control_loop(self):
@@ -366,40 +399,41 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             if self.robot_pose is None or self.parcel_pose is None:
                 return
             
-            # Calculate target state using the dedicated function
+            # Calculate target state and update instance target_state
             target_state, distance_to_target_state = self.calculate_target_state()
             if target_state is None:
                 return
-            
-            # Update instance target_state
             self.target_state = target_state
             
             # Calculate position and orientation errors
-            pos_dist, angle_diff = self._calculate_errors()
+            pos_dist = np.sqrt((self.current_state[0] - self.target_state[0])**2 + 
+                              (self.current_state[1] - self.target_state[1])**2)
+            angle_diff = abs((self.current_state[2] - self.target_state[2] + np.pi) % (2 * np.pi) - np.pi)
             
-            # Update control flags based on errors
-            self._update_control_flags(pos_dist, angle_diff)
+            # Update control flags
+            position_threshold = 0.04  # 2cm for position
+            orientation_threshold = 0.03  # ~3 degrees for orientation
+            
+            if pos_dist < position_threshold:
+                self.position_control_achieved = True
+            
+            if self.position_control_achieved and angle_diff < orientation_threshold:
+                self.orientation_control_achieved = True
             
             # Check if both position and orientation control are achieved
             if self.position_control_achieved and self.orientation_control_achieved:
                 self._stop_robot()
-                # Approach complete, stop control
                 self.control_active = False
                 print(f"[{self.name}][{self.robot_namespace}] Both position and orientation control achieved! pos: {pos_dist:.3f}m, angle: {angle_diff:.3f}rad")
             else:
-                # Continue control if we haven't reached both targets yet
-                if self.mpc is None:
-                    print(f"[{self.name}][{self.robot_namespace}] WARNING: MPC controller not initialized, skipping control")
-                    return
-                
                 # Generate and apply control using MPC
-                u = self.mpc.update_control(self.current_state, self.target_state, self.position_control_achieved)
-                
-                if u is not None and self.cmd_vel_pub:
-                    cmd = Twist()
-                    cmd.linear.x = float(u[0])
-                    cmd.angular.z = float(u[1])
-                    self.cmd_vel_pub.publish(cmd)
+                if self.mpc is not None:
+                    u = self.mpc.update_control(self.current_state, self.target_state, self.position_control_achieved)
+                    if u is not None and self.cmd_vel_pub:
+                        cmd = Twist()
+                        cmd.linear.x = float(u[0])
+                        cmd.angular.z = float(u[1])
+                        self.cmd_vel_pub.publish(cmd)
 
     def get_direction(self, robot_theta, parcel_theta):
         """Get optimal approach direction - from State_switch.py"""
@@ -425,13 +459,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         return candidates[index_min]
 
     def calculate_target_state(self):
-        """
-        Calculate the target state for the robot based on parcel pose and optimal approach direction.
-        
-        Returns:
-            tuple: (target_state, distance_to_target_state) where target_state is np.array([x, y, theta])
-                   and distance_to_target_state is the Euclidean distance to the target position
-        """
+        """Calculate the target state for the robot based on parcel pose and optimal approach direction."""
         if self.robot_pose is None or self.parcel_pose is None:
             return None, float('inf')
         
@@ -443,10 +471,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         ])
         
         # Get optimal direction and apply offset
-        optimal_direction = self.get_direction(
-            self.current_state[2],
-            target_state[2]
-        )
+        optimal_direction = self.get_direction(self.current_state[2], target_state[2])
         target_state[2] = optimal_direction
         target_state[0] = target_state[0] - (self.approach_distance) * math.cos(optimal_direction)
         target_state[1] = target_state[1] - (self.approach_distance) * math.sin(optimal_direction)
@@ -458,6 +483,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         )
         
         return target_state, distance_to_target_state
+
+    def publish_pushing_estimated_time(self):
+        """Publish the pushing estimated time via ROS topic"""
+        if self.pushing_estimated_time_pub:
+            # Get the current pushing_estimated_time from blackboard, default to 45.0
+            estimated_time = 50.0 # Default estimated time for turtlebot0
+            msg = Float64()
+            msg.data = estimated_time
+            self.pushing_estimated_time_pub.publish(msg)
 
     def initialise(self):
         """Initialize the behavior when it starts running"""
@@ -474,7 +508,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.start_time = time.time()
         self.timeout_duration = 30.0  # 30 second timeout for approach
         
-        # Reset ROS2 components
+        # Reset pose storage
         self.robot_pose = None
         self.parcel_pose = None
         
@@ -487,86 +521,116 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         print(f"[{self.name}][{self.robot_namespace}] Creating fresh MPC controller instance")
         self.mpc = MobileRobotMPC()
         
-        # Clean up existing subscriptions and timer
-        if self.control_timer:
-            self.control_timer.cancel()
-            self.control_timer = None
-        if self.robot_pose_sub is not None:
-            self.ros_node.destroy_subscription(self.robot_pose_sub)
-            self.robot_pose_sub = None
-        if self.parcel_pose_sub is not None:
-            self.ros_node.destroy_subscription(self.parcel_pose_sub)
-            self.parcel_pose_sub = None
+        # Setup ROS components if node is available
+        if self.node:
+            # Clean up existing subscriptions and timer
+            if self.control_timer:
+                self.control_timer.cancel()
+                self.control_timer = None
+            if self.robot_pose_sub is not None:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
         
-        # Set up robot pose subscription
-        if self.ros_node:
-            self.robot_pose_sub = self.ros_node.create_subscription(
-                Odometry, f'/turtlebot{self.namespace_number}/odom_map',
-                self.robot_pose_callback, 10)
-            print(f"[{self.name}][{self.robot_namespace}] Set up robot pose subscription to /turtlebot{self.namespace_number}/odom_map")
+            success_robot = self.setup_robot_subscription()
+            success_parcel = self.setup_parcel_subscription()
+            
+        # Create and start ROS timer for control loop at 10Hz
+        self.control_timer = self.node.create_timer(self.dt, self.control_timer_callback)
+        print(f"[{self.name}][{self.robot_namespace}] DEBUG: Created ROS timer for control loop at {1/self.dt:.1f} Hz (every {self.dt}s)")
         
-            # Set up parcel subscription with current parcel index
-            current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-            success = self.setup_parcel_subscription(current_parcel_index)
-            if success:
-                self._last_parcel_index = current_parcel_index
-                print(f"[{self.name}][{self.robot_namespace}] Initialized parcel subscription for parcel{current_parcel_index}")
-            else:
-                print(f"[{self.name}][{self.robot_namespace}] WARNING: Failed to set up parcel subscription for parcel{current_parcel_index}")
-        
-            # Create and start ROS timer for control loop at 10Hz
-            self.control_timer = self.ros_node.create_timer(self.dt, self.control_timer_callback)
-            print(f"[{self.name}][{self.robot_namespace}] DEBUG: Created ROS timer for control loop at {1/self.dt:.1f} Hz (every {self.dt}s)")
-        else:
-            print(f"[{self.name}][{self.robot_namespace}] WARNING: No ROS node available, cannot create control timer")
+        # Give ROS a moment to establish subscriptions before starting
+        print(f"[{self.name}][{self.robot_namespace}] DEBUG: Allowing time for ROS subscriptions to be established...")
 
     def update(self):
         """Main update method - behavior tree logic only, control runs via timer"""
-        # Handle parcel index changes
+        # Check for parcel index changes and update subscription if needed
         current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-        if self._last_parcel_index != current_parcel_index:
-            print(f"[{self.name}][{self.robot_namespace}] Parcel index changed from {self._last_parcel_index} to {current_parcel_index} - updating subscription")
-            success = self.setup_parcel_subscription(current_parcel_index)
+        
+        # Track parcel index changes and update subscription if needed
+        if not hasattr(self, '_last_parcel_index'):
+            self._last_parcel_index = current_parcel_index
+            print(f"[{self.name}][{self.robot_namespace}] DEBUG: Initialized _last_parcel_index to {current_parcel_index}")
+        elif self._last_parcel_index != current_parcel_index:
+            print(f"[{self.name}][{self.robot_namespace}] DEBUG: Parcel index changed from {self._last_parcel_index} to {current_parcel_index}, updating subscription")
+            success = self.update_parcel_subscription(current_parcel_index)
             if success:
                 self._last_parcel_index = current_parcel_index
-
-        with self.lock:
-            # Check timeout
-            elapsed = time.time() - self.start_time
-            if elapsed >= self.timeout_duration:
-                from .tree_builder import report_node_failure
-                error_msg = f"ApproachObject timeout after {elapsed:.1f}s - failed to reach parcel"
-                report_node_failure(self.name, error_msg, self.robot_namespace)
-                print(f"[{self.name}][{self.robot_namespace}] FAILURE: Approach timeout after {elapsed:.1f}s")
-                return py_trees.common.Status.FAILURE
-            
-            # Check if we have pose data and calculate target state
-            if self.robot_pose is None or self.parcel_pose is None:
-                self.feedback_message = f"[{self.robot_namespace}] Waiting for pose data..."
-                return py_trees.common.Status.RUNNING
-
-            target_state, distance_to_target_state = self.calculate_target_state()
-            if target_state is None:
-                self.feedback_message = f"[{self.robot_namespace}] Waiting for pose data..."
-                return py_trees.common.Status.RUNNING
-            
-            self.target_state = target_state
-            
-            # Check if approach is complete
-            if self.position_control_achieved and self.orientation_control_achieved and not self.control_active:
-                self._stop_robot()
-                self.feedback_message = f"[{self.robot_namespace}] Both position and orientation control achieved, approach complete"
-                print(f"[{self.name}][{self.robot_namespace}] Approach complete! Both control flags achieved. Distance to target state: {distance_to_target_state:.3f}m")
-                return py_trees.common.Status.SUCCESS
+                print(f"[{self.name}][{self.robot_namespace}] Successfully updated parcel subscription for parcel{current_parcel_index}")
             else:
-                # Continue approaching the target state
-                self.control_active = True
-                print(f"[{self.name}][{self.robot_namespace}] Continuing approach to target state, distance: {distance_to_target_state:.3f}m")
-                
-                self.feedback_message = f"[{self.robot_namespace}] Approaching target state - Distance: {distance_to_target_state:.3f}m, target: ({self.target_state[0]:.2f}, {self.target_state[1]:.2f}), robot: ({self.current_state[0]:.2f}, {self.current_state[1]:.2f}), position_flag: {self.position_control_achieved}, orientation_flag: {self.orientation_control_achieved}"
-                
-                return py_trees.common.Status.RUNNING
+                print(f"[{self.name}][{self.robot_namespace}] WARNING: Failed to update parcel subscription, keeping old index {self._last_parcel_index}")
+                self.parcel_pose = None
+        
+        # Periodically publish pushing_estimated_time while approaching
+        if hasattr(self, '_last_estimated_time_publish'):
+            if time.time() - self._last_estimated_time_publish > 1.0:  # Publish every 1 second
+                self.publish_pushing_estimated_time()
+                self._last_estimated_time_publish = time.time()
+        else:
+            # First time - publish and set timer
+            self.publish_pushing_estimated_time()
+            self._last_estimated_time_publish = time.time()
+        
+        # Check timeout
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.timeout_duration:
+            from .tree_builder import report_node_failure
+            error_msg = f"ApproachObject timeout after {elapsed:.1f}s - failed to reach parcel"
+            report_node_failure(self.name, error_msg, self.robot_namespace)
+            print(f"[{self.name}][{self.robot_namespace}] FAILURE: Approach timeout after {elapsed:.1f}s")
+            return py_trees.common.Status.FAILURE
+        
+        # Check if we have pose data and calculate target state
+        robot_pose_available = self.robot_pose is not None
+        parcel_pose_available = self.parcel_pose is not None
+        
+        if not robot_pose_available or not parcel_pose_available:
+            # Add debug info about subscription status
+            if not hasattr(self, '_debug_counter'):
+                self._debug_counter = 0
+            self._debug_counter += 1
+            
+            # Print debug info every 50 update cycles (about every 5 seconds)
+            if self._debug_counter % 50 == 1:
+                robot_topic = f'/turtlebot{self.namespace_number}/odom_map'
+                parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Still waiting for pose data after {self._debug_counter} update cycles")
+                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Robot subscription: {self.robot_pose_sub is not None} (topic: {robot_topic})")
+                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Parcel subscription: {self.parcel_pose_sub is not None} (topic: {parcel_topic})")
+                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Robot pose received: {robot_pose_available}, Parcel pose received: {parcel_pose_available}")
+            
+            self.feedback_message = f"[{self.robot_namespace}] Waiting for pose data... (robot: {robot_pose_available}, parcel: {parcel_pose_available})"
+            return py_trees.common.Status.RUNNING
 
+        target_state, distance_to_target_state = self.calculate_target_state()
+        if target_state is None:
+            self.feedback_message = f"[{self.robot_namespace}] Waiting for pose data..."
+            return py_trees.common.Status.RUNNING
+        
+        self.target_state = target_state
+        
+        # Check if approach is complete
+        if (self.position_control_achieved and self.orientation_control_achieved and not self.control_active):
+            self._stop_robot()
+            self.feedback_message = f"[{self.robot_namespace}] Both position and orientation control achieved, approach complete"
+            print(f"[{self.name}][{self.robot_namespace}] Approach complete! Both control flags achieved. Distance to target state: {distance_to_target_state:.3f}m")
+            return py_trees.common.Status.SUCCESS
+        else:
+            # Continue approaching the target state
+            self.control_active = True
+            
+            self.feedback_message = (
+                f"[{self.robot_namespace}] Approaching parcel{current_parcel_index} - "
+                f"Distance: {distance_to_target_state:.3f}m, "
+                f"target: ({self.target_state[0]:.2f}, {self.target_state[1]:.2f}, θ={self.target_state[2]:.2f}), "
+                f"robot{self.namespace_number}: ({self.current_state[0]:.2f}, {self.current_state[1]:.2f}, θ={self.current_state[2]:.2f}), "
+                f"position_flag: {self.position_control_achieved}, orientation_flag: {self.orientation_control_achieved}"
+            )
+            
+            return py_trees.common.Status.RUNNING
+                
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
         # Stop control and mark as inactive
@@ -580,19 +644,19 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self._stop_robot()
         
         # Clean up timer
-        if self.control_timer:
+        if hasattr(self, 'control_timer') and self.control_timer:
             self.control_timer.cancel()
             self.control_timer = None
             print(f"[{self.name}][{self.robot_namespace}] DEBUG: Cancelled control timer on terminate")
         
         # Clean up subscriptions
-        if self.robot_pose_sub is not None:
-            self.ros_node.destroy_subscription(self.robot_pose_sub)
+        if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub is not None:
+            self.node.destroy_subscription(self.robot_pose_sub)
             self.robot_pose_sub = None
             print(f"[{self.name}][{self.robot_namespace}] DEBUG: Destroyed robot pose subscription on terminate")
         
-        if self.parcel_pose_sub is not None:
-            self.ros_node.destroy_subscription(self.parcel_pose_sub)
+        if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub is not None:
+            self.node.destroy_subscription(self.parcel_pose_sub)
             self.parcel_pose_sub = None
             print(f"[{self.name}][{self.robot_namespace}] DEBUG: Destroyed parcel pose subscription on terminate")
         

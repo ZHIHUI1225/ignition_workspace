@@ -111,6 +111,23 @@ def main():
         # Use robot_namespace directly since we now use "turtlebot{i}" format throughout
         root = create_root(robot_namespace)
         
+        # CRITICAL FIX: Initialize blackboard variables BEFORE setup phase
+        # This ensures behaviors can access blackboard keys during their setup() calls
+        print(f"[SETUP] Pre-initializing blackboard variables for {robot_namespace}...")
+        blackboard = py_trees.blackboard.Client()
+        blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index",
+            access=py_trees.common.Access.WRITE
+        )
+        blackboard.register_key(
+            key=f"{robot_namespace}/system_failed", 
+            access=py_trees.common.Access.WRITE
+        )
+        # Set the initial values
+        blackboard.set(f"{robot_namespace}/current_parcel_index", 0)
+        blackboard.set(f"{robot_namespace}/system_failed", False)
+        print(f"[SETUP] ✓ Pre-initialized blackboard keys: {robot_namespace}/current_parcel_index=0, {robot_namespace}/system_failed=False")
+        
         # Print behavior tree structure
         print("BEHAVIOR TREE STRUCTURE:")
         print("="*40)
