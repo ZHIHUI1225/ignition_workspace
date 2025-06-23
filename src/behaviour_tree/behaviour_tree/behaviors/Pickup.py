@@ -18,7 +18,7 @@ import copy
 import tf_transformations as tf
 from geometry_msgs.msg import Twist, PoseStamped, Pose
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Bool, Int32, Float32, Float64
 import math
 
 def extract_namespace_number(namespace):
@@ -248,7 +248,7 @@ class MobileRobotMPC:
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0):
+    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0, estimated_time=55.0):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
@@ -258,6 +258,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.robot_namespace = robot_namespace  # Use provided robot_namespace
         self.case = "simple_maze"  # Default case
         self.timeout = timeout  # Timeout in seconds
+        self.estimated_time = estimated_time  # Estimated time for pushing operation in seconds
         
         # MPC and trajectory following variables
         self.trajectory_data = None
@@ -273,15 +274,17 @@ class PickObject(py_trees.behaviour.Behaviour):
         # Control variables
         self.cmd_vel_pub = None
         self.robot_pose_sub = None
+        self.estimated_time_pub = None  # Publisher for pushing estimated time
         
-        # Control timer for MPC
-        self.control_timer = None
+        # Dedicated control thread (专用控制线程)
+        self.control_thread = None
+        self.control_thread_active = False
         self.dt = 0.1  # 10Hz control frequency
         
         # Relay point tracking
         self.relay_pose_sub = None
         self.relay_pose = None
-        self.distance_threshold = 0.14  # Distance threshold for success condition
+        self.distance_threshold = 0.10 # Distance threshold for success condition
         
         # Trajectory following variables
         self.trajectory_index = 0  # Current index in trajectory
@@ -294,83 +297,320 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.parallel_count = 0
         self.last_cross_track_error = 0.0
         
+        # Estimated time publishing tracking
+        self.last_estimated_time_publish = 0.0
+        self.estimated_time_publish_interval = 1.0  # Publish every 5 seconds
+        
+        # State for the behavior
+        self.state = 'idle'  # idle, moving_to_parcel, moving_to_relay, finished
+        
+    def start_control_thread(self):
+        """Start the dedicated control thread for 10Hz control loop"""
+        if self.control_thread_active:
+            return  # Already running
+            
+        self.control_thread_active = True
+        self.control_thread = threading.Thread(target=self.control_loop_thread, daemon=True)
+        self.control_thread.start()
+        print(f"[{self.name}] Dedicated control thread started for Pickup behavior")
+        
+    def stop_control_thread(self):
+        """Stop the dedicated control thread"""
+        self.control_thread_active = False
+        if self.control_thread and self.control_thread.is_alive():
+            self.control_thread.join(timeout=1.0)
+        print(f"[{self.name}] Dedicated control thread stopped")
+        
+    def control_loop_thread(self):
+        """Dedicated control thread running at 10Hz"""
+        import time
+        
+        while self.control_thread_active and (not self.node or rclpy.ok()):
+            try:
+                self.control_step()
+                time.sleep(0.1)  # 10Hz control frequency
+            except Exception as e:
+                print(f"[{self.name}] Error in control thread: {e}")
+                
+    def control_step(self):
+        """Single control step - non-blocking with fallback state"""
+        if not self.control_thread_active or not self.picking_active:
+            print(f"[{self.name}] Control step skipped: thread_active={self.control_thread_active}, picking_active={self.picking_active}")
+            return
+            
+        # Debug: Check critical prerequisites
+        if not hasattr(self, 'mpc') or self.mpc is None:
+            print(f"[{self.name}] ERROR: MPC controller not initialized!")
+            return
+            
+        if not hasattr(self, 'trajectory_data') or self.trajectory_data is None:
+            print(f"[{self.name}] ERROR: No trajectory data loaded!")
+            return
+            
+        if not hasattr(self, 'cmd_vel_pub') or self.cmd_vel_pub is None:
+            print(f"[{self.name}] ERROR: cmd_vel_pub not initialized!")
+            return
+            
+        # Try to acquire state lock non-blocking
+        print(f"[{self.name}] DEBUG: Attempting to acquire state lock in control_step")
+        state_acquired = self.state_lock.acquire(blocking=False)
+        if not state_acquired:
+            # Use last known state if lock cannot be acquired
+            print(f"[{self.name}] Using last known state for control step - lock is BUSY/HELD by another process")
+            return
+        else:
+            print(f"[{self.name}] DEBUG: State lock ACQUIRED successfully in control_step")
+            
+        try:
+            # Check if we have valid robot pose data
+            current_state = self.current_state.copy()
+            if np.allclose(current_state, [0.0, 0.0, 0.0]):
+                print(f"[{self.name}] WARNING: No valid robot pose data - current_state is all zeros!")
+                return
+            
+            # Debug current state every 50 calls
+            if not hasattr(self, '_debug_call_count'):
+                self._debug_call_count = 0
+            self._debug_call_count += 1
+            
+            if self._debug_call_count % 50 == 0:
+                print(f"[{self.name}] DEBUG Control Step #{self._debug_call_count}: "
+                      f"pos=({current_state[0]:.3f}, {current_state[1]:.3f}, {current_state[2]:.3f}), "
+                      f"trajectory_idx={getattr(self, 'trajectory_index', 'N/A')}/{len(self.trajectory_data) if self.trajectory_data else 'N/A'}")
+            
+            # Execute MPC control if trajectory following is active
+            if not self.picking_complete:
+                print(f"[{self.name}] DEBUG: About to call _follow_trajectory_with_mpc()")
+                success = self._follow_trajectory_with_mpc()
+                if not success:
+                    print(f"[{self.name}] MPC trajectory following returned False!")
+                else:
+                    print(f"[{self.name}] MPC trajectory following returned True!")
+            else:
+                print(f"[{self.name}] Picking complete - stopping control")
+                
+        except Exception as e:
+            print(f"[{self.name}] Error in control step: {e}")
+            import traceback
+            print(f"[{self.name}] Control step traceback: {traceback.format_exc()}")
+        finally:
+            self.state_lock.release()
+        
     def setup(self, **kwargs):
         """Setup ROS connections and load trajectory data"""
+        print(f"[SETUP] 开始设置 PickObject: {self.name}")
+        print(f"[{self.name}] 开始设置 PickObject，参数: {kwargs}")
+        
         if 'node' in kwargs:
             self.node = kwargs['node']
             # Get robot namespace and case from ROS parameters
             try:
                 self.robot_namespace = self.node.get_parameter('robot_namespace').get_parameter_value().string_value
+                print(f"[{self.name}] 获取到机器人命名空间: {self.robot_namespace}")
             except:
                 self.robot_namespace = "turtlebot0"
+                print(f"[{self.name}] 使用默认机器人命名空间: {self.robot_namespace}")
             
             try:
                 self.case = self.node.get_parameter('case').get_parameter_value().string_value
+                print(f"[{self.name}] 获取到案例: {self.case}")
             except:
                 self.case = "simple_maze"
+                print(f"[{self.name}] 使用默认案例: {self.case}")
             
             # Setup ROS publishers and subscribers for MPC control
-            self._setup_ros_connections()
+            # Note: Subscriptions will be created in initialise(), not here
+            # self._setup_ros_connections()
             
             # Load trajectory data (with replanned trajectory support)
-            if not self._load_trajectory_data():
-                print(f"[{self.name}] CRITICAL ERROR: Failed to load trajectory data for {self.robot_namespace}")
-                print(f"[{self.name}] Expected file: /root/workspace/data/{self.case}/tb{self.number}_Trajectory_replanned.json")
+            print(f"[{self.name}] 开始加载轨迹数据...")
+            try:
+                if not self._load_trajectory_data():
+                    error_msg = f"Failed to load trajectory data for {self.robot_namespace}"
+                    print(f"[{self.name}] CRITICAL ERROR: {error_msg}")
+                    print(f"[{self.name}] Expected file: /root/workspace/data/{self.case}/tb{self.number}_Trajectory_replanned.json")
+                    # Report the failure to blackboard
+                    try:
+                        report_node_failure(self.name, error_msg, self.robot_namespace)
+                    except Exception as blackboard_err:
+                        print(f"[{self.name}] 无法报告失败到黑板: {blackboard_err}")
+                    return False
+                else:
+                    print(f"[{self.name}] 轨迹数据加载成功!")
+            except Exception as e:
+                error_msg = f"Exception during trajectory loading: {str(e)}"
+                print(f"[{self.name}] CRITICAL ERROR: {error_msg}")
+                print(f"[{self.name}] Traceback: {e}")
+                try:
+                    report_node_failure(self.name, error_msg, self.robot_namespace)
+                except Exception as blackboard_err:
+                    print(f"[{self.name}] 无法报告失败到黑板: {blackboard_err}")
                 return False
             
             # Initialize MPC controller
-            self._setup_simple_mpc()
+            print(f"[{self.name}] 初始化 MPC 控制器...")
+            try:
+                self._setup_simple_mpc()
+                print(f"[{self.name}] MPC 控制器初始化成功!")
+            except Exception as e:
+                error_msg = f"Failed to initialize MPC controller: {str(e)}"
+                print(f"[{self.name}] CRITICAL ERROR: {error_msg}")
+                print(f"[{self.name}] MPC Traceback: {e}")
+                try:
+                    report_node_failure(self.name, error_msg, self.robot_namespace)
+                except Exception as blackboard_err:
+                    print(f"[{self.name}] 无法报告失败到黑板: {blackboard_err}")
+                return False
             
-            print(f"[{self.name}] Setting up pick controller for {self.robot_namespace}, case: {self.case}")
+            print(f"[{self.name}] PickObject 设置完成，机器人: {self.robot_namespace}, 案例: {self.case}")
+            print(f"[SETUP] ✓ PickObject 设置成功: {self.name}")
             return True
         
-        print(f"[{self.name}] ERROR: No ROS node provided in setup")
-        return False
-    def _setup_ros_connections(self):
-        """Setup ROS publishers and subscribers for MPC trajectory following"""
+        error_msg = "No ROS node provided in setup"
+        print(f"[{self.name}] ERROR: {error_msg}")
         try:
-            # Command velocity publisher
-            self.cmd_vel_pub = self.node.create_publisher(
-                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            report_node_failure(self.name, error_msg, self.robot_namespace)
+        except:
+            print(f"[{self.name}] 无法报告失败到黑板")
+        return False
+    def setup_robot_subscription(self):
+        """Set up robot pose subscription - consistent with other behaviors"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup robot subscription - no ROS node")
+            return False
             
-            # Robot pose subscriber 
+        try:
+            # Clean up existing subscription if it exists
+            if self.robot_pose_sub is not None:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
+            
+            # Create dedicated callback group for non-blocking callbacks
+            if not hasattr(self, 'callback_group'):
+                self.callback_group = ReentrantCallbackGroup()
+            
+            # Subscribe to robot odometry (使用回调组避免阻塞)
             self.robot_pose_sub = self.node.create_subscription(
                 Odometry, f'/{self.robot_namespace}/odom_map', 
-                self._robot_pose_callback, 10)
-            
-            # Relay point subscriber
-            self.relay_pose_sub = self.node.create_subscription(
-                PoseStamped, f'/Relaypoint{self.number}/pose',
-                self._relay_pose_callback, 10)
-                
-            print(f"[{self.name}] ROS connections established for MPC control")
+                self._robot_pose_callback, 10,
+                callback_group=self.callback_group)
+            print(f"[{self.name}] 机器人姿态订阅已建立: {self.robot_namespace}/odom_map [使用回调组]")
+            return True
             
         except Exception as e:
-            print(f"[{self.name}] Error setting up ROS connections: {e}")
+            print(f"[{self.name}] ERROR: Failed to setup robot subscription: {e}")
+            return False
+
+    def setup_relay_subscription(self):
+        """Set up relay pose subscription - one-shot for static pose"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup relay subscription - no ROS node")
+            return False
+            
+        try:
+            # 如果已经有中继点数据，无需重新订阅
+            if self.relay_pose is not None:
+                print(f"[{self.name}] ✅ 中继点数据已存在，跳过订阅")
+                return True
+            
+            # Clean up existing subscription if it exists
+            if self.relay_pose_sub is not None:
+                self.node.destroy_subscription(self.relay_pose_sub)
+                self.relay_pose_sub = None
+            
+            # Create dedicated callback group for non-blocking callbacks
+            if not hasattr(self, 'callback_group'):
+                self.callback_group = ReentrantCallbackGroup()
+            
+            # Subscribe to relay point pose (一次性读取静态数据)
+            self.relay_pose_sub = self.node.create_subscription(
+                PoseStamped, f'/Relaypoint{self.number}/pose',
+                self._relay_pose_callback, 10,
+                callback_group=self.callback_group)
+            print(f"[{self.name}] ✅ 成功订阅中继话题: /Relaypoint{self.number}/pose (中继点: {self.number}) [一次性读取]")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup relay subscription: {e}")
+            return False
+
+    def setup_publishers(self):
+        """Set up publishers - these are created once and reused"""
+        try:
+            # Command velocity publisher (only create if not exists)
+            if self.cmd_vel_pub is None:
+                self.cmd_vel_pub = self.node.create_publisher(
+                    Twist, f'/{self.robot_namespace}/cmd_vel', 10)
+            
+            # Estimated time publisher (only create if not exists)
+            if self.estimated_time_pub is None:
+                self.estimated_time_pub = self.node.create_publisher(
+                    Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10)
+            
+            # Publish the estimated time immediately upon setup
+            self._publish_estimated_time()
+                
+            print(f"[{self.name}] 发布器已建立，估计时间已发布: {self.estimated_time}s")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Error setting up publishers: {e}")
+            return False
     
     def _relay_pose_callback(self, msg):
-        """Update relay point pose"""
-        self.relay_pose = np.array([
-            msg.pose.position.x,
-            msg.pose.position.y
-        ])
+        """Update relay point pose - optimized for non-blocking and static data reading"""
+        # 快速更新姿态数据（最小化锁持有时间）
+        try:
+            with self.state_lock:
+                self.relay_pose = np.array([
+                    msg.pose.position.x,
+                    msg.pose.position.y
+                ])
+            
+            # 静态数据已读取，销毁订阅 (Static relay data read, destroy subscription)
+            if self.relay_pose_sub is not None:
+                try:
+                    self.node.destroy_subscription(self.relay_pose_sub)
+                    self.relay_pose_sub = None
+                    print(f"[{self.name}] ✅ 中继点静态数据已读取，订阅已销毁: ({self.relay_pose[0]:.3f}, {self.relay_pose[1]:.3f})")
+                except Exception as destroy_e:
+                    print(f"[{self.name}] WARNING: Failed to destroy relay subscription: {destroy_e}")
+                    
+        except Exception as e:
+            print(f"[{self.name}] ERROR in relay_pose_callback: {e}")
     
     def _robot_pose_callback(self, msg):
-        """Update robot state from odometry message"""
-        with self.state_lock:
-            # Position
-            self.current_state[0] = msg.pose.pose.position.x
-            self.current_state[1] = msg.pose.pose.position.y
-            
-            # Orientation (yaw)
-            quat = [
-                msg.pose.pose.orientation.x,
-                msg.pose.pose.orientation.y,
-                msg.pose.pose.orientation.z,
-                msg.pose.pose.orientation.w
-            ]
-            yaw = euler_from_quaternion(quat)[2]
-            self.current_state[2] = yaw
+        """Update robot state from odometry message - optimized for non-blocking"""
+        try:
+            # Use non-blocking lock acquisition to avoid blocking callbacks
+            if self.state_lock.acquire(blocking=False):
+                try:
+                    # Position
+                    self.current_state[0] = msg.pose.pose.position.x
+                    self.current_state[1] = msg.pose.pose.position.y
+                    
+                    # Orientation (yaw)
+                    quat = [
+                        msg.pose.pose.orientation.x,
+                        msg.pose.pose.orientation.y,
+                        msg.pose.pose.orientation.z,
+                        msg.pose.pose.orientation.w
+                    ]
+                    yaw = euler_from_quaternion(quat)[2]
+                    self.current_state[2] = yaw
+                finally:
+                    self.state_lock.release()
+            # If lock can't be acquired, skip this update to avoid blocking
+        except Exception as e:
+            print(f"[{self.name}] ERROR in robot_pose_callback: {e}")
+    
+    def _publish_estimated_time(self):
+        """Publish estimated time for pushing operation"""
+        if self.estimated_time_pub is not None:
+            msg = Float64()
+            msg.data = float(self.estimated_time)
+            self.estimated_time_pub.publish(msg)
+            print(f"[{self.name}] 发布推送估计时间: {self.estimated_time}秒 到 /{self.robot_namespace}/pushing_estimated_time")
     
     def _load_trajectory_data(self):
         """Load trajectory data with support for replanned trajectories"""
@@ -396,8 +636,8 @@ class PickObject(py_trees.behaviour.Behaviour):
             self.goal = data[0]
             
             # Calculate target pose (approach position before final goal)
-            self.target_pose[0] = self.goal[0] - 0.4 * np.cos(self.goal[2])
-            self.target_pose[1] = self.goal[1] - 0.4 * np.sin(self.goal[2])
+            self.target_pose[0] = self.goal[0] - 0.3 * np.cos(self.goal[2])
+            self.target_pose[1] = self.goal[1] - 0.3 * np.sin(self.goal[2])
             self.target_pose[2] = self.goal[2]
             
             # Add interpolation points for smoother approach
@@ -443,17 +683,30 @@ class PickObject(py_trees.behaviour.Behaviour):
     
     def _setup_simple_mpc(self):
         """Setup full MobileRobotMPC controller for trajectory following"""
-        # Create the full MPC controller from manipulation_behaviors.py
-        self.mpc = MobileRobotMPC()
-        self.prediction_horizon = self.mpc.N
-        
-        # Pass target pose to MPC for precision positioning
-        if hasattr(self, 'target_pose'):
-            self.mpc.set_target_pose(self.target_pose)
-        
-        # Initialize control sequence management for N_c control horizon
-        self.control_sequence = None
-        self.control_step = 0
+        try:
+            print(f"[{self.name}] 创建 MobileRobotMPC 实例...")
+            # Create the full MPC controller from manipulation_behaviors.py
+            self.mpc = MobileRobotMPC()
+            print(f"[{self.name}] MobileRobotMPC 创建成功")
+            
+            self.prediction_horizon = self.mpc.N
+            print(f"[{self.name}] 预测地平线设置为: {self.prediction_horizon}")
+            
+            # Pass target pose to MPC for precision positioning
+            if hasattr(self, 'target_pose'):
+                self.mpc.set_target_pose(self.target_pose)
+                print(f"[{self.name}] 目标姿态已设置到 MPC")
+            
+            # Initialize control sequence management for N_c control horizon
+            self.control_sequence = None
+            self.control_step_index = 0
+            print(f"[{self.name}] 控制序列管理已初始化")
+            
+        except Exception as e:
+            print(f"[{self.name}] MPC 设置失败: {e}")
+            import traceback
+            print(f"[{self.name}] MPC 设置异常详情: {traceback.format_exc()}")
+            raise e
     
     def _find_initial_closest_trajectory_index(self):
         """Find the closest trajectory point to robot's current position at initialization"""
@@ -513,27 +766,22 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.trajectory_index = 0
         self._initial_index_set = False
         
-        # Set up control timer for MPC
-        if self.node and not self.control_timer:
-            self.control_timer = self.node.create_timer(self.dt, self.control_timer_callback)
+        # Setup ROS subscriptions (recreated each time behavior starts)
+        self.setup_robot_subscription()
+        self.setup_relay_subscription()
+        self.setup_publishers()
+        
+        # Start dedicated control thread (专用控制线程) instead of timer
+        self.start_control_thread()
         
         # Find initial closest trajectory index
         self._wait_for_initial_pose(timeout=5.0)  # Wait for initial pose
         self.closest_idx = self._find_initial_closest_trajectory_index()
         self.trajectory_index = self.closest_idx  # Start at closest index
         
-        print(f"[{self.name}] Starting to pick object...")
+        print(f"[{self.name}] Starting to pick object with dedicated control thread...")
     
-    def control_timer_callback(self):
-        """Timer callback for MPC control execution"""
-        if not self.picking_active or self.picking_complete:
-            return
-            
-        try:
-            # Execute MPC control if trajectory following is active
-            self._follow_trajectory_with_mpc()
-        except Exception as e:
-            print(f"[{self.name}] Error in control timer callback: {e}")
+    # Note: control_timer_callback removed - using dedicated control thread instead
     
     def update(self):
         """Update picking behavior - simplified to check completion"""
@@ -565,9 +813,25 @@ class PickObject(py_trees.behaviour.Behaviour):
         elapsed = time.time() - self.start_time
         self.feedback_message = f"[{self.robot_namespace}] Following trajectory to pick object... {elapsed:.1f}s elapsed"
         
+        # Periodically publish estimated time
+        current_time = time.time()
+        if current_time - self.last_estimated_time_publish >= self.estimated_time_publish_interval:
+            self._publish_estimated_time()
+            self.last_estimated_time_publish = current_time
+        
         # Check if robot is close to target
-        with self.state_lock:
-            current_state = self.current_state.copy()
+        # Use non-blocking lock acquisition to avoid blocking callbacks
+        if self.state_lock.acquire(blocking=False):
+            try:
+                current_state = self.current_state.copy()
+            finally:
+                self.state_lock.release()
+        else:
+            # If lock can't be acquired, use last known state
+            current_state = getattr(self, '_last_known_state', np.zeros(3))
+            
+        # Store last known state for fallback
+        self._last_known_state = current_state
             
         distance_to_target = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
                                    (current_state[1] - self.target_pose[1])**2)
@@ -653,16 +917,24 @@ class PickObject(py_trees.behaviour.Behaviour):
     def _follow_trajectory_with_mpc(self):
         """Follow trajectory using MPC controller with control sequence management (similar to PushObject)"""
         try:
+            print(f"[{self.name}] DEBUG: _follow_trajectory_with_mpc() called")
+            
             # Check if we have a valid stored control sequence we can use
             if self.control_sequence is not None:
+                print(f"[{self.name}] DEBUG: Using stored control sequence")
                 # Use the stored control sequence if available
                 if self._apply_stored_control():
                     self._advance_control_step()
                     return True
+                else:
+                    print(f"[{self.name}] DEBUG: Stored control sequence failed")
+            else:
+                print(f"[{self.name}] DEBUG: No stored control sequence available")
             
             # If no valid control sequence or need replanning, run MPC
-            with self.state_lock:
-                current_state = self.current_state.copy()
+            # NOTE: State lock is already held by control_step(), so we don't need to acquire it again
+            print(f"[{self.name}] DEBUG: Using current state (lock already held by control_step)")
+            current_state = self.current_state.copy()
             
             # Always find the closest trajectory point to ensure accurate reference
             curr_pos = np.array([current_state[0], current_state[1]])
@@ -792,7 +1064,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             if u_sequence is not None and not np.isnan(u_sequence).any() and not np.allclose(u_sequence, 0.0):
                 # Store the N_c control steps for future use
                 self.control_sequence = u_sequence
-                self.control_step = 0
+                self.control_step_index = 0
                 
                 # Apply first control command with velocity scaling for approach
                 if self._apply_stored_control():
@@ -896,35 +1168,86 @@ class PickObject(py_trees.behaviour.Behaviour):
     
     
     def terminate(self, new_status):
-        """Clean up when behavior terminates"""
+        """Clean up when behavior terminates - with proper resource cleanup"""
+        print(f"[{self.name}] 开始终止拾取行为，状态: {new_status}")
+        
+        # Step 1: Set termination flags
         self.picking_active = False
         
-        # Stop the robot
-        if self.cmd_vel_pub:
-            cmd_msg = Twist()
-            cmd_msg.linear.x = 0.0
-            cmd_msg.angular.z = 0.0
-            self.cmd_vel_pub.publish(cmd_msg)
+        # Step 2: Stop dedicated control thread (专用控制线程)
+        self.stop_control_thread()
         
-        # Clean up timer
-        if self.control_timer:
-            self.control_timer.cancel()
-            self.control_timer = None
+        # Step 3: Stop the robot immediately
+        try:
+            if self.cmd_vel_pub and hasattr(self, 'node') and self.node:
+                cmd_msg = Twist()
+                cmd_msg.linear.x = 0.0
+                cmd_msg.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd_msg)
+                print(f"[{self.name}] 机器人已停止 [发布停止命令]")
+        except Exception as e:
+            print(f"[{self.name}] 警告: 停止机器人时出错: {e}")
         
-        print(f"[{self.name}] Pick behavior terminated with status: {new_status}")
+        # Step 4: Clean up timer (legacy - now using control thread)
+        if hasattr(self, 'control_timer') and self.control_timer:
+            try:
+                self.control_timer.cancel()
+                self.control_timer = None
+                print(f"[{self.name}] 控制定时器已清理")
+            except Exception as e:
+                print(f"[{self.name}] 警告: 定时器清理错误: {e}")
+        
+        # Step 5: Thread-safe subscription cleanup using non-blocking locks
+        if self.state_lock.acquire(blocking=False):
+            try:
+                subscription_errors = []
+                
+                # Clean up robot pose subscription
+                if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub is not None:
+                    try:
+                        self.node.destroy_subscription(self.robot_pose_sub)
+                        self.robot_pose_sub = None
+                    except Exception as e:
+                        subscription_errors.append(f"robot_pose_sub: {e}")
+                
+                # Clean up relay pose subscription (静态数据，应该已销毁)
+                if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub is not None:
+                    try:
+                        self.node.destroy_subscription(self.relay_pose_sub)
+                        self.relay_pose_sub = None
+                    except Exception as e:
+                        subscription_errors.append(f"relay_pose_sub: {e}")
+                
+                # Note: Publishers (cmd_vel_pub, estimated_time_pub) are kept for reuse
+                # They will be destroyed when the node is destroyed
+                
+                if subscription_errors:
+                    print(f"[{self.name}] 资源清理警告: {subscription_errors}")
+            finally:
+                self.state_lock.release()
+        else:
+            print(f"[{self.name}] 警告: 无法获取锁进行资源清理，跳过订阅清理")
+        
+        print(f"[{self.name}] 拾取行为终止完成，状态: {new_status}")
     
     def _apply_stored_control(self):
         """Apply the current step from the stored control sequence"""
-        if self.control_sequence is None or self.control_step >= self.mpc.N_c:
+        print(f"[{self.name}] DEBUG: _apply_stored_control() called")
+        if self.control_sequence is None or self.control_step_index >= self.mpc.N_c:
+            print(f"[{self.name}] DEBUG: No control sequence or index out of bounds: "
+                  f"sequence={self.control_sequence is not None}, "
+                  f"index={self.control_step_index}, N_c={self.mpc.N_c if self.mpc else 'N/A'}")
             return False
         
         # Get current control input
-        raw_v = float(self.control_sequence[0, self.control_step])
-        raw_omega = float(self.control_sequence[1, self.control_step])
+        raw_v = float(self.control_sequence[0, self.control_step_index])
+        raw_omega = float(self.control_sequence[1, self.control_step_index])
+        print(f"[{self.name}] DEBUG: Raw control inputs: v={raw_v:.3f}, ω={raw_omega:.3f}")
         
         # Apply velocity scaling for approach
-        with self.state_lock:
-            current_state = self.current_state.copy()
+        # NOTE: State lock is already held by control_step(), so we don't need to acquire it again
+        print(f"[{self.name}] DEBUG: Using current state (lock already held by control_step)")
+        current_state = self.current_state.copy()
             
         distance_to_target = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
                                    (current_state[1] - self.target_pose[1])**2)
@@ -953,10 +1276,12 @@ class PickObject(py_trees.behaviour.Behaviour):
         cmd_msg.linear.x = raw_v * scale_factor
         cmd_msg.angular.z = raw_omega * scale_factor
         
+        print(f"[{self.name}] DEBUG: Publishing cmd_vel: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f}")
         self.cmd_vel_pub.publish(cmd_msg)
+        print(f"[{self.name}] DEBUG: cmd_vel published successfully")
         
         # Enhanced logging with trajectory following info
-        print(f'[{self.name}] MPC control step {self.control_step+1}/{self.mpc.N_c}: '
+        print(f'[{self.name}] MPC control step {self.control_step_index+1}/{self.mpc.N_c}: '
               f'v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f}, '
               f'dist_to_target={distance_to_target:.3f}m, dist_to_traj={distance_to_traj:.3f}m, '
               f'traj_idx={self.trajectory_index}/{len(self.trajectory_data)}')
@@ -968,12 +1293,12 @@ class PickObject(py_trees.behaviour.Behaviour):
         if self.control_sequence is None:
             return False
         
-        self.control_step += 1
+        self.control_step_index += 1
         
         # Advanced trajectory progression: only advance index if robot has moved forward along trajectory
-        if self.control_step == 1:  # Only check on first control step application
-            with self.state_lock:
-                current_state = self.current_state.copy()
+        if self.control_step_index == 1:  # Only check on first control step application
+            # NOTE: State lock is already held by control_step(), so we don't need to acquire it again
+            current_state = self.current_state.copy()
             
             curr_pos = np.array([current_state[0], current_state[1]])
             
@@ -992,8 +1317,8 @@ class PickObject(py_trees.behaviour.Behaviour):
                     break
         
         # If we've used all our control steps, need a new MPC solve
-        if self.control_step >= self.mpc.N_c:
-            self.control_step = 0
+        if self.control_step_index >= self.mpc.N_c:
+            self.control_step_index = 0
             self.control_sequence = None
             return False
         
