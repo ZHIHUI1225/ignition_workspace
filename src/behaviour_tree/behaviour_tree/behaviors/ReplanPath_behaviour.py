@@ -67,6 +67,30 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             raw_target_time = self.previous_robot_pushing_estimated_time
             print(f"[{self.name}] Getting target time from {self.previous_robot_namespace} via ROS topic: {raw_target_time:.2f}s")
 
+        # Check if pushing_estimated_time is too small (< 20 seconds)
+        if raw_target_time < 20.0:
+            from .tree_builder import report_node_failure
+            error_msg = f"Pushing estimated time ({raw_target_time:.2f}s) is too small (< 20s) and fallback copy failed"
+            report_node_failure(self.name, error_msg, self.robot_namespace)
+            print(f"[{self.name}] FAILURE: {error_msg}")
+            
+            # Set system failure flag directly via blackboard
+            try:
+                blackboard_client = py_trees.blackboard.Client(name="replan_failure_reporter")
+                blackboard_client.register_key(
+                    key=f"{self.robot_namespace}/system_failed",
+                    access=py_trees.common.Access.WRITE
+                )
+                blackboard_client.set(f"{self.robot_namespace}/system_failed", True)
+                print(f"[{self.name}] System failure flag set to True due to insufficient pushing time and failed fallback")
+            except Exception as bb_error:
+                print(f"[{self.name}] Warning: Could not set system failure flag: {bb_error}")
+            
+            # Mark as failed to be caught in update()
+            self.replanning_completed = True
+            self.replanning_successful = False
+            return
+
         target_time = raw_target_time
         print(f"[{self.name}] Target time for replanning: {target_time:.2f}s")
         
@@ -91,6 +115,11 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         # Check for timeout
         if elapsed >= self.duration:
             print(f"[{self.name}] Replanning timeout after {self.duration}s")
+            return py_trees.common.Status.FAILURE
+        
+        # Check if replanning failed during initialization (e.g., pushing time too small)
+        if self.replanning_completed and not self.replanning_successful:
+            print(f"[{self.name}] Replanning failed during initialization")
             return py_trees.common.Status.FAILURE
         
         # If replanning hasn't been started yet, start it
@@ -118,25 +147,79 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     
                     return py_trees.common.Status.SUCCESS
                 else:
+                    # Replanning failed - copy original data directly as fallback
+                    print(f"[{self.name}] Replanning failed - copying original trajectory data as fallback")
+                    
+                    try:
+                        # Import the copy function to handle fallback
+                        from .Replan_behaviors import copy_original_trajectory_as_fallback
+                        
+                        # Copy original trajectory data
+                        copy_result = copy_original_trajectory_as_fallback(
+                            case=self.case,
+                            robot_id=self.robot_id
+                        )
+                        
+                        if copy_result:
+                            self.replanning_completed = True
+                            self.replanning_successful = True
+                            
+                            print(f"[{self.name}] Successfully copied original trajectory data as fallback")
+                            print(f"[{self.name}] Robot {self.robot_id} will use original trajectory")
+                            
+                            return py_trees.common.Status.SUCCESS
+                        else:
+                            print(f"[{self.name}] Failed to copy original trajectory data")
+                            
+                    except ImportError:
+                        print(f"[{self.name}] Fallback copy function not available - using manual copy")
+                        
+                        # Manual fallback - copy original trajectory file
+                        if self._copy_original_trajectory_as_fallback():
+                            self.replanning_completed = True
+                            self.replanning_successful = True
+                            
+                            print(f"[{self.name}] Robot {self.robot_id} will use original trajectory")
+                            return py_trees.common.Status.SUCCESS
+                    
+                    # If all fallback attempts failed, report failure but don't stop the system
                     self.replanning_completed = True
                     self.replanning_successful = False
                     
                     from .tree_builder import report_node_failure
-                    error_msg = "Replanning failed - optimization returned None (infeasible constraints or missing data)"
+                    error_msg = "Replanning failed and fallback copy also failed - optimization returned None"
                     report_node_failure(self.name, error_msg, self.robot_namespace)
-                    print(f"[{self.name}] Replanning failed - optimization returned None")
-                    print(f"[{self.name}] This could be due to infeasible constraints or missing data")
+                    print(f"[{self.name}] WARNING: Both replanning and fallback failed")
                 
                     return py_trees.common.Status.FAILURE
                     
             except Exception as e:
+                # Replanning failed with exception - try to copy original data as fallback
+                print(f"[{self.name}] Replanning failed with exception: {str(e)}")
+                print(f"[{self.name}] Attempting to copy original trajectory data as fallback...")
+                
+                try:
+                    # Manual fallback - copy original trajectory file
+                    if self._copy_original_trajectory_as_fallback():
+                        self.replanning_completed = True
+                        self.replanning_successful = True
+                        
+                        print(f"[{self.name}] Successfully copied original trajectory as fallback after exception")
+                        print(f"[{self.name}] Robot {self.robot_id} will use original trajectory")
+                        
+                        return py_trees.common.Status.SUCCESS
+                        
+                except Exception as copy_error:
+                    print(f"[{self.name}] Failed to copy original trajectory after exception: {copy_error}")
+                
+                # If fallback copy also failed, report the failure
                 self.replanning_completed = True
                 self.replanning_successful = False
                 
                 from .tree_builder import report_node_failure
-                error_msg = f"Replanning failed with exception: {str(e)}"
+                error_msg = f"Replanning failed with exception and fallback copy also failed: {str(e)}"
                 report_node_failure(self.name, error_msg, self.robot_namespace)
-                print(f"[{self.name}] {error_msg}")
+                print(f"[{self.name}] WARNING: Both replanning and fallback failed due to exception")
                 
                 return py_trees.common.Status.FAILURE
         
@@ -183,7 +266,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     self.pushing_estimated_time_callback,
                     10
                 )
-                print(f"[{self.name}] DEBUG: Subscribed to {self.previous_robot_namespace}/pushing_estimated_time topic")
+                # print(f"[{self.name}] DEBUG: Subscribed to {self.previous_robot_namespace}/pushing_estimated_time topic")
             else:
                 print(f"[{self.name}] DEBUG: No previous robot (this is turtlebot0)")
             
@@ -196,4 +279,31 @@ class ReplanPath(py_trees.behaviour.Behaviour):
     def pushing_estimated_time_callback(self, msg):
         """Callback for previous robot's pushing estimated time"""
         self.previous_robot_pushing_estimated_time = msg.data
-        print(f"[{self.name}] DEBUG: Received {self.previous_robot_namespace}/pushing_estimated_time = {msg.data:.2f}s")
+        # print(f"[{self.name}] DEBUG: Received {self.previous_robot_namespace}/pushing_estimated_time = {msg.data:.2f}s")
+    
+    def _copy_original_trajectory_as_fallback(self):
+        """
+        Copy the original trajectory file as a fallback when replanning fails.
+        
+        Returns:
+            bool: True if copy was successful, False otherwise
+        """
+        try:
+            import os
+            import shutil
+            
+            # Define file paths
+            original_file = f'/root/workspace/data/{self.case}/tb{self.robot_id}_Trajectory.json'
+            replanned_file = f'/root/workspace/data/{self.case}/tb{self.robot_id}_Trajectory_replanned.json'
+            
+            if os.path.exists(original_file):
+                shutil.copy2(original_file, replanned_file)
+                print(f"[{self.name}] Successfully copied original trajectory: {original_file} -> {replanned_file}")
+                return True
+            else:
+                print(f"[{self.name}] Original trajectory file not found: {original_file}")
+                return False
+                
+        except Exception as e:
+            print(f"[{self.name}] Failed to copy original trajectory: {e}")
+            return False

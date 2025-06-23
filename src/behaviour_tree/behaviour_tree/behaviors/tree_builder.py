@@ -50,11 +50,16 @@ class FailureHandler(py_trees.behaviour.Behaviour):
             access=py_trees.common.Access.WRITE
         )
         self.blackboard.register_key(
+            key=f"{robot_namespace}/current_parcel_index",
+            access=py_trees.common.Access.WRITE
+        )
+        self.blackboard.register_key(
             key=f"{robot_namespace}/failure_context",
             access=py_trees.common.Access.READ
         )
     
     def update(self):
+        print(f"[{self.name}][{self.robot_namespace}] FailureHandler 被触发 - 这意味着主序列失败了")
         print(f"[{self.name}][{self.robot_namespace}] FAILURE DETECTED - STOPPING SYSTEM")
         
         # Set system failure flag
@@ -65,6 +70,8 @@ class FailureHandler(py_trees.behaviour.Behaviour):
             failure_context = self.blackboard.get(f"{self.robot_namespace}/failure_context")
             if failure_context:
                 print(f"[{self.name}][{self.robot_namespace}] Failure context: {failure_context}")
+            else:
+                print(f"[{self.name}][{self.robot_namespace}] Failure context exists but is empty/None")
         except KeyError:
             print(f"[{self.name}][{self.robot_namespace}] No failure context available")
         
@@ -87,13 +94,16 @@ class LoopCondition(py_trees.behaviour.Behaviour):
     def update(self):
         try:
             system_failed = self.blackboard.get(f"{self.robot_namespace}/system_failed")
+            print(f"[{self.name}][{self.robot_namespace}] 检查循环条件: system_failed = {system_failed}")
             if system_failed:
                 print(f"[{self.name}][{self.robot_namespace}] System failure detected - preventing loop restart")
                 return py_trees.common.Status.FAILURE
             else:
+                print(f"[{self.name}][{self.robot_namespace}] 系统正常，继续循环")
                 return py_trees.common.Status.SUCCESS
         except KeyError:
             # If key doesn't exist, system hasn't failed
+            print(f"[{self.name}][{self.robot_namespace}] 系统失败标志不存在，假设系统正常")
             return py_trees.common.Status.SUCCESS
 
 
@@ -179,7 +189,7 @@ def create_root(robot_namespace="turtlebot0"):
     # Add parallel sequence and its failure handler
     parallel_move_replan_with_fallback.add_children([
         parallel_move_replan,
-        FailureHandler("ParallelFailureHandler", robot_namespace)
+        FailureHandler("ReplanningFailureHandler", robot_namespace)
     ])
     
     # Picking sequence with failure handling
@@ -226,7 +236,7 @@ def create_root(robot_namespace="turtlebot0"):
         picking_up_sequence_with_fallback
     ])
     
-    # Add action execution and its failure handler
+    # Add action execution and its failure handler to the fallback
     action_execution_with_fallback.add_children([
         action_execution,
         FailureHandler("ActionExecutionFailureHandler", robot_namespace)
