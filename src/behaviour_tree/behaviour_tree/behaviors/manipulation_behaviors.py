@@ -7,7 +7,7 @@ import py_trees
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from geometry_msgs.msg import Twist, PoseStamped, Pose
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Int32, Float64
@@ -390,12 +390,19 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.last_control_errors = {}
     
     def setup(self, **kwargs):
-        """设置ROS节点和通信组件（使用回调组避免阻塞）"""
+        """设置ROS节点和通信组件（优化：使用机器人专用回调组实现线程隔离）"""
         if 'node' in kwargs:
             self.node = kwargs['node']
             
-            # 创建专用回调组避免回调互相阻塞
-            self.callback_group = ReentrantCallbackGroup()
+            # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup
+            # 每个机器人的所有回调都使用同一个专用回调组，实现真正的线程隔离
+            if hasattr(self.node, 'robot_dedicated_callback_group'):
+                self.callback_group = self.node.robot_dedicated_callback_group
+                print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
+            else:
+                # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
+                self.callback_group = MutuallyExclusiveCallbackGroup()
+                print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
             
             # 获取命名空间参数
             try:
@@ -428,7 +435,8 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.pred_path = Path()
             self.pred_path.header.frame_id = 'world'
             
-            print(f"[{self.name}] 发布者已创建（使用回调组避免阻塞）")
+            print(f"[{self.name}] ✅ 发布者已创建，使用专用MutuallyExclusiveCallbackGroup for {self.robot_namespace}")
+            print(f"[{self.name}] 🔧 回调组优化：CallbackGroup ID = {id(self.callback_group)}")
         return True
     
     def _extract_namespace_number(self):
@@ -506,7 +514,7 @@ class PushObject(py_trees.behaviour.Behaviour):
     
     def robot_pose_callback(self, msg):
         """Update robot state from odometry message"""
-        # Ensure current_state is initialized before accessing it
+        # Initialize current_state if it's None (first callback)
         if self.current_state is None:
             self.current_state = np.zeros(5)  # [x, y, theta, v, omega]
         
@@ -541,7 +549,6 @@ class PushObject(py_trees.behaviour.Behaviour):
                 
         except Exception as e:
             print(f"[{self.name}] ERROR in robot_pose_callback: {e}")
-            import traceback
             traceback.print_exc()
 
     def parcel_pose_callback(self, msg):
@@ -559,9 +566,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         else:
             self._parcel_callback_count += 1
             # Log first few callbacks and then periodically
-            if self._parcel_callback_count <= 3:
-                print(f"[{self.name}] 📦 包裹回调 #{self._parcel_callback_count}: pos=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f})")
-            elif self._parcel_callback_count % 50 == 0:
+            # if self._parcel_callback_count <= 3:
+            #     print(f"[{self.name}] 📦 包裹回调 #{self._parcel_callback_count}: pos=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f})")
+            if self._parcel_callback_count % 50 == 0:
                 time_since_start = current_time - self._last_parcel_callback_time
                 frequency = self._parcel_callback_count / time_since_start if time_since_start > 0 else 0
                 print(f"[{self.name}] 📦 包裹话题频率: {frequency:.1f} Hz (总回调: {self._parcel_callback_count})")
@@ -629,6 +636,26 @@ class PushObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] SUCCESS: Robot is close to target state(x:{target_x},y:{target_y}) (distance: {distance:.3f}m)")
         
         return is_close
+    
+    def _check_robot_in_relay_range(self):
+        """Check if robot is within distance threshold of relay point"""
+        if self.current_state is None or self.relay_pose is None:
+            return False
+        
+        # Convert current robot state to geometry_msgs format for distance calculation
+        robot_x = self.current_state[0]
+        robot_y = self.current_state[1]
+        
+        # Calculate distance between robot and relay point
+        relay_x = self.relay_pose.position.x
+        relay_y = self.relay_pose.position.y
+        
+        distance = math.sqrt((robot_x - relay_x)**2 + (robot_y - relay_y)**2)
+        is_in_range = distance <= 0.05 # 5cm threshold      
+        if is_in_range:
+            print(f"[{self.name}] SUCCESS: Robot is within relay range (distance: {distance:.3f}m <= {self.distance_threshold:.3f}m)")
+        
+        return is_in_range
     
     def _update_pushing_estimated_time(self):
         """Update pushing estimated time in blackboard based on current trajectory index"""
@@ -1072,24 +1099,30 @@ class PushObject(py_trees.behaviour.Behaviour):
             return False
             
         try:
-            # Try to get current parcel index from blackboard, but handle if it doesn't exist yet
+            # Try to get current parcel index from blackboard with proper error handling
             try:
                 current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+                print(f"[{self.name}] 调试: 从黑板检索包裹索引: {current_parcel_index}")
             except Exception as bb_error:
-                # Blackboard key doesn't exist yet - this is normal during setup
-                print(f"[{self.name}] INFO: Blackboard key not ready during setup, will create parcel subscription in initialise(): {bb_error}")
-                return False  # Return False to indicate subscription not yet created
+                # Blackboard key doesn't exist yet - use default value
+                print(f"[{self.name}] 信息: 黑板键尚未就绪，使用默认包裹索引0: {bb_error}")
+                current_parcel_index = 0
             
+            # Always update self.current_parcel_index and create subscription
+            old_index = getattr(self, 'current_parcel_index', 'none')
             self.current_parcel_index = current_parcel_index
             
             # Clean up existing subscription if it exists
             if self.parcel_pose_sub is not None:
                 self.node.destroy_subscription(self.parcel_pose_sub)
                 self.parcel_pose_sub = None
+                print(f"[{self.name}] 调试: 已销毁现有包裹订阅")
                 
-            # Create dedicated callback group for this behavior's subscriptions
+            # 使用已创建的专用MutuallyExclusiveCallbackGroup（在setup中创建）
+            # 确保此机器人的所有回调使用相同的专用回调组
             if not hasattr(self, 'callback_group') or self.callback_group is None:
-                self.callback_group = ReentrantCallbackGroup()
+                print(f"[{self.name}] 警告: 专用回调组未找到，创建临时回调组")
+                self.callback_group = MutuallyExclusiveCallbackGroup()
                 
             # Create new parcel subscription (使用回调组避免阻塞)
             parcel_topic = f'/parcel{current_parcel_index}/pose'
@@ -1100,11 +1133,12 @@ class PushObject(py_trees.behaviour.Behaviour):
                 10,
                 callback_group=self.callback_group
             )
-            print(f"[{self.name}] ✅ 成功订阅包裹话题: {parcel_topic} (索引: {current_parcel_index}) [使用回调组, 节点: {self.node.get_name()}]")
+            print(f"[{self.name}] ✅ 成功订阅包裹话题: {parcel_topic} (索引变化: {old_index} -> {current_parcel_index}) [使用回调组, 节点: {self.node.get_name()}]")
             return True
             
         except Exception as e:
             print(f"[{self.name}] ERROR: Failed to setup parcel subscription: {e}")
+            traceback.print_exc()
             return False
 
     def setup_relay_subscription(self):
@@ -1124,9 +1158,10 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.relay_pose_sub)
                 self.relay_pose_sub = None
             
-            # Create dedicated callback group for this behavior's subscriptions
+            # 使用已创建的专用MutuallyExclusiveCallbackGroup（在setup中创建）
             if not hasattr(self, 'callback_group') or self.callback_group is None:
-                self.callback_group = ReentrantCallbackGroup()
+                print(f"[{self.name}] 警告: 专用回调组未找到，创建临时回调组")
+                self.callback_group = MutuallyExclusiveCallbackGroup()
             
             # Subscribe to relay point pose (一次性读取静态数据)
             relay_number = self._extract_namespace_number() + 1  # Relaypoint{i+1}
@@ -1154,16 +1189,19 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.robot_pose_sub)
                 self.robot_pose_sub = None
             
-            # Create dedicated callback group for this behavior's subscriptions
+            # 🔧 使用已创建的专用MutuallyExclusiveCallbackGroup（在setup中创建）
+            # 确保此机器人的所有回调使用相同的专用回调组
             if not hasattr(self, 'callback_group') or self.callback_group is None:
-                self.callback_group = ReentrantCallbackGroup()
+                print(f"[{self.name}] 警告: 专用回调组未找到，创建临时回调组")
+                self.callback_group = MutuallyExclusiveCallbackGroup()
             
             # Subscribe to robot odometry (使用回调组避免阻塞) 
             robot_odom_topic = f'/turtlebot{self._extract_namespace_number()}/odom_map'
             self.robot_pose_sub = self.node.create_subscription(
                 Odometry, robot_odom_topic, self.robot_pose_callback, 10,
                 callback_group=self.callback_group)
-            print(f"[{self.name}] ✅ 成功订阅机器人话题: {robot_odom_topic} [使用回调组, 节点: {self.node.get_name()}]")
+            print(f"[{self.name}] ✅ 成功订阅机器人话题: {robot_odom_topic} [使用专用MutuallyExclusiveCallbackGroup, 节点: {self.node.get_name()}]")
+            print(f"[{self.name}] 🔧 线程隔离: CallbackGroup ID = {id(self.callback_group)} for {self.robot_namespace}")
             return True
             
         except Exception as e:
@@ -1172,12 +1210,24 @@ class PushObject(py_trees.behaviour.Behaviour):
 
     def initialise(self):
         """初始化行为状态并启动专用控制线程"""
-        # 重置状态变量
-        self.current_state = np.zeros(5)
+        print(f"[{self.name}] 开始初始化推送行为...")
+        
+        # 重置状态变量 - 使用None而不是zeros来区分"未初始化"和"收到零值"
+        self.current_state = None
         self.pushing_active = True
         self.start_time = time.time()
         self.parcel_pose = None
         self.relay_pose = None
+        
+        # 重置轨迹索引到起始位置
+        self.trajectory_index = 0
+        
+        # 添加初始化完成标志，防止控制循环在数据到达前运行
+        self.initialization_complete = False
+        
+        # 重置回调计数器用于调试
+        self._robot_callback_count = 0
+        self._parcel_callback_count = 0
         
         # 线程安全标志
         self.terminating = False
@@ -1196,13 +1246,56 @@ class PushObject(py_trees.behaviour.Behaviour):
         self._load_trajectory()
         
         # 设置ROS订阅（无回调组）
-        self.setup_robot_subscription()
-        self.setup_parcel_subscription()
-        self.setup_relay_subscription()
+        print(f"[{self.name}] 设置ROS订阅...")
+        robot_sub_ok = self.setup_robot_subscription()
+        parcel_sub_ok = self.setup_parcel_subscription()
+        relay_sub_ok = self.setup_relay_subscription()
         
-        # 关键：等待100ms确保订阅建立
-        time.sleep(0.1)  
+        print(f"[{self.name}] 订阅状态: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_sub_ok}")
+        
+        # 关键：等待更长时间确保订阅建立和回调开始接收数据
+        print(f"[{self.name}] 等待订阅建立和数据接收...")
+        time.sleep(0.5)  # 增加等待时间从100ms到500ms
         self.check_topic_connectivity()
+        
+        # 主动等待数据到达，最多等待3秒
+        print(f"[{self.name}] 主动等待关键数据到达...")
+        max_wait_time = 3.0
+        start_wait = time.time()
+        
+        while (time.time() - start_wait) < max_wait_time:
+            # 检查是否有足够的数据开始控制
+            robot_has_data = (self.current_state is not None and 
+                            hasattr(self, '_robot_callback_count') and 
+                            self._robot_callback_count > 0)
+            parcel_has_data = self.parcel_pose is not None
+            
+            if robot_has_data and parcel_has_data:
+                print(f"[{self.name}] ✅ 关键数据已到达 (等待时间: {time.time() - start_wait:.1f}s)")
+                break
+            
+            # 短暂等待
+            time.sleep(0.1)
+            
+            # 每0.5秒打印一次状态
+            if int((time.time() - start_wait) * 2) % 1 == 0:
+                robot_status = "✓" if robot_has_data else "✗"
+                parcel_status = "✓" if parcel_has_data else "✗"
+                print(f"[{self.name}] 数据等待中... robot:{robot_status} parcel:{parcel_status} (已等待: {time.time() - start_wait:.1f}s)")
+        
+        # 最终数据检查
+        robot_has_data = (self.current_state is not None and 
+                        hasattr(self, '_robot_callback_count') and 
+                        self._robot_callback_count > 0)
+        parcel_has_data = self.parcel_pose is not None
+        relay_has_data = self.relay_pose is not None
+        
+        print(f"[{self.name}] 初始化数据检查: robot_data={robot_has_data}, parcel_data={parcel_has_data}, relay_data={relay_has_data}")
+        if not robot_has_data or not parcel_has_data:
+            print(f"[{self.name}] ⚠️ 警告: 初始化后缺少关键姿态数据，控制可能延迟启动")
+        
+        # 设置初始化完成标志
+        self.initialization_complete = True
         
         # 启动专用控制线程（替代定时器）
         self.control_thread = threading.Thread(
@@ -1210,11 +1303,23 @@ class PushObject(py_trees.behaviour.Behaviour):
             daemon=True
         )
         self.control_thread.start()
-        print(f"[{self.name}] 专用控制线程已启动 (10Hz)")
+        print(f"[{self.name}] ✅ 专用控制线程已启动 (10Hz)")
+        print(f"[{self.name}] 推送行为初始化完成")
         
     def _control_thread_worker(self):
         """专用控制线程工作函数 - 10Hz 控制循环"""
         control_call_count = 0
+        
+        # 等待初始化完成
+        print(f"[{self.name}] 控制线程启动，等待初始化完成...")
+        while not getattr(self, 'initialization_complete', False) and not self.terminating:
+            time.sleep(0.05)  # 50ms检查间隔
+        
+        if self.terminating:
+            print(f"[{self.name}] 控制线程在初始化完成前被终止")
+            return
+        
+        print(f"[{self.name}] 控制线程开始执行控制循环")
         
         while not self.terminating and self.pushing_active:
             try:
@@ -1226,8 +1331,8 @@ class PushObject(py_trees.behaviour.Behaviour):
                     self.control_loop()
                     execution_time = time.time() - start_time
                     
-                    if execution_time > 0.1:  # 警告如果控制循环超过100ms
-                        print(f"[{self.name}] 警告: 控制循环耗时 {execution_time:.3f}s (> 0.1s)")
+                    if execution_time > 0.15:  # 警告如果控制循环超过150ms (放宽阈值)
+                        print(f"[{self.name}] 警告: 控制循环耗时 {execution_time:.3f}s (> 0.15s)")
                 else:
                     print(f"[{self.name}] 警告: 控制循环跳过 - ROS资源不可用")
                 
@@ -1236,6 +1341,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 
             except Exception as e:
                 print(f"[{self.name}] 错误: 控制线程异常: {e}")
+                traceback.print_exc()
                 # 出错时紧急停止
                 if hasattr(self, 'cmd_vel_pub') and self.cmd_vel_pub:
                     cmd_msg = Twist()
@@ -1276,9 +1382,32 @@ class PushObject(py_trees.behaviour.Behaviour):
                 
         # Additional debug: Check if callbacks are actually being triggered
         print(f"[{self.name}] 📊 回调状态检查:")
-        print(f"   机器人状态: {self.current_state is not None and not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])}")
-        print(f"   包裹姿态: {self.parcel_pose is not None}")
+        print(f"   机器人状态: {self.current_state is not None and not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])} (回调次数: {getattr(self, '_robot_callback_count', 0)})")
+        print(f"   包裹姿态: {self.parcel_pose is not None} (回调次数: {getattr(self, '_parcel_callback_count', 0)})")
         print(f"   中继点姿态: {self.relay_pose is not None}")
+        
+        # Check subscription objects
+        print(f"[{self.name}] 📊 订阅对象状态:")
+        print(f"   robot_pose_sub: {self.robot_pose_sub is not None}")
+        print(f"   parcel_pose_sub: {self.parcel_pose_sub is not None}")
+        print(f"   relay_pose_sub: {self.relay_pose_sub is not None}")
+        print(f"   callback_group: {hasattr(self, 'callback_group') and self.callback_group is not None}")
+        
+        # Force a topic list check to see what topics actually exist
+        try:
+            topic_names_and_types = self.node.get_topic_names_and_types()
+            available_topics = [name for name, _ in topic_names_and_types]
+            print(f"[{self.name}] 📊 系统可用话题数量: {len(available_topics)}")
+            
+            # Check if our expected topics exist
+            for topic in topics:
+                if topic in available_topics:
+                    print(f"   ✅ 话题存在: {topic}")
+                else:
+                    print(f"   ❌ 话题不存在: {topic}")
+                    
+        except Exception as e:
+            print(f"[{self.name}] 警告: 无法检查系统话题列表: {e}")
     
     def publish_pushing_estimated_time(self):
         """Publish the pushing estimated time via ROS topic"""
@@ -1313,12 +1442,15 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.publish_pushing_finished(False)
             self._last_false_publish_time = time.time()
         
-        # DUAL SUCCESS CONDITIONS: Check if either condition is met
+        # TRIPLE SUCCESS CONDITIONS: Check if any condition is met
         # Condition 1: Parcel has reached relay point
         parcel_in_relay_range = self._check_parcel_in_relay_range()
         
         # Condition 2: Robot is close to its target state (distance < 0.03m)
         robot_close_to_target = self._check_robot_close_to_target()
+        
+        # Condition 3: Robot is in relay range (NEW SUCCESS CONDITION)
+        robot_in_relay_range = self._check_robot_in_relay_range()
         
         if parcel_in_relay_range:
             print(f"[{self.name}] SUCCESS: Parcel has reached the relay point")
@@ -1333,6 +1465,13 @@ class PushObject(py_trees.behaviour.Behaviour):
             # Publish pushing_finished = True via ROS topic
             self.publish_pushing_finished(True)
             print(f"[{self.name}] DEBUG: Published pushing_finished = True via ROS topic (robot reached target)")
+            return py_trees.common.Status.SUCCESS
+        elif robot_in_relay_range:
+            print(f"[{self.name}] SUCCESS: Robot is in relay range (distance <= {self.distance_threshold}m)")
+            self.pushing_active = False
+            # Publish pushing_finished = True via ROS topic
+            self.publish_pushing_finished(True)
+            print(f"[{self.name}] DEBUG: Published pushing_finished = True via ROS topic (robot in relay range)")
             return py_trees.common.Status.SUCCESS
         
         # Always return RUNNING if parcel hasn't reached relay point yet
@@ -1647,25 +1786,46 @@ class PushObject(py_trees.behaviour.Behaviour):
 
     def _has_valid_pose_data(self):
         """Check if we have valid pose data for control operations"""
-        # Check robot pose data
+        # Check robot pose data - must exist and have received at least one callback
         robot_data_valid = (self.current_state is not None and 
-                           not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0]))
+                           hasattr(self, '_robot_callback_count') and 
+                           self._robot_callback_count > 0)
         
         # Check parcel pose data (essential for pushing)
         parcel_data_valid = self.parcel_pose is not None
         
-        # Relay data is optional for control (used mainly for success detection)
-        # relay_data_valid = self.relay_pose is not None
+        # Additional validation: if robot position is exactly (0,0,0) and we've only received
+        # 1 callback, wait for more data as it might be initialization artifacts
+        if robot_data_valid and self._robot_callback_count < 3:
+            robot_pos_zero = np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])
+            if robot_pos_zero:
+                print(f"[{self.name}] 调试: 机器人位置为零且回调数少于3次，等待更多数据 (回调: {self._robot_callback_count})")
+                return False
+        
+        # For debugging: log validation details
+        if not robot_data_valid or not parcel_data_valid:
+            robot_status = f"valid(callbacks:{getattr(self, '_robot_callback_count', 0)})" if robot_data_valid else "invalid"
+            parcel_status = "valid" if parcel_data_valid else "invalid"
+            print(f"[{self.name}] 数据验证失败: robot={robot_status}, parcel={parcel_status}")
         
         return robot_data_valid and parcel_data_valid
     
     def _log_pose_data_status(self, context=""):
         """Log the current status of pose data for debugging"""
-        robot_status = "valid" if (self.current_state is not None and not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])) else "missing/zero"
+        if self.current_state is not None:
+            # Check if robot data is valid (non-zero position or sufficient callbacks)
+            robot_has_callbacks = hasattr(self, '_robot_callback_count') and self._robot_callback_count > 0
+            robot_pos_nonzero = not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])
+            robot_status = "valid" if (robot_has_callbacks and (robot_pos_nonzero or self._robot_callback_count >= 3)) else "zero/insufficient"
+        else:
+            robot_status = "missing"
+            
         parcel_status = "valid" if self.parcel_pose is not None else "missing"
         relay_status = "valid" if self.relay_pose is not None else "missing"
         
-        status_msg = f"[robot:{robot_status}, parcel:{parcel_status}, relay:{relay_status}]"
+        callback_info = f"(robot_callbacks:{getattr(self, '_robot_callback_count', 0)})"
+        status_msg = f"[robot:{robot_status}, parcel:{parcel_status}, relay:{relay_status}] {callback_info}"
+        
         if context:
             print(f"[{self.name}] {context}: Pose data status {status_msg}")
         else:

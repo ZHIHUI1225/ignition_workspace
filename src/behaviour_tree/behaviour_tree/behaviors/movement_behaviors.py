@@ -8,7 +8,7 @@ import py_trees
 import rclpy
 import re
 import traceback
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64
@@ -183,8 +183,14 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         if 'node' in kwargs:
             self.node = kwargs['node']
             
-            # 创建回调组支持并行执行
-            self.callback_group = ReentrantCallbackGroup()
+            # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
+            if hasattr(self.node, 'robot_dedicated_callback_group'):
+                self.callback_group = self.node.robot_dedicated_callback_group
+                print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
+            else:
+                # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
+                self.callback_group = MutuallyExclusiveCallbackGroup()
+                print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
             
             # Initialize state variables early to prevent callback race conditions
             self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
@@ -249,10 +255,16 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             
         with self._subscription_lock:
             try:
-                # 从黑板获取当前包裹索引（安全回退）
-                current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+                # 从黑板获取当前包裹索引（安全回退）- 修复blackboard访问
+                try:
+                    current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+                    print(f"[{self.name}] 调试: 从黑板获取包裹索引: {current_parcel_index}")
+                except Exception as bb_error:
+                    # 黑板键不存在时使用默认值
+                    print(f"[{self.name}] 信息: 黑板键尚未就绪，使用默认包裹索引0: {bb_error}")
+                    current_parcel_index = 0
+                
                 self.current_parcel_index = current_parcel_index
-                print(f"[{self.name}] 调试: 从黑板获取包裹索引: {current_parcel_index}")
                 
                 # Mark for safe destruction if exists
                 if self.parcel_pose_sub is not None:
@@ -280,6 +292,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 
             except Exception as e:
                 print(f"[{self.name}] 错误: 包裹订阅设置失败: {e}")
+                traceback.print_exc()
                 self._parcel_sub_destroying = False
                 return False
 
@@ -332,6 +345,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # Early exit if subscription is being destroyed
         if self._robot_sub_destroying:
             return
+        
+        # 🔧 添加回调计数器进行调试
+        if not hasattr(self, '_robot_callback_count'):
+            self._robot_callback_count = 0
+        self._robot_callback_count += 1
+        
+        # 每100次回调打印一次调试信息
+        if self._robot_callback_count % 100 == 1:
+            print(f"[{self.name}][{self.robot_namespace}] 🔄 机器人位姿回调 #{self._robot_callback_count}")
             
         try:
             # Use minimal lock holding time and non-blocking approach
@@ -356,6 +378,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # Early exit if subscription is being destroyed
         if self._parcel_sub_destroying:
             return
+        
+        # 🔧 添加回调计数器进行调试
+        if not hasattr(self, '_parcel_callback_count'):
+            self._parcel_callback_count = 0
+        self._parcel_callback_count += 1
+        
+        # 每50次回调打印一次调试信息
+        if self._parcel_callback_count % 50 == 1:
+            print(f"[{self.name}][{self.robot_namespace}] 🔄 包裹位姿回调 #{self._parcel_callback_count} (parcel{self.current_parcel_index})")
             
         try:
             # Use minimal lock holding time and non-blocking approach
@@ -608,6 +639,8 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 
     def initialise(self):
         """Initialize the behavior when it starts running"""
+        print(f"[{self.name}][{self.robot_namespace}] =================== INITIALISE START ===================")
+        
         # Reset state variables every time behavior launches
         self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
         self.target_state = np.array([0.0, 0.0, 0.0])   # [x, y, theta]
@@ -625,6 +658,11 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.robot_pose = None
         self.parcel_pose = None
         
+        # 🔧 重置回调计数器用于调试
+        self._robot_callback_count = 0
+        self._parcel_callback_count = 0
+        self._debug_counter = 0
+        
         self.feedback_message = f"[{self.robot_namespace}] 初始化接近行为"
         
         # 每次行为开始时设置默认推送预估时间（45秒）
@@ -639,22 +677,124 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             # 停止现有控制线程
             self.stop_control_thread()
             
+            # 🔧 修复：优雅地销毁现有订阅并等待完成
+            print(f"[{self.name}][{self.robot_namespace}] 第一步：清理现有订阅...")
             if self.robot_pose_sub is not None:
-                self.node.destroy_subscription(self.robot_pose_sub)
+                print(f"[{self.name}][{self.robot_namespace}] 销毁现有机器人订阅...")
+                try:
+                    self.node.destroy_subscription(self.robot_pose_sub)
+                    print(f"[{self.name}][{self.robot_namespace}] ✓ 机器人订阅已销毁")
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 销毁机器人订阅时出错: {e}")
                 self.robot_pose_sub = None
+                time.sleep(0.1)  # 等待销毁完成
+                
             if self.parcel_pose_sub is not None:
-                self.node.destroy_subscription(self.parcel_pose_sub)
+                print(f"[{self.name}][{self.robot_namespace}] 销毁现有包裹订阅...")
+                try:
+                    self.node.destroy_subscription(self.parcel_pose_sub)
+                    print(f"[{self.name}][{self.robot_namespace}] ✓ 包裹订阅已销毁")
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 销毁包裹订阅时出错: {e}")
                 self.parcel_pose_sub = None
-        
+                time.sleep(0.1)  # 等待销毁完成
+            
+            # 🔧 修复：验证订阅设置成功
+            print(f"[{self.name}][{self.robot_namespace}] 第二步：创建新订阅...")
             success_robot = self.setup_robot_subscription()
             success_parcel = self.setup_parcel_subscription()
             
+            print(f"[{self.name}][{self.robot_namespace}] 订阅创建结果: robot={success_robot}, parcel={success_parcel}")
+            
+            if not success_robot:
+                print(f"[{self.name}][{self.robot_namespace}] ❌ 机器人订阅设置失败")
+            if not success_parcel:
+                print(f"[{self.name}][{self.robot_namespace}] ❌ 包裹订阅设置失败")
+            
+            # 🔧 修复：给ROS更多时间建立订阅连接
+            print(f"[{self.name}][{self.robot_namespace}] 第三步：等待订阅建立连接...")
+            time.sleep(0.8)  # 增加到800ms让订阅完全建立
+            
+            # 🔧 新增：验证话题连通性
+            self.verify_topic_connectivity()
+            
+            # 🔧 新增：再次等待数据开始到达
+            print(f"[{self.name}][{self.robot_namespace}] 第四步：等待数据开始到达...")
+            time.sleep(0.5)  # 再等待500ms让数据开始流动
+            
+            # 🔧 新增：检查初始数据状态
+            robot_has_data = self.robot_pose is not None
+            parcel_has_data = self.parcel_pose is not None
+            print(f"[{self.name}][{self.robot_namespace}] 初始数据检查: robot_data={robot_has_data}, parcel_data={parcel_has_data}")
+            
         # 启动专用控制线程而不是ROS定时器
-        print(f"[{self.name}][{self.robot_namespace}] 启动专用10Hz控制线程...")
+        print(f"[{self.name}][{self.robot_namespace}] 第五步：启动专用10Hz控制线程...")
         self.start_control_thread()
         
-        # 给ROS一点时间建立订阅再开始
-        print(f"[{self.name}][{self.robot_namespace}] 调试: 允许时间建立ROS订阅...")
+        print(f"[{self.name}][{self.robot_namespace}] =================== INITIALISE COMPLETE ===================")
+        print(f"[{self.name}][{self.robot_namespace}] 初始化完成，开始等待话题数据...")
+    
+    def verify_topic_connectivity(self):
+        """验证话题连通性和发布者状态"""
+        if not self.node:
+            return
+            
+        robot_topic = f'/turtlebot{self.namespace_number}/odom_map'
+        parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+        
+        print(f"[{self.name}][{self.robot_namespace}] 🔍 话题连通性验证:")
+        
+        try:
+            # 检查话题是否存在
+            topic_names_and_types = self.node.get_topic_names_and_types()
+            available_topics = [name for name, _ in topic_names_and_types]
+            
+            robot_topic_exists = robot_topic in available_topics
+            parcel_topic_exists = parcel_topic in available_topics
+            
+            print(f"   • 机器人话题存在: {robot_topic_exists} ({robot_topic})")
+            print(f"   • 包裹话题存在: {parcel_topic_exists} ({parcel_topic})")
+            
+            # 检查发布者数量
+            robot_pub_count = self.node.count_publishers(robot_topic)
+            parcel_pub_count = self.node.count_publishers(parcel_topic)
+            
+            print(f"   • 机器人话题发布者: {robot_pub_count}")
+            print(f"   • 包裹话题发布者: {parcel_pub_count}")
+            
+            # 检查订阅者数量
+            robot_sub_count = self.node.count_subscribers(robot_topic)
+            parcel_sub_count = self.node.count_subscribers(parcel_topic)
+            
+            print(f"   • 机器人话题订阅者: {robot_sub_count}")
+            print(f"   • 包裹话题订阅者: {parcel_sub_count}")
+            
+            # 检查订阅对象状态
+            print(f"   • 机器人订阅对象: {self.robot_pose_sub is not None}")
+            print(f"   • 包裹订阅对象: {self.parcel_pose_sub is not None}")
+            
+            # 诊断问题
+            if not robot_topic_exists:
+                print(f"   ❌ 机器人话题不存在！检查Gazebo仿真和机器人spawning")
+            elif robot_pub_count == 0:
+                print(f"   ⚠️ 机器人话题无发布者！检查机器人节点是否运行")
+            elif robot_sub_count == 0:
+                print(f"   ⚠️ 机器人话题无订阅者！检查订阅创建是否成功")
+            else:
+                print(f"   ✅ 机器人话题连通性正常")
+                
+            if not parcel_topic_exists:
+                print(f"   ❌ 包裹话题不存在！检查包裹spawning")
+            elif parcel_pub_count == 0:
+                print(f"   ⚠️ 包裹话题无发布者！检查包裹pose发布节点")
+            elif parcel_sub_count == 0:
+                print(f"   ⚠️ 包裹话题无订阅者！检查订阅创建是否成功")
+            else:
+                print(f"   ✅ 包裹话题连通性正常")
+                
+        except Exception as e:
+            print(f"   ❌ 话题连通性检查失败: {e}")
+            traceback.print_exc()
 
     def update(self):
         """Main update method - behavior tree logic only, control runs via timer"""
@@ -690,16 +830,49 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 self._debug_counter = 0
             self._debug_counter += 1
             
-            # Print debug info every 50 update cycles (about every 5 seconds)
+            # Print debug info every 50 update cycles (about every 5 seconds at 10Hz BT tick)
             if self._debug_counter % 50 == 1:
                 robot_topic = f'/turtlebot{self.namespace_number}/odom_map'
                 parcel_topic = f'/parcel{self.current_parcel_index}/pose'
-                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Still waiting for pose data after {self._debug_counter} update cycles")
-                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Robot subscription: {self.robot_pose_sub is not None} (topic: {robot_topic})")
-                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Parcel subscription: {self.parcel_pose_sub is not None} (topic: {parcel_topic})")
-                print(f"[{self.name}][{self.robot_namespace}] DEBUG: Robot pose received: {robot_pose_available}, Parcel pose received: {parcel_pose_available}")
+                
+                print(f"[{self.name}][{self.robot_namespace}] 🔍 话题数据诊断 (周期 #{self._debug_counter}):")
+                print(f"   • 机器人订阅状态: {self.robot_pose_sub is not None} (话题: {robot_topic})")
+                print(f"   • 包裹订阅状态: {self.parcel_pose_sub is not None} (话题: {parcel_topic})")
+                print(f"   • 机器人位姿接收: {robot_pose_available}")
+                print(f"   • 包裹位姿接收: {parcel_pose_available}")
+                print(f"   • 当前包裹索引: {self.current_parcel_index}")
+                print(f"   • 机器人回调计数: {getattr(self, '_robot_callback_count', 0)}")
+                print(f"   • 包裹回调计数: {getattr(self, '_parcel_callback_count', 0)}")
+                
+                # 🔧 添加订阅对象调试信息
+                if self.robot_pose_sub:
+                    print(f"   • 机器人订阅对象ID: {id(self.robot_pose_sub)}")
+                if self.parcel_pose_sub:
+                    print(f"   • 包裹订阅对象ID: {id(self.parcel_pose_sub)}")
+                    
+                # 🔧 检查话题是否有发布者
+                if hasattr(self.node, 'count_publishers'):
+                    robot_pub_count = self.node.count_publishers(robot_topic)
+                    parcel_pub_count = self.node.count_publishers(parcel_topic)
+                    print(f"   • 机器人话题发布者数量: {robot_pub_count}")
+                    print(f"   • 包裹话题发布者数量: {parcel_pub_count}")
+                    
+                    # 🔧 新增：如果订阅存在但没有数据，尝试重新创建订阅
+                    if self._debug_counter >= 100 and (robot_pub_count > 0 or parcel_pub_count > 0):
+                        print(f"   🔧 检测到数据缺失但话题有发布者，尝试重新创建订阅...")
+                        
+                        if not robot_pose_available and robot_pub_count > 0:
+                            print(f"   🔧 重新创建机器人订阅...")
+                            self.setup_robot_subscription()
+                            
+                        if not parcel_pose_available and parcel_pub_count > 0:
+                            print(f"   🔧 重新创建包裹订阅...")
+                            self.setup_parcel_subscription()
+                            
+                        # 重置计数器避免频繁重试
+                        self._debug_counter = 50
             
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for pose data... (robot: {robot_pose_available}, parcel: {parcel_pose_available})"
+            self.feedback_message = f"[{self.robot_namespace}] 等待话题数据... (机器人: {robot_pose_available}, 包裹: {parcel_pose_available}, 周期: {getattr(self, '_debug_counter', 0)})"
             return py_trees.common.Status.RUNNING
 
         target_state, distance_to_target_state = self.calculate_target_state()

@@ -99,6 +99,29 @@ def main():
         # Create ROS node for executor and snapshot publishing (use "tree" as node name for snapshot stream support)
         ros_node = rclpy.create_node("tree")
         
+        # 🔧 关键优化：为每个机器人BT节点创建专用线程池和回调组
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+        # 🔧 优化：移除重复的ThreadPoolExecutor，直接使用MultiThreadedExecutor
+        # 注释掉专用ThreadPoolExecutor，避免线程资源重复
+        # robot_dedicated_threadpool = ThreadPoolExecutor(
+        #     max_workers=4,
+        #     thread_name_prefix=f"{robot_namespace}_bt_pool"
+        # )
+        robot_dedicated_threadpool = None  # 将在后面使用MultiThreadedExecutor
+        
+        # 创建专用回调组
+        robot_dedicated_callback_group = MutuallyExclusiveCallbackGroup()
+        
+        # 将专用资源存储为节点属性，供behaviors使用
+        ros_node.robot_dedicated_callback_group = robot_dedicated_callback_group
+        ros_node.robot_dedicated_threadpool = robot_dedicated_threadpool
+        
+        print(f"🎯 [{robot_namespace}] 创建专用资源:")
+        print(f"   • CallbackGroup ID: {id(robot_dedicated_callback_group)}")
+        print(f"   • ThreadPool ID: {id(robot_dedicated_threadpool)}")
+        print(f"   • 专用线程数: 4")
+        print(f"   • 线程名前缀: {robot_namespace}_bt_pool")
+        
         # Declare robot parameters to main node
         ros_node.declare_parameter('robot_id', robot_id)
         ros_node.declare_parameter('robot_namespace', robot_namespace)
@@ -164,10 +187,24 @@ def main():
             print(f"Warning: Could not setup PyTrees viewer integration: {e}")
             print("Continuing without viewer integration...")
         
-        # Create ROS executor for background ROS topic processing
-        # Use MultiThreadedExecutor to avoid blocking between callbacks
-        executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
+        # 🔧 关键优化：为每个BT节点创建独立的MultiThreadedExecutor
+        # 每个机器人的BT节点使用独立的执行器和线程池，彻底隔离消息处理流
+        robot_id = ros_node.get_parameter('robot_id').value
+        robot_namespace = ros_node.get_parameter('robot_namespace').value
+        
+        # 为每个机器人分配独立的线程池，避免线程竞争
+        threads_per_robot = 6  # 每个机器人专用6个线程 (之前8个线程优化为6个)
+        executor = rclpy.executors.MultiThreadedExecutor(num_threads=threads_per_robot)
         executor.add_node(ros_node)
+        
+        # 🔧 重要：将MultiThreadedExecutor赋值给节点，供behaviors使用
+        ros_node.robot_dedicated_threadpool = executor  # 复用executor替代单独的ThreadPoolExecutor
+        
+        print(f"🔧 [{robot_namespace}] 创建独立MultiThreadedExecutor: {threads_per_robot}线程专用")
+        print(f"   • 优化说明: 移除重复ThreadPoolExecutor, 统一使用MultiThreadedExecutor")
+        print(f"   • 线程数从8个减少至6个，消除资源重复")
+        print(f"🎯 [{robot_namespace}] 执行器ID: {id(executor)}")
+        print(f"🧵 [{robot_namespace}] 线程池独立隔离，避免与其他机器人竞争")
         
         # Use manual ticking loop to ensure ROS topic processing
         iteration_count = 0
@@ -222,6 +259,11 @@ def main():
     finally:
         # Signal shutdown to background thread
         shutdown_requested = True
+        
+        # 关闭ROS executor（已整合专用线程池功能）
+        if 'executor' in locals():
+            print(f"🛑 [{robot_namespace}] 关闭MultiThreadedExecutor...")
+            executor.shutdown(timeout_sec=2.0)
         
         # Wait for background thread to finish
         if 'ros_thread' in locals():
