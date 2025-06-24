@@ -75,17 +75,17 @@ def generate_launch_description():
                 ]
             )
         ])
-        
-        # Add with timer delay for sequential startup (2 seconds apart)
-        if i == 0:
-            # First robot starts immediately
-            ld.add_action(robot_group)
-        else:
-            # Subsequent robots start with delay
-            ld.add_action(TimerAction(
-                period=float(i * 2.0),  # 2 second delays between robots
-                actions=[robot_group]
-            ))
+        ld.add_action(robot_group)
+        # # Add with timer delay for sequential startup (2 seconds apart)
+        # if i == 0:
+        #     # First robot starts immediately
+        #     ld.add_action(robot_group)
+        # else:
+        #     # Subsequent robots start with delay
+        #     ld.add_action(TimerAction(
+        #         period=float(i * 2.0),  # 2 second delays between robots
+        #         actions=[robot_group]
+        #     ))
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',

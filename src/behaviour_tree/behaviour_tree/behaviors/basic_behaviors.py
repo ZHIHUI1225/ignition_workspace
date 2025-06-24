@@ -18,6 +18,7 @@ import threading
 import tf_transformations
 from scipy.interpolate import CubicSpline
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Int32, Float64, Bool
@@ -51,6 +52,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         # ROS2 components (will be initialized in setup)
         self.node = None
+        self.callback_group = None  # Add callback group for thread isolation
         self.robot_pose_sub = None
         self.relay_pose_sub = None
         self.parcel_pose_sub = None
@@ -133,20 +135,21 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             10
         )
         
-        # Subscriber for previous robot's pushing_finished status
+        # Subscriber for previous robot's pushing_finished status with callback group
         previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
         if previous_robot_namespace:
             self.pushing_finished_sub = self.node.create_subscription(
                 Bool,
                 f'/{previous_robot_namespace}/pushing_finished',
                 self.previous_robot_pushing_finished_callback,
-                10
+                10,
+                callback_group=self.callback_group
             )
-            print(f"[{self.name}] DEBUG: Subscribed to {previous_robot_namespace}/pushing_finished topic")
+            print(f"[{self.name}] DEBUG: Subscribed to {previous_robot_namespace}/pushing_finished topic with callback group")
         
         # Publish initial values
         self.publish_pushing_estimated_time()
-        print(f"[{self.name}] DEBUG: Setup pushing coordination topics")
+        print(f"[{self.name}] DEBUG: Setup pushing coordination topics with callback group")
     
     def publish_pushing_estimated_time(self):
         """Publish the pushing estimated time via ROS topic"""
@@ -157,31 +160,34 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] DEBUG: Published pushing_estimated_time = {self.pushing_estimated_time}s")
     
     def setup_subscriptions(self):
-        """Setup ROS2 subscriptions"""
-        # Robot pose subscription
+        """Setup ROS2 subscriptions with callback group for thread isolation"""
+        # Robot pose subscription - 使用专属线程池处理
         self.robot_pose_sub = self.node.create_subscription(
             Odometry,
             f'/turtlebot{self.namespace_number}/odom_map',
-            self.robot_pose_callback,
-            10
+            lambda msg: self.handle_callback_in_dedicated_pool(msg, 'robot_pose'),
+            10,
+            callback_group=self.callback_group
         )
         
-        # Relay point pose subscription
+        # Relay point pose subscription - 使用专属线程池处理
         self.relay_pose_sub = self.node.create_subscription(
             PoseStamped,
             f'/Relaypoint{self.relay_number}/pose',
-            self.relay_pose_callback,
-            10
+            lambda msg: self.handle_callback_in_dedicated_pool(msg, 'relay_pose'),
+            10,
+            callback_group=self.callback_group
         )
         
-        # Last robot pose subscription (only for non-turtlebot0 robots)
+        # Last robot pose subscription (only for non-turtlebot0 robots) - 使用专属线程池处理
         self.last_robot_pose_sub = None
         if not self.is_first_robot and self.last_robot_number is not None:
             self.last_robot_pose_sub = self.node.create_subscription(
                 Odometry,
                 f'/turtlebot{self.last_robot_number}/odom_map',
-                self.last_robot_pose_callback,
-                10
+                lambda msg: self.handle_callback_in_dedicated_pool(msg, 'last_robot_pose'),
+                10,
+                callback_group=self.callback_group
             )
         
         # Setup pushing coordination topics
@@ -189,6 +195,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         # Initialize parcel subscription as None - will be set up in initialise() when blackboard is ready
         self.parcel_pose_sub = None
+        print(f"[{self.name}] DEBUG: Subscriptions created with dedicated threadpool for {self.robot_namespace}")
         print(f"[{self.name}] DEBUG: Parcel subscription will be created in initialise() when blackboard is ready")
     
     def robot_pose_callback(self, msg):
@@ -232,15 +239,16 @@ class WaitForPush(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.parcel_pose_sub)
                 print(f"[{self.name}] DEBUG: Destroyed existing parcel subscription")
                 
-            # Create new parcel subscription
+            # Create new parcel subscription with dedicated threadpool for thread isolation
             parcel_topic = f'/parcel{current_parcel_index}/pose'
             self.parcel_pose_sub = self.node.create_subscription(
                 PoseStamped,
                 parcel_topic,
-                self.parcel_pose_callback,
-                10
+                lambda msg: self.handle_callback_in_dedicated_pool(msg, 'parcel_pose'),
+                10,
+                callback_group=self.callback_group
             )
-            print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic}")
+            print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic} with dedicated threadpool")
             return True
             
         except Exception as e:
@@ -407,11 +415,48 @@ class WaitForPush(py_trees.behaviour.Behaviour):
                 rclpy.init()
             self.node = rclpy.create_node(f'wait_push_{self.robot_namespace}')
         
+        # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
+        if hasattr(self.node, 'robot_dedicated_callback_group'):
+            self.callback_group = self.node.robot_dedicated_callback_group
+            print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
+        else:
+            # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
+            self.callback_group = MutuallyExclusiveCallbackGroup()
+            print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
+        
         # Setup ROS subscriptions now that we have a node
         self.setup_subscriptions()
         
         # Call parent setup
         return super().setup(**kwargs)
+    
+    def handle_callback_in_dedicated_pool(self, msg, callback_type):
+        """
+        优化版本：直接处理回调，利用MutuallyExclusiveCallbackGroup实现隔离
+        移除了重复的ThreadPoolExecutor, 减少线程资源消耗
+        """
+        # 直接在专属CallbackGroup的线程中处理，无需额外线程池
+        return self._execute_callback_in_pool(msg, callback_type)
+    
+    def _execute_callback_in_pool(self, msg, callback_type):
+        """
+        在专属线程池中执行实际的回调处理逻辑
+        """
+        try:
+            if callback_type == 'robot_pose':
+                self.robot_pose_callback(msg)
+            elif callback_type == 'relay_pose':
+                self.relay_pose_callback(msg)
+            elif callback_type == 'last_robot_pose':
+                self.last_robot_pose_callback(msg)
+            elif callback_type == 'parcel_pose':
+                self.parcel_pose_callback(msg)
+            else:
+                print(f"[{self.name}] WARNING: Unknown callback type: {callback_type}")
+        except Exception as e:
+            print(f"[{self.name}] ERROR in dedicated pool callback: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class WaitForPick(py_trees.behaviour.Behaviour):
@@ -731,6 +776,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         
         # ROS2 components (will be initialized in setup)
         self.ros_node = None
+        self.callback_group = None  # Will be initialized in setup
         self.robot_pose_sub = None
         self.parcel_pose_sub = None
         self.current_index_sub = None
@@ -767,25 +813,34 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 
                 self.ros_node = ApproachObjectNode()
             
+            # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
+            if hasattr(self.ros_node, 'robot_dedicated_callback_group'):
+                self.callback_group = self.ros_node.robot_dedicated_callback_group
+                print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
+            else:
+                # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
+                self.callback_group = MutuallyExclusiveCallbackGroup()
+                print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
+            
             # Create command velocity publisher
             self.cmd_vel_pub = self.ros_node.create_publisher(
                 Twist, f'/{self.robot_namespace}/cmd_vel', 10)
             
-            # Subscribe to robot pose (Odometry)
+            # Subscribe to robot pose (Odometry) with callback group
             self.robot_pose_sub = self.ros_node.create_subscription(
                 Odometry, f'/turtlebot{self.namespace_number}/odom_map',
-                self.robot_pose_callback, 10)
+                self.robot_pose_callback, 10, callback_group=self.callback_group)
             
-            # Subscribe to current parcel index
+            # Subscribe to current parcel index with callback group
             self.current_index_sub = self.ros_node.create_subscription(
                 Int32, f'/{self.robot_namespace}/current_parcel_index',
-                self.current_index_callback, 10)
+                self.current_index_callback, 10, callback_group=self.callback_group)
             
             # Initial parcel subscription (will be updated based on current index)
             self.update_parcel_subscription()
             
             self.ros_node.get_logger().info(
-                f'ApproachObject setup complete for {self.robot_namespace}')
+                f'ApproachObject setup complete for {self.robot_namespace} with callback group')
             return True
             
         except Exception as e:
@@ -801,12 +856,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         if self.parcel_pose_sub is not None:
             self.ros_node.destroy_subscription(self.parcel_pose_sub)
         
-        # Subscribe to current parcel topic
+        # Subscribe to current parcel topic with callback group
         parcel_topic = f'/parcel{self.current_parcel_index}/pose'
         self.parcel_pose_sub = self.ros_node.create_subscription(
-            PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+            PoseStamped, parcel_topic, self.parcel_pose_callback, 10,
+            callback_group=self.callback_group)
         
-        self.ros_node.get_logger().info(f'Updated parcel subscription to: {parcel_topic}')
+        self.ros_node.get_logger().info(f'Updated parcel subscription to: {parcel_topic} with callback group')
 
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates (Odometry message)"""
@@ -1231,6 +1287,22 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         is_out_of_range = distance > self.distance_threshold
         return is_out_of_range
     
+    def initialise(self):
+        """Initialize the behavior when it starts - ensure parcel subscription is up to date"""
+        print(f"[{self.name}] 初始化CheckPairComplete行为...")
+        
+        # 🔧 关键修复：确保在行为开始时正确设置parcel订阅
+        self.update_parcel_subscription()
+        
+        # 重置位姿数据，强制等待新的数据
+        with self.lock:
+            self.robot_pose = None
+            self.relay_pose = None  
+            self.parcel_pose = None
+            
+        print(f"[{self.name}] 当前包裹索引: {self.current_parcel_index}")
+        print(f"[{self.name}] 等待位姿数据...")
+
     def update(self):
         # Update parcel subscription from blackboard
         self.update_parcel_subscription()
@@ -1244,6 +1316,19 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
             robot_dist = self.calculate_distance(self.robot_pose, self.relay_pose) if self.robot_pose and self.relay_pose else float('inf')
             parcel_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
             
+            # 🔍 详细诊断parcel_dist为inf的原因
+            parcel_status = "OK"
+            if self.parcel_pose is None:
+                parcel_status = f"parcel_pose=None (订阅话题: /parcel{self.current_parcel_index}/pose)"
+            elif self.relay_pose is None:
+                parcel_status = f"relay_pose=None (订阅话题: /Relaypoint{self.relay_number}/pose)"
+            
+            if parcel_dist == float('inf'):
+                print(f"[{self.name}] ⚠️  Parcel距离为inf的原因: {parcel_status}")
+                print(f"[{self.name}] 🔍 当前包裹索引: {self.current_parcel_index}")
+                print(f"[{self.name}] 🔍 包裹订阅状态: {self.parcel_pose_sub is not None}")
+                print(f"[{self.name}] 🔍 中继点订阅状态: {self.relay_pose_sub is not None}")
+            
             print(f"[{self.name}] Robot dist: {robot_dist:.2f}, Parcel dist: {parcel_dist:.2f}, Threshold: {self.distance_threshold}")
             print(f"[{self.name}] Robot out: {robot_out}, Parcel out: {parcel_out}")
             
@@ -1252,6 +1337,22 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
                 return py_trees.common.Status.SUCCESS
             else:
                 return py_trees.common.Status.RUNNING
+
+    def initialise(self):
+        """Initialize the behavior when it starts - ensure parcel subscription is up to date"""
+        print(f"[{self.name}] 初始化CheckPairComplete行为...")
+        
+        # 🔧 关键修复：确保在行为开始时正确设置parcel订阅
+        self.update_parcel_subscription()
+        
+        # 重置位姿数据，强制等待新的数据
+        with self.lock:
+            self.robot_pose = None
+            self.relay_pose = None  
+            self.parcel_pose = None
+            
+        print(f"[{self.name}] 当前包裹索引: {self.current_parcel_index}")
+        print(f"[{self.name}] 等待位姿数据...")
 
 
 class IncrementIndex(py_trees.behaviour.Behaviour):
