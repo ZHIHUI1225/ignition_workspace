@@ -96,8 +96,10 @@ def main():
         # Destroy temporary node
         temp_node.destroy_node()
         
-        # Create ROS node for executor and snapshot publishing (use "tree" as node name for snapshot stream support)
-        ros_node = rclpy.create_node("tree")
+        # Create ROS node for executor and snapshot publishing 
+        # 🔧 关键修复：为每个机器人创建唯一的节点名称避免冲突
+        unique_node_name = f"tree_{robot_id}"
+        ros_node = rclpy.create_node(unique_node_name)
         
         # 🔧 关键优化：为每个机器人BT节点创建专用线程池和回调组
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup

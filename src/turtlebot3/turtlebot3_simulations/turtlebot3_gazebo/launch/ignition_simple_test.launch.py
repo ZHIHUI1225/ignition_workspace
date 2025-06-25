@@ -278,7 +278,8 @@ def generate_launch_description():
         name='parameter_bridge',
         output='screen',
         parameters=[{
-            'config_file': config_file
+            'config_file': config_file,
+            'frequency': 20.0  # Set parcel pose publishing frequency to 10 Hz
         }]
     )
     ld.add_action(bridge_node)
