@@ -31,8 +31,17 @@ class TurtlebotPose(Node):
             Odometry,
             f'/{ns}/odom_map',
             10)
+        
+        # Declare parameter for publish frequency (Hz)
+        self.declare_parameter('publish_frequency', 20.0)  # Default 20 Hz
+        publish_freq = self.get_parameter('publish_frequency').get_parameter_value().double_value
+        
+        # Calculate timer period from frequency
+        timer_period = 1.0 / publish_freq
+        self.get_logger().info(f'Publishing pose at {publish_freq} Hz (period: {timer_period:.3f}s)')
+        
         # Timer to calculate and publish pose periodically
-        self.timer = self.create_timer(0.05, self.calculate_and_publish_pose)
+        self.timer = self.create_timer(timer_period, self.calculate_and_publish_pose)
 
     def odom_callback(self, msg: Odometry):
         """Stores the latest odometry message."""

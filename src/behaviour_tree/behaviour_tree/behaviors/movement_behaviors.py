@@ -20,11 +20,24 @@ import numpy as np
 
 
 class MobileRobotMPC:
-    """MPC controller for robot approach - now using proportional control for better performance"""
+    """MPC controller for robot approach - now using PI control for better performance"""
     def __init__(self):
         # Control constraints - these are the only parameters actually used
         self.vx_max = 0.05   # m/s max velocity in x direction
         self.vy_max = 0.05   # m/s max velocity in y direction
+        
+        # PI controller parameters for PHASE 1
+        self.kp = 0.8        # Proportional gain
+        self.ki = 0.2        # Integral gain
+        self.dt = 0.1        # Control timestep (10Hz)
+        
+        # PI controller state variables
+        self.error_integral = np.array([0.0, 0.0])  # Integral of position error [x, y]
+        self.last_error = np.array([0.0, 0.0])      # Previous error for derivative (if needed later)
+        self.max_integral = 0.5  # Anti-windup limit for integral term
+        
+        # Reset flag to clear integral on new approach
+        self.reset_pi_state = True
         
     def update_control(self, current_state, target_state, position_achieved=False):
         # SEQUENTIAL APPROACH: Position first, then orientation
@@ -32,39 +45,102 @@ class MobileRobotMPC:
         dist_to_target = np.sqrt((current_state[0] - target_state[0])**2 + (current_state[1] - target_state[1])**2)
         angle_diff = abs((current_state[2] - target_state[2] + np.pi) % (2 * np.pi) - np.pi)
 
-        # PHASE 1: Position control (with smooth deceleration)
+        # PHASE 1: Position control with PI controller
         if not position_achieved and dist_to_target >= 0.015:
-            # Use fast proportional control instead of MPC for better performance
-            # This avoids the 0.8s MPC computation time issue
+            # Reset PI state on new approach or significant target change
+            if self.reset_pi_state:
+                self.error_integral = np.array([0.0, 0.0])
+                self.last_error = np.array([0.0, 0.0])
+                self.reset_pi_state = False
+                self._last_target = target_state.copy()  # Store target for change detection
+                print(f"[MobileRobotMPC] PI controller state reset (distance: {dist_to_target:.3f}m)")
+            elif hasattr(self, '_last_target'):
+                # Check if target has changed significantly
+                target_change = np.linalg.norm(target_state[:2] - self._last_target[:2])
+                if target_change > 0.1:  # 10cm target change threshold
+                    self.error_integral = np.array([0.0, 0.0])
+                    self.last_error = np.array([0.0, 0.0])
+                    self._last_target = target_state.copy()
+                    print(f"[MobileRobotMPC] PI controller reset due to target change: {target_change:.3f}m")
+            
+            # Calculate position error in global frame
             current_pos = np.array([current_state[0], current_state[1]])
             target_pos = np.array([target_state[0], target_state[1]])
-            error = target_pos - current_pos
+            error_global = target_pos - current_pos
             
-            # Proportional control with distance-based gain scaling
-            base_gain = 0.8
+            # Transform error to robot body frame
+            robot_theta = current_state[2]
+            cos_theta = np.cos(robot_theta)
+            sin_theta = np.sin(robot_theta)
+            
+            # Rotation matrix from global to robot body frame
+            # [x_robot]   [cos(θ)  sin(θ)] [x_global]
+            # [y_robot] = [-sin(θ) cos(θ)] [y_global]
+            error_body = np.array([
+                error_global[0] * cos_theta + error_global[1] * sin_theta,    # forward/backward error
+                -error_global[0] * sin_theta + error_global[1] * cos_theta   # left/right error
+            ])
+            
+            # Update integral term with anti-windup (in body frame)
+            self.error_integral += error_body * self.dt
+            # Apply anti-windup: clamp integral to prevent excessive buildup
+            self.error_integral = np.clip(self.error_integral, -self.max_integral, self.max_integral)
+            
+            # PI control calculation in body frame
+            proportional_term = self.kp * error_body
+            integral_term = self.ki * self.error_integral
+            
+            # Distance-based gain scaling for smooth approach
             distance_scale = min(1.0, dist_to_target / 0.08)  # Scale down as we get closer
-            gain = base_gain * distance_scale
             
-            cmd_vel_2d = gain * error
-            cmd_vel_2d[0] = np.clip(cmd_vel_2d[0], -0.06, 0.06)  # vx_max constraint
-            cmd_vel_2d[1] = np.clip(cmd_vel_2d[1], -0.06, 0.06)  # vy_max constraint
-            
-            # Convert 2D velocity command to [linear_x, angular_z] format
-            vx_global = cmd_vel_2d[0]
-            vy_global = cmd_vel_2d[1]
-            theta = current_state[2]
-            vx_robot = vx_global * np.cos(theta) + vy_global * np.sin(theta)
-            vy_robot = -vx_global * np.sin(theta) + vy_global * np.cos(theta)
+            # Combine PI terms with distance scaling (in body frame)
+            cmd_vel_body = (proportional_term + integral_term) * distance_scale
+            cmd_vel_body[0] = np.clip(cmd_vel_body[0], -0.1, 0.1)  # forward/backward constraint
+            cmd_vel_body[1] = np.clip(cmd_vel_body[1], -0.1, 0.1)  # left/right constraint
             
             # Apply speed scaling for smooth deceleration
             speed_scale = min(1.0, dist_to_target / 0.08)  # Slow down within 8cm
-            linear_vel = vx_robot * speed_scale
-            angular_vel = (vy_robot / 0.18) * speed_scale  # Larger divisor for gentler turns
+            
+            # ROBOT BODY FRAME CONTROL: velocities in robot's local coordinate system
+            linear_x_vel = cmd_vel_body[0] * speed_scale  # Forward/backward
+            linear_y_vel = cmd_vel_body[1] * speed_scale  # Left/right
             
             # Clamp speeds for stability
-            linear_vel = np.clip(linear_vel, -0.06, 0.06)
-            angular_vel = np.clip(angular_vel, -0.15, 0.15)
-            return np.array([linear_vel, angular_vel])
+            linear_x_vel = np.clip(linear_x_vel, -0.08, 0.08)
+            linear_y_vel = np.clip(linear_y_vel, -0.08, 0.08)
+            
+            # For orientation control, align robot with target direction
+            if dist_to_target > 0.02:  # Only adjust orientation when moving
+                # Calculate desired heading toward target
+                target_heading = np.arctan2(error_global[1], error_global[0])
+                angular_error = target_heading - current_state[2]
+                # Normalize angle difference
+                while angular_error > np.pi:
+                    angular_error -= 2 * np.pi
+                while angular_error < -np.pi:
+                    angular_error += 2 * np.pi
+                angular_vel = 0.3 * angular_error  # Gentle orientation adjustment
+                angular_vel = np.clip(angular_vel, -0.4, 0.4)
+            else:
+                angular_vel = 0.0
+            
+            # Store current error for next iteration
+            self.last_error = error_body.copy()
+            
+            # Debug output (reduced frequency for performance - only when there are issues)
+            if not hasattr(self, '_pi_debug_counter'):
+                self._pi_debug_counter = 0
+            self._pi_debug_counter += 1
+            # Only print when there are control issues or every 100th iteration (every 10 seconds at 10Hz)
+            should_debug = (self._pi_debug_counter % 100 == 1 or 
+                          dist_to_target > 0.08 or  # Large distance error
+                          abs(angular_error) > 0.3)  # Large angular error
+            if should_debug:
+                print(f"[MobileRobotMPC] PI Control - Error (body frame): [{error_body[0]:.3f}, {error_body[1]:.3f}], "
+                      f"Integral: [{self.error_integral[0]:.3f}, {self.error_integral[1]:.3f}], "
+                      f"Output: [linear.x={linear_x_vel:.3f}, linear.y={linear_y_vel:.3f}, ω={angular_vel:.3f}], Distance: {dist_to_target:.3f}m")
+            
+            return np.array([linear_x_vel, linear_y_vel, angular_vel])
             
         # PHASE 2: Orientation alignment (after position achieved)
         elif position_achieved:
@@ -76,10 +152,28 @@ class MobileRobotMPC:
             # Proportional rotation control with increased speed for faster orientation
             angular_vel = 0.6 * angular_error  # Increased gain for faster response
             angular_vel = np.clip(angular_vel, -0.4, 0.4)  # Higher max angular velocity
-            return np.array([0.0, angular_vel])
+            return np.array([0.0, 0.0, angular_vel])  # No linear movement during orientation
+        
         # Fallback: stop if in between phases
         else:
-            return np.array([0.0, 0.0])
+            return np.array([0.0, 0.0, 0.0])  # Full stop
+    
+    def reset_pi_controller(self):
+        """Reset PI controller state - call when starting a new approach"""
+        self.error_integral = np.array([0.0, 0.0])
+        self.last_error = np.array([0.0, 0.0])
+        self.reset_pi_state = True
+        print(f"[MobileRobotMPC] PI controller state manually reset")
+        
+    def get_pi_state_info(self):
+        """Get current PI controller state for debugging"""
+        return {
+            'error_integral': self.error_integral.copy(),
+            'last_error': self.last_error.copy(),
+            'kp': self.kp,
+            'ki': self.ki,
+            'max_integral': self.max_integral
+        }
 
 
 class ApproachObject(py_trees.behaviour.Behaviour):
@@ -157,12 +251,12 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.0
                 self.cmd_vel_pub.publish(cmd)
-                # Debug output for stop commands
+                # Debug output for stop commands - only occasionally
                 if not hasattr(self, '_stop_debug_counter'):
                     self._stop_debug_counter = 0
                 self._stop_debug_counter += 1
-                # Print every 20th stop command to avoid spam
-                if self._stop_debug_counter % 20 == 1:
+                # Only print every 100th stop command to avoid spam
+                if self._stop_debug_counter % 100 == 1:
                     print(f"[{self.name}][{self.robot_namespace}] 发布停止命令 #{self._stop_debug_counter}: 线速度=0.0, 角速度=0.0")
         except Exception as e:
             print(f"[{self.name}][{self.robot_namespace}] 警告: 停止机器人时出错: {e}")
@@ -541,8 +635,8 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             angle_diff = abs((self.current_state[2] - self.target_state[2] + np.pi) % (2 * np.pi) - np.pi)
             
             # Update control flags
-            position_threshold = 0.04  # 2cm for position
-            orientation_threshold = 0.03  # ~3 degrees for orientation
+            position_threshold = 0.05  # 5cm for position
+            orientation_threshold = 0.05  # ~3 degrees for orientation
             
             if pos_dist < position_threshold:
                 self.position_control_achieved = True
@@ -562,16 +656,28 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                         u = self.mpc.update_control(self.current_state, self.target_state, self.position_control_achieved)
                         if u is not None and self.cmd_vel_pub:
                             cmd = Twist()
-                            cmd.linear.x = float(u[0])
-                            cmd.angular.z = float(u[1])
+                            # Handle both 2D and 3D velocity commands
+                            if len(u) == 3:  # True 2D movement: [vx, vy, angular_z]
+                                cmd.linear.x = float(u[0])
+                                cmd.linear.y = float(u[1])
+                                cmd.angular.z = float(u[2])
+                            else:  # Differential drive: [linear_x, angular_z]
+                                cmd.linear.x = float(u[0])
+                                cmd.angular.z = float(u[1])
                             self.cmd_vel_pub.publish(cmd)
-                            # Debug output for published commands
+                            # Debug output for published commands - only when there are issues
                             if not hasattr(self, '_cmd_debug_counter'):
                                 self._cmd_debug_counter = 0
                             self._cmd_debug_counter += 1
-                            # Print every 10th command (once per second at 10Hz)
-                            if self._cmd_debug_counter % 10 == 1:
-                                print(f"[{self.name}][{self.robot_namespace}] 发布控制命令 #{self._cmd_debug_counter}: linear.x={cmd.linear.x:.3f} m/s, angular.z={cmd.angular.z:.3f} rad/s [频率: 10Hz]")
+                            # Only print when there are control issues or every 50th command (once per 5 seconds at 10Hz)
+                            should_print = (self._cmd_debug_counter % 50 == 1 or 
+                                          pos_dist > 0.1 or  # Large position error
+                                          angle_diff > 0.2)  # Large angle error
+                            if should_print:
+                                if len(u) == 3:  # True 2D movement
+                                    print(f"[{self.name}][{self.robot_namespace}] 发布2D控制命令 #{self._cmd_debug_counter}: linear.x={cmd.linear.x:.3f}, linear.y={cmd.linear.y:.3f}, angular.z={cmd.angular.z:.3f} [频率: 10Hz]")
+                                else:  # Differential drive
+                                    print(f"[{self.name}][{self.robot_namespace}] 发布控制命令 #{self._cmd_debug_counter}: linear.x={cmd.linear.x:.3f} m/s, angular.z={cmd.angular.z:.3f} rad/s [频率: 10Hz]")
                                 print(f"[{self.name}][{self.robot_namespace}] 控制状态: 位置误差={pos_dist:.3f}m, 角度误差={angle_diff:.3f}rad, 位置达成={self.position_control_achieved}, 方向达成={self.orientation_control_achieved}")
                     except Exception as e:
                         print(f"[{self.name}][{self.robot_namespace}] 错误: MPC控制失败: {e}")
@@ -671,6 +777,10 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # 每次节点启动时重置并创建新的MPC控制器
         print(f"[{self.name}][{self.robot_namespace}] 创建新的MPC控制器实例")
         self.mpc = MobileRobotMPC()
+        
+        # Reset PI controller state for new approach
+        print(f"[{self.name}][{self.robot_namespace}] 重置PI控制器状态")
+        self.mpc.reset_pi_controller()
         
         # 如果节点可用则设置ROS组件
         if self.node:

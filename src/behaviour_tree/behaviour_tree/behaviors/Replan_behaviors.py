@@ -329,6 +329,14 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                     if i == 0 or (i < len(Flagb) and Flagb[i] != 0):
                         min_t_initial = np.sqrt(2*arc_segment_length / angular_limits[i]['aw_max'] / r0_valid[i])
                         opti.subject_to(delta_t_arcs[i][0] >= min_t_initial)
+                    
+                    # Ensure stopping at the end of trajectory for arc segments (final segment only)
+                    # Only apply if this is the last segment AND there are no line segments after it
+                    if i == len(time_segments)-1 and (i >= len(delta_t_lines) or not delta_t_lines[i]):
+                        # Minimum time for final arc segment to allow deceleration to zero
+                        t_min_arc = np.sqrt(2*arc_segment_length / angular_limits[i]['aw_max'] / r0_valid[i])
+                        opti.subject_to(delta_t_arcs[i][-1] >= t_min_arc)
+                        opti.subject_to(delta_t_arcs[i][-1] <= 10.0)
             
             # Line constraints - optimized processing  
             if i < len(delta_t_lines) and delta_t_lines[i] and l_valid[i] > 0:
@@ -363,6 +371,13 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                         a_transition = (v_line_start - v_arc_end) / t_transition
                         opti.subject_to(opti.bounded(-a_max, a_transition, a_max))
                         all_accelerations.append(a_transition)
+                
+                # Ensure stopping at the end of trajectory (final segment only)
+                if i == len(time_segments)-1:
+                    # Minimum time for final line segment to allow deceleration to zero
+                    t_min = np.sqrt(2*line_segment_length/a_max)
+                    opti.subject_to(delta_t_lines[i][-1] >= t_min)
+                    opti.subject_to(delta_t_lines[i][-1] <= 5.0)
             
             # Calculate total time for detailed optimization
             total_time = 0
@@ -446,6 +461,19 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                         else:
                             initial_time = 0.5
                         opti.set_initial(arc_var, max(0.05, initial_time))
+                
+                # Ensure stopping at the end of trajectory for arc segments (final segment only)
+                # Only apply if this is the last segment AND there are no line segments after it
+                if i == len(time_segments)-1 and len(delta_t_arcs[i]) > 0 and (i >= len(delta_t_lines) or not delta_t_lines[i]):
+                    # Minimum time for final arc segment
+                    delta_phi = phi[i+1] - phi_new[i] if i+1 < len(phi) else 0
+                    arc_length = abs(r0[i] * delta_phi) if abs(r0[i]) > 0 else 0
+                    arc_segment_length = arc_length / len(delta_t_arcs[i]) if len(delta_t_arcs[i]) > 0 else 0
+                    if arc_segment_length > 0 and abs(r0[i]) > 0:
+                        aw_max_arc = calculate_angular_acceleration_limit(abs(r0[i]))
+                        t_min = np.sqrt(2*arc_segment_length / aw_max_arc / abs(r0[i]))
+                        # Ensure the last arc segment has enough time to stop
+                        opti.set_initial(delta_t_arcs[i][-1], max(t_min * 1.2, 0.5))
             
             # Set initial values for line variables using loaded data and physical constraints
             if i < len(delta_t_lines) and len(delta_t_lines[i]) > 0:
@@ -495,6 +523,16 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                         else:
                             initial_time = 0.5
                         opti.set_initial(line_var, max(0.05, initial_time))
+                
+                # Ensure stopping at the end of trajectory (final segment only)
+                if i == len(time_segments)-1:
+                    # Minimum time for final line segment (similar to Planning_deltaT.py)
+                    line_length = l[i] if i < len(l) else 0
+                    line_segment_length = line_length / len(delta_t_lines[i]) if len(delta_t_lines[i]) > 0 else 0
+                    if line_segment_length > 0:
+                        t_min = np.sqrt(2*line_segment_length/a_max)
+                        # Ensure the last line segment has enough time to stop
+                        opti.set_initial(delta_t_lines[i][-1], max(t_min * 1.2, 0.5))
             if i < len(delta_t_arcs) and len(delta_t_arcs[i]) > 0:
                 orig_arc_times = segment.get('arc', [])
                 if orig_arc_times and len(orig_arc_times) == len(delta_t_arcs[i]):

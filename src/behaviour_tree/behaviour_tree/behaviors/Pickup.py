@@ -55,9 +55,9 @@ class MobileRobotMPC:
         self.dt = 0.1        # Time step
         
         # Balanced weights for 5-state formulation
-        self.Q = np.diag([50.0, 50.0, 5.0, 1.0, 1.0])   # State weights (x, y, theta, v, omega)
+        self.Q = np.diag([50.0, 50.0, 1.0, 1.0, 1.0])   # State weights (x, y, theta, v, omega)
         self.R = np.diag([1.0, 1.0])                     # Control input weights (v, omega)
-        self.F = np.diag([100.0, 100.0, 10.0, 2.0, 2.0]) # Terminal cost weights
+        self.F = np.diag([100.0, 100.0, 2.0, 2.0, 2.0]) # Terminal cost weights
         
         # Conservative velocity constraints
         self.max_vel = 0.25      # m/s
@@ -304,6 +304,11 @@ class PickObject(py_trees.behaviour.Behaviour):
         # State for the behavior
         self.state = 'idle'  # idle, moving_to_parcel, moving_to_relay, finished
         
+        # Freshness checking variables
+        self._last_robot_callback_time = None
+        self._robot_callback_count = 0
+        self._freshness_check_count = 0
+        
     def start_control_thread(self):
         """Start the dedicated control thread for 10Hz control loop"""
         if self.control_thread_active:
@@ -352,20 +357,21 @@ class PickObject(py_trees.behaviour.Behaviour):
             return
             
         # Try to acquire state lock non-blocking
-        print(f"[{self.name}] DEBUG: Attempting to acquire state lock in control_step")
         state_acquired = self.state_lock.acquire(blocking=False)
         if not state_acquired:
             # Use last known state if lock cannot be acquired
             print(f"[{self.name}] Using last known state for control step - lock is BUSY/HELD by another process")
             return
-        else:
-            print(f"[{self.name}] DEBUG: State lock ACQUIRED successfully in control_step")
+
             
         try:
             # Check if we have valid robot pose data
             current_state = self.current_state.copy()
             if np.allclose(current_state, [0.0, 0.0, 0.0]):
-                print(f"[{self.name}] WARNING: No valid robot pose data - current_state is all zeros!")
+                # Also check if callback is receiving data
+                callback_count = getattr(self, '_pose_callback_count', 0)
+                print(f"[{self.name}] WARNING: No valid robot pose data - current_state is all zeros! "
+                      f"Callback count: {callback_count}, Subscription active: {self.robot_pose_sub is not None}")
                 return
             
             # Debug current state every 50 calls
@@ -378,14 +384,14 @@ class PickObject(py_trees.behaviour.Behaviour):
                       f"pos=({current_state[0]:.3f}, {current_state[1]:.3f}, {current_state[2]:.3f}), "
                       f"trajectory_idx={getattr(self, 'trajectory_index', 'N/A')}/{len(self.trajectory_data) if self.trajectory_data else 'N/A'}")
             
+            # Check topic freshness (only outputs when there are issues)
+            self._check_topic_freshness()
+            
             # Execute MPC control if trajectory following is active
             if not self.picking_complete:
-                print(f"[{self.name}] DEBUG: About to call _follow_trajectory_with_mpc()")
                 success = self._follow_trajectory_with_mpc()
                 if not success:
                     print(f"[{self.name}] MPC trajectory following returned False!")
-                else:
-                    print(f"[{self.name}] MPC trajectory following returned True!")
             else:
                 print(f"[{self.name}] Picking complete - stopping control")
                 
@@ -398,8 +404,6 @@ class PickObject(py_trees.behaviour.Behaviour):
         
     def setup(self, **kwargs):
         """Setup ROS connections and load trajectory data"""
-        print(f"[SETUP] 开始设置 PickObject: {self.name}")
-        print(f"[{self.name}] 开始设置 PickObject，参数: {kwargs}")
         
         if 'node' in kwargs:
             self.node = kwargs['node']
@@ -437,6 +441,11 @@ class PickObject(py_trees.behaviour.Behaviour):
                     return False
                 else:
                     print(f"[{self.name}] 轨迹数据加载成功!")
+                    
+                    # Calculate closest trajectory index after trajectory is loaded
+                    print(f"[{self.name}] 计算初始最近轨迹索引...")
+                    self._calculate_initial_closest_trajectory_index()
+                    
             except Exception as e:
                 error_msg = f"Exception during trajectory loading: {str(e)}"
                 print(f"[{self.name}] CRITICAL ERROR: {error_msg}")
@@ -489,16 +498,39 @@ class PickObject(py_trees.behaviour.Behaviour):
             if not hasattr(self, 'callback_group'):
                 self.callback_group = ReentrantCallbackGroup()
             
+            # Initialize debug counter
+            self._pose_callback_count = 0
+            
+            # Set up QoS profile for reliable communication
+            from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
+            qos_profile = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=10
+            )
+            
             # Subscribe to robot odometry (使用回调组避免阻塞)
+            topic_name = f'/{self.robot_namespace}/odom_map'
             self.robot_pose_sub = self.node.create_subscription(
-                Odometry, f'/{self.robot_namespace}/odom_map', 
-                self._robot_pose_callback, 10,
+                Odometry, topic_name, 
+                self._robot_pose_callback, 
+                qos_profile,
                 callback_group=self.callback_group)
-            print(f"[{self.name}] 机器人姿态订阅已建立: {self.robot_namespace}/odom_map [使用回调组]")
-            return True
+            print(f"[{self.name}] 机器人姿态订阅已建立: {topic_name} [使用回调组+QoS]")
+            
+            # Verify subscription is created
+            if self.robot_pose_sub is not None:
+                print(f"[{self.name}] ✅ Robot pose subscription confirmed active")
+                return True
+            else:
+                print(f"[{self.name}] ❌ Robot pose subscription failed to create")
+                return False
             
         except Exception as e:
             print(f"[{self.name}] ERROR: Failed to setup robot subscription: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def setup_relay_subscription(self):
@@ -580,12 +612,27 @@ class PickObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] ERROR in relay_pose_callback: {e}")
     
     def _robot_pose_callback(self, msg):
-        """Update robot state from odometry message - optimized for non-blocking"""
+        """Update robot state from odometry message - optimized for non-blocking with freshness tracking"""
         try:
+            # Track callback timing for freshness checking
+            current_time = time.time()
+            self._last_robot_callback_time = current_time
+            
+            # Initialize debug counter if not exists
+            if not hasattr(self, '_pose_callback_count'):
+                self._pose_callback_count = 0
+            self._pose_callback_count += 1
+            
+            # Update robot callback count for freshness checking
+            if not hasattr(self, '_robot_callback_count'):
+                self._robot_callback_count = 0
+            self._robot_callback_count += 1
+            
             # Use non-blocking lock acquisition to avoid blocking callbacks
             if self.state_lock.acquire(blocking=False):
                 try:
                     # Position
+                    old_state = self.current_state.copy()
                     self.current_state[0] = msg.pose.pose.position.x
                     self.current_state[1] = msg.pose.pose.position.y
                     
@@ -598,11 +645,24 @@ class PickObject(py_trees.behaviour.Behaviour):
                     ]
                     yaw = euler_from_quaternion(quat)[2]
                     self.current_state[2] = yaw
+                    
+                    # Debug output every 50 callbacks or if state significantly changed
+                    if (self._pose_callback_count % 50 == 0 or 
+                        np.linalg.norm(self.current_state - old_state) > 0.1):
+                        print(f"[{self.name}] POSE CALLBACK #{self._pose_callback_count}: "
+                              f"pos=({self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f})")
+                              
                 finally:
                     self.state_lock.release()
-            # If lock can't be acquired, skip this update to avoid blocking
+            else:
+                # If lock can't be acquired, skip this update to avoid blocking
+                if self._pose_callback_count % 100 == 0:
+                    print(f"[{self.name}] POSE CALLBACK #{self._pose_callback_count}: SKIPPED (lock busy)")
+                    
         except Exception as e:
             print(f"[{self.name}] ERROR in robot_pose_callback: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _publish_estimated_time(self):
         """Publish estimated time for pushing operation"""
@@ -636,8 +696,8 @@ class PickObject(py_trees.behaviour.Behaviour):
             self.goal = data[0]
             
             # Calculate target pose (approach position before final goal)
-            self.target_pose[0] = self.goal[0] - 0.3 * np.cos(self.goal[2])
-            self.target_pose[1] = self.goal[1] - 0.3 * np.sin(self.goal[2])
+            self.target_pose[0] = self.goal[0] - 0.4 * np.cos(self.goal[2])
+            self.target_pose[1] = self.goal[1] - 0.4 * np.sin(self.goal[2])
             self.target_pose[2] = self.goal[2]
             
             # Add interpolation points for smoother approach
@@ -708,15 +768,29 @@ class PickObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] MPC 设置异常详情: {traceback.format_exc()}")
             raise e
     
-    def _find_initial_closest_trajectory_index(self):
-        """Find the closest trajectory point to robot's current position at initialization"""
+    def _find_closest_trajectory_index(self):
+        """Find the closest trajectory point to robot's current position - unified method for setup and runtime"""
         try:
             # Get current robot position
             with self.state_lock:
                 current_state = self.current_state.copy()
             
+            # If no valid pose received, use a default position near trajectory start
+            if np.allclose(current_state, [0.0, 0.0, 0.0]):
+                print(f"[{self.name}] No robot pose available, using trajectory start as reference")
+                # Use first trajectory point as reference
+                if self.trajectory_data and len(self.trajectory_data) > 0:
+                    current_state = np.array([
+                        self.trajectory_data[0][0], 
+                        self.trajectory_data[0][1], 
+                        self.trajectory_data[0][2]
+                    ])
+                else:
+                    print(f"[{self.name}] ERROR: No trajectory data available for closest index calculation")
+                    return 0
+            
             if not self.trajectory_data or len(self.trajectory_data) == 0:
-                print(f"[{self.name}] No trajectory data available for initial closest index finding")
+                print(f"[{self.name}] No trajectory data available for closest index calculation")
                 return 0
             
             curr_pos = np.array([current_state[0], current_state[1]])
@@ -731,14 +805,15 @@ class PickObject(py_trees.behaviour.Behaviour):
                     min_dist = dist
                     closest_idx = idx
             
-            print(f"[{self.name}] Initial closest trajectory point found at index {closest_idx}/{len(self.trajectory_data)-1}, distance: {min_dist:.3f}m")
+            print(f"[{self.name}] Closest trajectory point found at index {closest_idx}/{len(self.trajectory_data)-1}")
+            print(f"[{self.name}] Distance to closest point: {min_dist:.3f}m")
             print(f"[{self.name}] Robot position: ({current_state[0]:.3f}, {current_state[1]:.3f})")
             print(f"[{self.name}] Closest trajectory point: ({self.trajectory_data[closest_idx][0]:.3f}, {self.trajectory_data[closest_idx][1]:.3f})")
             
             return closest_idx
             
         except Exception as e:
-            print(f"[{self.name}] Error finding initial closest trajectory index: {e}")
+            print(f"[{self.name}] Error finding closest trajectory index: {e}")
             return 0
 
     def _wait_for_initial_pose(self, timeout=5.0):
@@ -762,22 +837,41 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.picking_complete = False
         self.feedback_message = f"[{self.robot_namespace}] Starting pick operation..."
         
-        # Reset trajectory index and initial index finding flag
-        self.trajectory_index = 0
-        self._initial_index_set = False
+        # Initialize debug counters
+        self._debug_call_count = 0
+        self._pose_callback_count = 0
         
         # Setup ROS subscriptions (recreated each time behavior starts)
-        self.setup_robot_subscription()
-        self.setup_relay_subscription()
+        print(f"[{self.name}] Setting up robot subscription...")
+        robot_sub_ok = self.setup_robot_subscription()
+        print(f"[{self.name}] Setting up relay subscription...")
+        relay_sub_ok = self.setup_relay_subscription()
+        print(f"[{self.name}] Setting up publishers...")
         self.setup_publishers()
+        
+        # Debug: Check if topic exists
+        if robot_sub_ok and self.node is not None:
+            try:
+                topic_name = f'/{self.robot_namespace}/odom_map'
+                topic_list = self.node.get_topic_names_and_types()
+                topic_exists = any(topic_name in topic for topic, _ in topic_list)
+                print(f"[{self.name}] Topic {topic_name} exists: {topic_exists}")
+                if not topic_exists:
+                    print(f"[{self.name}] Available topics: {[topic for topic, _ in topic_list if 'odom' in topic]}")
+            except Exception as e:
+                print(f"[{self.name}] Could not check topic list: {e}")
         
         # Start dedicated control thread (专用控制线程) instead of timer
         self.start_control_thread()
         
-        # Find initial closest trajectory index
-        self._wait_for_initial_pose(timeout=5.0)  # Wait for initial pose
-        self.closest_idx = self._find_initial_closest_trajectory_index()
-        self.trajectory_index = self.closest_idx  # Start at closest index
+        # Find initial closest trajectory index if not already set during setup
+        if not getattr(self, '_initial_index_set', False):
+            print(f"[{self.name}] Finding initial closest trajectory index during initialization...")
+            self._wait_for_initial_pose(timeout=5.0)  # Wait for initial pose
+            self.closest_idx = self._find_closest_trajectory_index()
+            self.trajectory_index = self.closest_idx  # Start at closest index
+        else:
+            print(f"[{self.name}] Using trajectory index {self.trajectory_index} set during setup")
         
         print(f"[{self.name}] Starting to pick object with dedicated control thread...")
     
@@ -917,23 +1011,16 @@ class PickObject(py_trees.behaviour.Behaviour):
     def _follow_trajectory_with_mpc(self):
         """Follow trajectory using MPC controller with control sequence management (similar to PushObject)"""
         try:
-            print(f"[{self.name}] DEBUG: _follow_trajectory_with_mpc() called")
             
             # Check if we have a valid stored control sequence we can use
             if self.control_sequence is not None:
-                print(f"[{self.name}] DEBUG: Using stored control sequence")
                 # Use the stored control sequence if available
                 if self._apply_stored_control():
                     self._advance_control_step()
                     return True
-                else:
-                    print(f"[{self.name}] DEBUG: Stored control sequence failed")
-            else:
-                print(f"[{self.name}] DEBUG: No stored control sequence available")
-            
+           
             # If no valid control sequence or need replanning, run MPC
             # NOTE: State lock is already held by control_step(), so we don't need to acquire it again
-            print(f"[{self.name}] DEBUG: Using current state (lock already held by control_step)")
             current_state = self.current_state.copy()
             
             # Always find the closest trajectory point to ensure accurate reference
@@ -1232,7 +1319,6 @@ class PickObject(py_trees.behaviour.Behaviour):
     
     def _apply_stored_control(self):
         """Apply the current step from the stored control sequence"""
-        print(f"[{self.name}] DEBUG: _apply_stored_control() called")
         if self.control_sequence is None or self.control_step_index >= self.mpc.N_c:
             print(f"[{self.name}] DEBUG: No control sequence or index out of bounds: "
                   f"sequence={self.control_sequence is not None}, "
@@ -1242,11 +1328,10 @@ class PickObject(py_trees.behaviour.Behaviour):
         # Get current control input
         raw_v = float(self.control_sequence[0, self.control_step_index])
         raw_omega = float(self.control_sequence[1, self.control_step_index])
-        print(f"[{self.name}] DEBUG: Raw control inputs: v={raw_v:.3f}, ω={raw_omega:.3f}")
+     
         
         # Apply velocity scaling for approach
         # NOTE: State lock is already held by control_step(), so we don't need to acquire it again
-        print(f"[{self.name}] DEBUG: Using current state (lock already held by control_step)")
         current_state = self.current_state.copy()
             
         distance_to_target = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
@@ -1275,10 +1360,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         cmd_msg = Twist()
         cmd_msg.linear.x = raw_v * scale_factor
         cmd_msg.angular.z = raw_omega * scale_factor
-        
-        print(f"[{self.name}] DEBUG: Publishing cmd_vel: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f}")
         self.cmd_vel_pub.publish(cmd_msg)
-        print(f"[{self.name}] DEBUG: cmd_vel published successfully")
         
         # Enhanced logging with trajectory following info
         print(f'[{self.name}] MPC control step {self.control_step_index+1}/{self.mpc.N_c}: '
@@ -1324,3 +1406,72 @@ class PickObject(py_trees.behaviour.Behaviour):
         
         # Otherwise we can use the next step from our stored sequence
         return True
+    
+    def _calculate_initial_closest_trajectory_index(self):
+        """Calculate the closest trajectory index during setup phase - uses default position if robot pose not available"""
+        try:
+            # Wait briefly for robot pose data
+            self._wait_for_initial_pose(timeout=2.0)
+            
+            # Use the unified method to find closest trajectory index
+            closest_idx = self._find_closest_trajectory_index()
+            
+            # Set the closest index as the starting point
+            self.trajectory_index = closest_idx
+            self.closest_idx = closest_idx
+            self._initial_index_set = True
+            
+            print(f"[{self.name}] MPC controller will start from trajectory index {closest_idx}")
+            
+        except Exception as e:
+            print(f"[{self.name}] Error calculating initial closest trajectory index: {e}")
+            self.trajectory_index = 0
+            self.closest_idx = 0
+            self._initial_index_set = True
+    
+    def _check_topic_freshness(self):
+        """Check freshness of robot topic data and output debug when stale"""
+        current_time = time.time()
+        
+        # Initialize freshness check counter
+        if not hasattr(self, '_freshness_check_count'):
+            self._freshness_check_count = 0
+        self._freshness_check_count += 1
+        
+        # Check robot data freshness
+        robot_data_fresh = True
+        robot_data_exists = (self._last_robot_callback_time is not None and 
+                           hasattr(self, '_robot_callback_count') and 
+                           self._robot_callback_count > 0)
+        
+        if robot_data_exists:
+            robot_data_age = current_time - self._last_robot_callback_time
+            robot_data_fresh = robot_data_age < 3.0  # 3 second timeout
+            
+            # Only output when data is stale (freshness is False)
+            if not robot_data_fresh:
+                print(f"[{self.name}] ❌ ROBOT TOPIC FRESHNESS ERROR:")
+                print(f"   Topic: /{self.robot_namespace}/odom_map")
+                print(f"   Data age: {robot_data_age:.2f}s (threshold: 3.0s)")
+                print(f"   Last callback count: {self._robot_callback_count}")
+                print(f"   Subscription active: {self.robot_pose_sub is not None}")
+        else:
+            robot_data_fresh = False
+            # Only output when no data received (freshness is False)
+            if self._freshness_check_count % 20 == 1:  # Every 2 seconds at 10Hz
+                print(f"[{self.name}] ❌ ROBOT TOPIC DATA ERROR:")
+                print(f"   Topic: /{self.robot_namespace}/odom_map")
+                print(f"   No data received yet")
+                print(f"   Callback count: {getattr(self, '_robot_callback_count', 0)}")
+                print(f"   Subscription active: {self.robot_pose_sub is not None}")
+        
+        # Note: This PickObject behavior follows pre-planned trajectory, no parcel subscription needed
+        
+        # Only output summary when there are freshness issues
+        if self._freshness_check_count % 50 == 0 and not robot_data_fresh:
+            print(f"[{self.name}] 📊 TOPIC FRESHNESS SUMMARY #{self._freshness_check_count}:")
+            print(f"   Robot odometry: ✗ STALE (/{self.robot_namespace}/odom_map)")
+            print(f"   Robot callbacks: {getattr(self, '_robot_callback_count', 0)}")
+            print(f"   Behavior: PickObject (trajectory-following, no parcel subscription)")
+        
+        return robot_data_fresh
