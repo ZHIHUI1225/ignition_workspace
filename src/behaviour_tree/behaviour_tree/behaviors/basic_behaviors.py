@@ -3,6 +3,10 @@
 Basic behavior classes for the behavior tree system.
 Contains utility behaviors like waiting, resetting, and message printing.
 """
+
+# 🔧 CRITICAL: Set environment variables BEFORE any imports that might use BLAS/LAPACK
+import os
+
 import time
 import math
 import re
@@ -408,21 +412,20 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         # Get the shared ROS node from kwargs or create one if needed
         if 'node' in kwargs:
             self.node = kwargs['node']
-        elif not hasattr(self, 'node') or self.node is None:
-            # Create a shared node if one doesn't exist
-            import rclpy
-            if not rclpy.ok():
-                rclpy.init()
-            self.node = rclpy.create_node(f'wait_push_{self.robot_namespace}')
+        else:
+            print(f"[{self.name}] ❌ ERROR: No shared ROS node provided! Behaviors must use shared node to prevent thread proliferation.")
+            return False
         
-        # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
-        if hasattr(self.node, 'robot_dedicated_callback_group'):
+        # 🔧 CRITICAL FIX: Use shared callback groups to prevent proliferation
+        if hasattr(self.node, 'shared_callback_manager'):
+            self.callback_group = self.node.shared_callback_manager.get_group('coordination')
+            print(f"[{self.name}] ✅ Using shared coordination callback group: {id(self.callback_group)}")
+        elif hasattr(self.node, 'robot_dedicated_callback_group'):
             self.callback_group = self.node.robot_dedicated_callback_group
             print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
         else:
-            # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
-            self.callback_group = MutuallyExclusiveCallbackGroup()
-            print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
+            print(f"[{self.name}] ❌ 错误：没有找到shared_callback_manager，无法使用共享回调组")
+            return False
         
         # Setup ROS subscriptions now that we have a node
         self.setup_subscriptions()
@@ -588,12 +591,9 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.namespace_number = self.extract_namespace_number(robot_namespace)
         self.relay_number = self.namespace_number  # Relay point is tb{i} -> Relaypoint{i}
         
-        # Initialize ROS2 if not already created
-        if not rclpy.ok():
-            rclpy.init()
-        
-        # Create node for subscriptions
-        self.node = rclpy.create_node(f'wait_action_{robot_namespace}')
+        # NOTE: ROS node should be provided via setup() method to use shared node
+        # Creating separate nodes causes thread proliferation (9 threads per node)
+        self.node = None  # Will be set in setup()
         
         # Pose storage
         self.robot_pose = None
@@ -814,13 +814,16 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 self.ros_node = ApproachObjectNode()
             
             # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
-            if hasattr(self.ros_node, 'robot_dedicated_callback_group'):
+            # 🔧 CRITICAL FIX: Use shared callback groups to prevent proliferation
+            if hasattr(self.ros_node, 'shared_callback_manager'):
+                self.callback_group = self.ros_node.shared_callback_manager.get_group('sensor')
+                print(f"[{self.name}] ✅ Using shared sensor callback group: {id(self.callback_group)}")
+            elif hasattr(self.ros_node, 'robot_dedicated_callback_group'):
                 self.callback_group = self.ros_node.robot_dedicated_callback_group
                 print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
             else:
-                # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
-                self.callback_group = MutuallyExclusiveCallbackGroup()
-                print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
+                print(f"[{self.name}] ❌ 错误：没有找到shared_callback_manager，无法使用共享回调组")
+                return False
             
             # Create command velocity publisher
             self.cmd_vel_pub = self.ros_node.create_publisher(

@@ -13,7 +13,6 @@ from geometry_msgs.msg import Twist, PoseStamped, Pose
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Int32, Float64
 import time
-import threading
 import json
 import numpy as np
 import casadi as ca
@@ -21,6 +20,8 @@ import os
 import math
 import re
 import traceback
+import threading  # Keep full threading module for compatibility
+from threading import Lock  # Also import Lock directly for clarity
 from tf_transformations import euler_from_quaternion
 import tf_transformations as tf
 import copy
@@ -136,8 +137,17 @@ class MobileRobotMPC:
         self.opti.subject_to(self.opti.bounded(-1.0, self.X[3, :], 1.0))   # v bounds
         self.opti.subject_to(self.opti.bounded(-np.pi, self.X[4, :], np.pi)) # omega bounds
 
-        # Solver settings - optimized for speed and numerical stability
+        # Solver settings - optimized for speed and numerical stability with THREAD CONTROL
         self.opti.minimize(cost)
+        
+        # 🔧 CRITICAL: Set environment variables to control BLAS/LAPACK threading
+        import os
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['OPENBLAS_NUM_THREADS'] = '1' 
+        os.environ['MKL_NUM_THREADS'] = '1'
+        os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+        os.environ['NUMEXPR_NUM_THREADS'] = '1'
+        
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
@@ -148,7 +158,7 @@ class MobileRobotMPC:
             'ipopt.acceptable_iter': 2,   # Accept quickly if reasonable
             'ipopt.warm_start_init_point': 'no', # Disable warm start initially for stability
             'ipopt.hessian_approximation': 'limited-memory', # BFGS approximation
-            'ipopt.linear_solver': 'mumps', # Reliable linear solver
+            'ipopt.linear_solver': 'mumps', # Try single-threaded linear solver
             'ipopt.mu_strategy': 'monotone', # Stable strategy
             'ipopt.nlp_scaling_method': 'none', # Disable scaling to prevent issues
             'ipopt.constr_viol_tol': 5e-2, # Relaxed constraint violation
@@ -380,24 +390,28 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.start_time = None
         self.last_time = None
         
-        # Threading lock for state protection
-        self.state_lock = threading.Lock()
-        
         # Control error tracking (will be reset in initialise)
         self.last_control_errors = {}
+        
+        # Thread-safe state lock for callback protection
+        self.state_lock = Lock()
     
     def setup(self, **kwargs):
-        """设置ROS节点和通信组件（优化：使用多个专用回调组避免回调阻塞）"""
+        """设置ROS节点和通信组件（优化：使用共享回调组管理器）"""
         if 'node' in kwargs:
             self.node = kwargs['node']
             
-            # 🔧 关键优化：为不同类型的回调创建不同的回调组
-            # 姿态数据回调使用ReentrantCallbackGroup以支持并发处理
-            self.pose_callback_group = ReentrantCallbackGroup()
-            # 控制逻辑使用MutuallyExclusiveCallbackGroup确保线程安全
-            self.control_callback_group = MutuallyExclusiveCallbackGroup()
-            
-            print(f"[{self.name}] ✅ 创建专用回调组: 姿态数据={id(self.pose_callback_group)}, 控制逻辑={id(self.control_callback_group)}")
+            # 🔧 关键修复：使用共享回调组管理器，避免创建新的回调组
+            if hasattr(self.node, 'shared_callback_manager'):
+                self.pose_callback_group = self.node.shared_callback_manager.get_group('sensor')
+                self.control_callback_group = self.node.shared_callback_manager.get_group('control')
+                print(f"[{self.name}] ✅ 使用共享回调组管理器: 传感器组={id(self.pose_callback_group)}, 控制组={id(self.control_callback_group)}")
+            else:
+                # 错误情况：如果没有共享管理器，则记录错误并使用默认组
+                print(f"[{self.name}] ❌ 错误：没有找到shared_callback_manager，无法使用共享回调组")
+                self.pose_callback_group = None
+                self.control_callback_group = None
+                return False
             
             # 获取命名空间参数
             try:
@@ -430,7 +444,10 @@ class PushObject(py_trees.behaviour.Behaviour):
             self.pred_path = Path()
             self.pred_path.header.frame_id = 'world'
             
-            print(f"[{self.name}] ✅ 发布者已创建，使用多个专用回调组 for {self.robot_namespace}")
+            print(f"[{self.name}] ✅ 发布者已创建，使用共享回调组管理器 for {self.robot_namespace}")
+            
+            # 初始化控制定时器为None (将在update中创建)
+            self.control_timer = None
         return True
     
     def _extract_namespace_number(self):
@@ -883,13 +900,17 @@ class PushObject(py_trees.behaviour.Behaviour):
     
     def control_loop(self):
         """Main MPC control loop - optimized with reduced solving frequency"""
-        # print(f"[{self.name}] Control loop called - trajectory_index: {self.trajectory_index}, pushing_active: {self.pushing_active}")
-        
         # CRITICAL: Check if we have valid pose data before attempting control
         # Do not send control commands if no pose data has been received
         if not self._has_valid_pose_data():
-            self._log_pose_data_status("CONTROL SKIPPED: Missing pose data")
-            print(f"[{self.name}] No control commands sent - waiting for valid pose data")
+            # Throttle "missing pose data" warnings to reduce CPU usage
+            if not hasattr(self, '_pose_warning_count'):
+                self._pose_warning_count = 0
+            self._pose_warning_count += 1
+            
+            if self._pose_warning_count % 100 == 1:  # Only warn every 100 iterations (10 seconds at 10Hz)
+                self._log_pose_data_status("CONTROL SKIPPED: Missing pose data")
+                print(f"[{self.name}] No control commands sent - waiting for valid pose data (warning #{self._pose_warning_count})")
             
             # Publish zero velocity to ensure robot stops
             if self.cmd_vel_pub:
@@ -909,7 +930,13 @@ class PushObject(py_trees.behaviour.Behaviour):
 
         # No stored sequence available - calculate new MPC control output
         if not self.ref_trajectory:
-            print(f"[{self.name}] Warning: No reference trajectory available")
+            # Throttle trajectory warnings
+            if not hasattr(self, '_traj_warning_count'):
+                self._traj_warning_count = 0
+            self._traj_warning_count += 1
+            
+            if self._traj_warning_count % 50 == 1:  # Only warn every 50 iterations (5 seconds at 10Hz)
+                print(f"[{self.name}] Warning: No reference trajectory available (warning #{self._traj_warning_count})")
             return
 
         with self.state_lock:
@@ -1099,12 +1126,12 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.parcel_pose_sub = None
                 print(f"[{self.name}] 调试: 已销毁现有包裹订阅")
                 
-            # 🔧 使用姿态数据专用的ReentrantCallbackGroup - 支持高频并发处理
+            # 🔧 使用共享回调组管理器 - 不再创建临时回调组
             if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] 警告: 姿态回调组未找到，创建临时回调组")
-                self.pose_callback_group = ReentrantCallbackGroup()
+                print(f"[{self.name}] ❌ 错误: 共享回调组未正确设置，无法创建包裹订阅")
+                return False
             
-            # Create new parcel subscription (使用可靠QoS和ReentrantCallbackGroup)
+            # Create new parcel subscription (使用可靠QoS和共享ReentrantCallbackGroup)
             parcel_topic = f'/parcel{current_parcel_index}/pose'
             reliable_qos = self._create_reliable_qos_profile()
             self.parcel_pose_sub = self.node.create_subscription(
@@ -1139,10 +1166,10 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.relay_pose_sub)
                 self.relay_pose_sub = None
             
-            # 🔧 使用姿态数据专用的ReentrantCallbackGroup
+            # 🔧 使用共享回调组管理器 - 不再创建临时回调组
             if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] 警告: 姿态回调组未找到，创建临时回调组")
-                self.pose_callback_group = ReentrantCallbackGroup()
+                print(f"[{self.name}] ❌ 错误: 共享回调组未正确设置，无法创建中继点订阅")
+                return False
             
             # Subscribe to relay point pose (一次性读取静态数据，使用可靠QoS)
             relay_number = self._extract_namespace_number() + 1  # Relaypoint{i+1}
@@ -1171,12 +1198,12 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.robot_pose_sub)
                 self.robot_pose_sub = None
             
-            # 🔧 使用姿态数据专用的ReentrantCallbackGroup - 支持并发处理
+            # 🔧 使用共享回调组管理器 - 不再创建临时回调组
             if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] 警告: 姿态回调组未找到，创建临时回调组")
-                self.pose_callback_group = ReentrantCallbackGroup()
+                print(f"[{self.name}] ❌ 错误: 共享回调组未正确设置，无法创建机器人订阅")
+                return False
             
-            # Subscribe to robot odometry (使用可靠QoS和ReentrantCallbackGroup) 
+            # Subscribe to robot odometry (使用可靠QoS和共享ReentrantCallbackGroup) 
             robot_odom_topic = f'/turtlebot{self._extract_namespace_number()}/odom_map'
             reliable_qos = self._create_reliable_qos_profile()
             self.robot_pose_sub = self.node.create_subscription(
@@ -1255,30 +1282,21 @@ class PushObject(py_trees.behaviour.Behaviour):
         time.sleep(0.8)  # 增加等待时间到800ms以确保gazebo到ros2转换稳定
         self.check_topic_connectivity()
         
-        # 主动等待数据到达，最多等待2秒（增加超时时间）
-        print(f"[{self.name}] 主动等待关键数据到达...")
-        max_wait_time = 2.0  # 增加到2秒
-        start_wait = time.time()
+        # Non-blocking data availability check (no while loops in timer callbacks)
+        print(f"[{self.name}] 检查关键数据可用性...")
         
-        while (time.time() - start_wait) < max_wait_time:
-            # 检查是否有足够的数据开始控制
-            robot_has_data = (self.current_state is not None and 
-                            hasattr(self, '_robot_callback_count') and 
-                            self._robot_callback_count > 0)
-            parcel_has_data = self.parcel_pose is not None
-            
-            if robot_has_data and parcel_has_data:
-                print(f"[{self.name}] ✅ 关键数据已到达 (等待时间: {time.time() - start_wait:.1f}s)")
-                break
-            
-            # 短暂等待
-            time.sleep(0.1)
-            
-            # 每0.5秒打印一次状态
-            if int((time.time() - start_wait) * 2) % 1 == 0:
-                robot_status = "✓" if robot_has_data else "✗"
-                parcel_status = "✓" if parcel_has_data else "✗"
-                print(f"[{self.name}] 数据等待中... robot:{robot_status} parcel:{parcel_status} (已等待: {time.time() - start_wait:.1f}s)")
+        # Check if we have sufficient data to start control (non-blocking)
+        robot_has_data = (self.current_state is not None and 
+                        hasattr(self, '_robot_callback_count') and 
+                        self._robot_callback_count > 0)
+        parcel_has_data = self.parcel_pose is not None
+        
+        if robot_has_data and parcel_has_data:
+            print(f"[{self.name}] ✅ 关键数据已就绪")
+        else:
+            robot_status = "✓" if robot_has_data else "✗"
+            parcel_status = "✓" if parcel_has_data else "✗"
+            print(f"[{self.name}] ⚠️ 等待数据: robot:{robot_status} parcel:{parcel_status} - 控制将在数据到达后自动开始")
         
         # 最终数据检查
         robot_has_data = (self.current_state is not None and 
@@ -1294,61 +1312,23 @@ class PushObject(py_trees.behaviour.Behaviour):
         # 设置初始化完成标志
         self.initialization_complete = True
         
-        # 启动专用控制线程（替代定时器）
-        self.control_thread = threading.Thread(
-            target=self._control_thread_worker,
-            daemon=True
-        )
-        self.control_thread.start()
-        print(f"[{self.name}] ✅ 专用控制线程已启动 (10Hz)")
+        # 启动控制定时器（替代专用线程）- 使用共享回调组
+        if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
+            self.control_timer = self.node.create_timer(
+                self.dt,  # 0.1s 定时器周期
+                self.control_loop,
+                callback_group=self.control_callback_group  # 使用共享回调组
+            )
+            print(f"[{self.name}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用共享回调组)")
+        else:
+            # 回退方案：使用默认回调组
+            self.control_timer = self.node.create_timer(
+                self.dt,  # 0.1s 定时器周期
+                self.control_loop
+            )
+            print(f"[{self.name}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用默认回调组)")
         print(f"[{self.name}] 推送行为初始化完成")
         
-    def _control_thread_worker(self):
-        """专用控制线程工作函数 - 10Hz 控制循环"""
-        control_call_count = 0
-        
-        # 等待初始化完成
-        print(f"[{self.name}] 控制线程启动，等待初始化完成...")
-        while not getattr(self, 'initialization_complete', False) and not self.terminating:
-            time.sleep(0.05)  # 50ms检查间隔
-        
-        if self.terminating:
-            print(f"[{self.name}] 控制线程在初始化完成前被终止")
-            return
-        
-        print(f"[{self.name}] 控制线程开始执行控制循环")
-        
-        while not self.terminating and self.pushing_active:
-            try:
-                control_call_count += 1
-                
-                # 执行控制循环
-                if hasattr(self, 'cmd_vel_pub') and self.cmd_vel_pub and hasattr(self, 'node') and self.node:
-                    start_time = time.time()
-                    self.control_loop()
-                    execution_time = time.time() - start_time
-                    
-                    if execution_time > 0.10:  # Warning if control loop exceeds 100ms (tightened threshold for performance)
-                        print(f"[{self.name}] 警告: 控制循环耗时 {execution_time:.3f}s (> 0.10s)")
-                else:
-                    print(f"[{self.name}] 警告: 控制循环跳过 - ROS资源不可用")
-                
-                # 10Hz 频率 (0.1秒间隔)
-                time.sleep(0.1)
-                
-            except Exception as e:
-                print(f"[{self.name}] 错误: 控制线程异常: {e}")
-                traceback.print_exc()
-                # 出错时紧急停止
-                if hasattr(self, 'cmd_vel_pub') and self.cmd_vel_pub:
-                    cmd_msg = Twist()
-                    cmd_msg.linear.x = 0.0
-                    cmd_msg.angular.z = 0.0
-                    self.cmd_vel_pub.publish(cmd_msg)
-                time.sleep(0.1)  # 确保命令发送后再继续
-        
-        print(f"[{self.name}] 控制线程已退出，调用次数: {control_call_count}")
-
     def check_topic_connectivity(self):
         """验证话题数据流连通性（使用回调组避免阻塞）"""
         topics = [
@@ -1549,19 +1529,16 @@ class PushObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] 警告: 停止机器人时出错: {e}")
         
         # Step 4: 等待控制线程安全退出
-        if hasattr(self, 'control_thread') and self.control_thread is not None:
+        # Step 4: 等待控制线程安全退出
+        if hasattr(self, 'control_timer') and self.control_timer is not None:
             try:
-                if self.control_thread.is_alive():
-                    # 等待线程退出，最多等待0.2秒
-                    self.control_thread.join(timeout=0.2)
-                    if self.control_thread.is_alive():
-                        print(f"[{self.name}] 警告: 控制线程未在超时内退出")
-                    else:
-                        print(f"[{self.name}] 控制线程已安全退出")
-                self.control_thread = None
+                # 停止定时器
+                self.node.destroy_timer(self.control_timer)
+                self.control_timer = None
+                print(f"[{self.name}] 控制定时器已销毁")
             except Exception as e:
-                print(f"[{self.name}] 警告: 控制线程清理错误: {e}")
-                self.control_thread = None
+                print(f"[{self.name}] 警告: 销毁定时器时出错: {e}")
+                self.control_timer = None
         
         # Step 5: 线程安全的订阅清理
         with self.state_lock:
