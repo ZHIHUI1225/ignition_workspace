@@ -14,7 +14,8 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64
 import math
 import time
-import threading
+import threading  # Keep full threading module for compatibility
+from threading import Lock, Event  # Also import specific components for clarity
 import tf_transformations as tf
 import numpy as np
 
@@ -221,8 +222,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self._robot_sub_destroying = False
         self._parcel_sub_destroying = False
         
-        # Subscription lock for thread-safe access
-        self._subscription_lock = threading.Lock()
+        # Subscription lock for thread-safe access - already created in __init__
         
         # Pose storage
         self.robot_pose = None
@@ -235,13 +235,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # Control loop timer period for high-frequency control (10Hz)
         self.dt = 0.1
         
-        # Threading components for high-frequency control
-        self.control_thread = None
-        self.control_thread_active = False
-        self.control_thread_stop_event = threading.Event()
+        # Replace threading with ROS timer for control
+        self.control_timer = None
+        self.control_active = False
         
         # Threading lock for state protection
-        self.lock = threading.Lock()
+        self.lock = Lock()  # Using Lock directly
+        
+        # Thread-safe subscription lock
+        self._subscription_lock = Lock()  # Using Lock directly
         
     def _stop_robot(self):
         """Helper method to stop the robot safely"""
@@ -262,29 +264,33 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}][{self.robot_namespace}] 警告: 停止机器人时出错: {e}")
 
     def extract_namespace_number(self, namespace):
-        """Extract numerical index from namespace string using regex"""
-        match = re.search(r'\d+', namespace)
-        return int(match.group()) if match else 0
-
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
+        return int(match.group(1)) if match else 0
+        
     def setup(self, **kwargs):
         """设置ROS节点和通信组件（非阻塞优化版）
         
         功能包括：
-        1. 创建ReentrantCallbackGroup支持并行回调
+        1. 使用共享回调组管理器避免线程增殖
         2. 创建发布者（cmd_vel, pushing_estimated_time）
         3. 订阅移至initialise避免竞态条件
         """
         if 'node' in kwargs:
             self.node = kwargs['node']
             
-            # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
-            if hasattr(self.node, 'robot_dedicated_callback_group'):
+            # 🔧 CRITICAL FIX: Use shared callback groups to prevent proliferation
+            if hasattr(self.node, 'shared_callback_manager'):
+                self.callback_group = self.node.shared_callback_manager.get_group('sensor')
+                self.control_callback_group = self.node.shared_callback_manager.get_group('control')
+                print(f"[{self.name}] ✅ Using shared callback groups: sensor={id(self.callback_group)}, control={id(self.control_callback_group)}")
+            elif hasattr(self.node, 'robot_dedicated_callback_group'):
                 self.callback_group = self.node.robot_dedicated_callback_group
+                self.control_callback_group = self.node.robot_dedicated_callback_group
                 print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
             else:
-                # 降级方案：创建独立的MutuallyExclusiveCallbackGroup
-                self.callback_group = MutuallyExclusiveCallbackGroup()
-                print(f"[{self.name}] ⚠️ 降级：创建独立回调组: {id(self.callback_group)}")
+                print(f"[{self.name}] ❌ 错误：没有找到shared_callback_manager，无法使用共享回调组")
+                return False
             
             # Initialize state variables early to prevent callback race conditions
             self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
@@ -505,104 +511,107 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         euler = tf.euler_from_quaternion(quat_list)
         return euler[2]
 
-    def control_thread_worker(self):
-        """Dedicated control thread worker - runs at precise 10Hz"""
-        print(f"[{self.name}][{self.robot_namespace}] 控制线程已启动 - 目标频率: 10Hz")
-        
-        # Debug counters for thread performance
-        thread_debug_counter = 0
-        thread_start_time = time.time()
-        
-        while not self.control_thread_stop_event.is_set():
-            try:
-                loop_start_time = time.time()
+    def control_loop_callback(self):
+        """Control loop callback for ROS timer - replaces thread worker"""
+        try:
+            # Early exit if behavior is inactive
+            if not self.control_active:
+                return
                 
-                # Only execute control if active and not both control flags achieved
-                if (hasattr(self, 'control_active') and self.control_active and 
-                    hasattr(self, 'position_control_achieved') and hasattr(self, 'orientation_control_achieved') and
-                    not (self.position_control_achieved and self.orientation_control_achieved)):
-                    
-                    # Ensure we have necessary resources
-                    if (hasattr(self, 'robot_pose_sub') and hasattr(self, 'parcel_pose_sub') and 
-                        hasattr(self, 'cmd_vel_pub') and self.cmd_vel_pub):
-                        
-                        # Add timeout protection for control loop
-                        control_start_time = time.time()
-                        try:
-                            self.control_loop()
-                            control_duration = time.time() - control_start_time
-                            
-                            # Warn if control loop takes too long (>60ms for 10Hz operation)
-                            if control_duration > 0.06:
-                                print(f"[{self.name}][{self.robot_namespace}] ⚠️ 控制循环执行时间过长: {control_duration:.3f}s (建议: <0.060s)")
-                        except Exception as control_error:
-                            print(f"[{self.name}][{self.robot_namespace}] 错误: 控制循环失败: {control_error}")
-                            self._stop_robot()
-                    else:
-                        # Stop robot if resources not available
-                        self._stop_robot()
+            # Check that required data is available
+            if self.robot_pose is None:
+                if hasattr(self, '_no_pose_warning_count'):
+                    self._no_pose_warning_count += 1
+                    if self._no_pose_warning_count % 50 == 1:  # Only warn every 50 iterations
+                        print(f"[{self.name}][{self.robot_namespace}] 无机器人姿态数据，跳过控制 (警告 #{self._no_pose_warning_count})")
                 else:
-                    # Stop robot when not in control mode
+                    self._no_pose_warning_count = 1
+                    print(f"[{self.name}][{self.robot_namespace}] 无机器人姿态数据，跳过控制")
+                return
+                
+            # Check that parcel data is available
+            if self.parcel_pose is None:
+                if not hasattr(self, '_no_parcel_warning_count'):
+                    self._no_parcel_warning_count = 0
+                self._no_parcel_warning_count += 1
+                
+                if self._no_parcel_warning_count % 50 == 1:  # Only warn every 50 iterations
+                    print(f"[{self.name}][{self.robot_namespace}] 无包裹姿态数据，跳过控制 (警告 #{self._no_parcel_warning_count})")
+                return
+                
+            # Execute control step - use the main control logic from control_loop method
+            # Use non-blocking lock acquisition to prevent callback blocking
+            if not self.lock.acquire(blocking=False):
+                return  # Skip this control cycle if lock is busy
+                
+            try:
+                # Validate critical resources before proceeding
+                if not hasattr(self, 'robot_pose') or not hasattr(self, 'parcel_pose'):
+                    return
+                
+                # Check if we have the necessary pose data
+                if self.robot_pose is None or self.parcel_pose is None:
+                    return
+                
+                # Additional safety check: ensure we're still in control mode
+                if not self.control_active:
+                    return
+                
+                # Calculate target state and update instance target_state
+                target_state, distance_to_target_state = self.calculate_target_state()
+                if target_state is None:
+                    return
+                self.target_state = target_state
+                
+                # Calculate position and orientation errors
+                pos_dist = np.sqrt((self.current_state[0] - self.target_state[0])**2 + 
+                                  (self.current_state[1] - self.target_state[1])**2)
+                angle_diff = abs((self.current_state[2] - self.target_state[2] + np.pi) % (2 * np.pi) - np.pi)
+                
+                # Update control flags
+                position_threshold = 0.05  # 5cm for position
+                orientation_threshold = 0.05  # ~3 degrees for orientation
+                
+                if pos_dist < position_threshold:
+                    self.position_control_achieved = True
+                
+                if self.position_control_achieved and angle_diff < orientation_threshold:
+                    self.orientation_control_achieved = True
+                
+                # Check if both position and orientation control are achieved
+                if self.position_control_achieved and self.orientation_control_achieved:
                     self._stop_robot()
+                    self.control_active = False
+                    print(f"[{self.name}][{self.robot_namespace}] Both position and orientation control achieved! pos: {pos_dist:.3f}m, angle: {angle_diff:.3f}rad")
+                else:
+                    # Generate and apply control using MPC
+                    if self.mpc is not None:
+                        try:
+                            u = self.mpc.update_control(self.current_state, self.target_state, self.position_control_achieved)
+                            if u is not None and self.cmd_vel_pub:
+                                cmd = Twist()
+                                # Handle both 2D and 3D velocity commands
+                                if len(u) == 3:  # True 2D movement: [vx, vy, angular_z]
+                                    cmd.linear.x = float(u[0])
+                                    cmd.linear.y = float(u[1])
+                                    cmd.angular.z = float(u[2])
+                                else:  # Differential drive: [linear_x, angular_z]
+                                    cmd.linear.x = float(u[0])
+                                    cmd.angular.z = float(u[1])
+                                self.cmd_vel_pub.publish(cmd)
+                        except Exception as e:
+                            print(f"[{self.name}][{self.robot_namespace}] 错误: MPC控制失败: {e}")
+                            self._stop_robot()
+            finally:
+                self.lock.release()
                 
-                # Debug frequency tracking
-                thread_debug_counter += 1
-                if thread_debug_counter % 50 == 1:  # Every 5 seconds at 10Hz
-                    elapsed_time = time.time() - thread_start_time
-                    actual_frequency = thread_debug_counter / elapsed_time if elapsed_time > 0 else 0
-                    print(f"[{self.name}][{self.robot_namespace}] 控制线程统计: 调用#{thread_debug_counter}, 实际频率={actual_frequency:.1f}Hz (目标:10Hz)")
-                
-                # Sleep to maintain 10Hz frequency
-                loop_execution_time = time.time() - loop_start_time
-                sleep_time = self.dt - loop_execution_time
-                
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                elif loop_execution_time > self.dt * 1.2:  # Warn if loop takes >120% of target time
-                    print(f"[{self.name}][{self.robot_namespace}] ⚠️ 线程循环执行时间过长: {loop_execution_time:.3f}s (目标: {self.dt:.3f}s)")
-                    
-            except Exception as e:
-                print(f"[{self.name}][{self.robot_namespace}] 错误: 控制线程异常: {e}")
-                print(f"[{self.name}][{self.robot_namespace}] 异常详情: {traceback.format_exc()}")
-                # Emergency stop on error
-                try:
-                    self._stop_robot()
-                except:
-                    pass
-                time.sleep(0.1)  # Prevent tight error loop
-        
-        print(f"[{self.name}][{self.robot_namespace}] 控制线程已停止")
-
-    def start_control_thread(self):
-        """Start the dedicated control thread"""
-        if self.control_thread is None or not self.control_thread.is_alive():
-            self.control_thread_stop_event.clear()
-            self.control_thread_active = True
-            self.control_thread = threading.Thread(
-                target=self.control_thread_worker,
-                name=f"ControlThread_{self.robot_namespace}",
-                daemon=True
-            )
-            self.control_thread.start()
-            print(f"[{self.name}][{self.robot_namespace}] 专用控制线程已启动")
-        else:
-            print(f"[{self.name}][{self.robot_namespace}] 控制线程已在运行")
-
-    def stop_control_thread(self):
-        """Stop the dedicated control thread safely"""
-        if self.control_thread and self.control_thread.is_alive():
-            print(f"[{self.name}][{self.robot_namespace}] 正在停止控制线程...")
-            self.control_thread_stop_event.set()
-            self.control_thread_active = False
-            
-            # Wait for thread to finish with timeout
-            self.control_thread.join(timeout=0.5)
-            if self.control_thread.is_alive():
-                print(f"[{self.name}][{self.robot_namespace}] 警告: 控制线程未在超时内停止")
-            else:
-                print(f"[{self.name}][{self.robot_namespace}] 控制线程已成功停止")
-            self.control_thread = None
-
+        except Exception as e:
+            print(f"[{self.name}][{self.robot_namespace}] 控制循环错误: {e}")
+            traceback.print_exc()
+            try:
+                self._stop_robot()
+            except:
+                pass
 
     def control_loop(self):  
         """Control loop for the approaching behavior - with non-blocking lock acquisition"""
@@ -1074,6 +1083,58 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self.feedback_message = f"[{self.robot_namespace}] ApproachObject 已终止，状态: {new_status}"
         print(f"[{self.name}][{self.robot_namespace}] ApproachObject 终止完成，状态: {new_status}")
 
+    def start_control_thread(self):
+        """Start control timer (replacing thread with ROS timer) - uses shared callback group"""
+        try:
+            # Stop any existing timer first
+            self.stop_control_thread()
+            
+            # Create timer using shared callback group for unified execution
+            if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
+                self.control_timer = self.node.create_timer(
+                    self.dt,  # 0.1s timer period for 10Hz control
+                    self.control_loop_callback,
+                    callback_group=self.control_callback_group  # Use shared callback group
+                )
+                print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用共享回调组)")
+            else:
+                # Fallback: use default callback group
+                self.control_timer = self.node.create_timer(
+                    self.dt,  # 0.1s timer period
+                    self.control_loop_callback
+                )
+                print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用默认回调组)")
+                
+            self.control_active = True
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}][{self.robot_namespace}] 错误: 启动控制定时器失败: {e}")
+            return False
+
+    def stop_control_thread(self):
+        """Stop control timer (replacing thread cleanup with timer cleanup) - thread-safe"""
+        try:
+            # Mark control as inactive first
+            self.control_active = False
+            
+            # Destroy timer if it exists
+            if hasattr(self, 'control_timer') and self.control_timer is not None:
+                try:
+                    self.node.destroy_timer(self.control_timer)
+                    self.control_timer = None
+                    print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已停止")
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 停止控制定时器时出错: {e}")
+                    self.control_timer = None
+            
+            # Stop robot immediately
+            self._stop_robot()
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}][{self.robot_namespace}] 错误: 停止控制定时器失败: {e}")
+            return False
 
 class MoveBackward(py_trees.behaviour.Behaviour):
     """Move backward behavior - using direct velocity control"""

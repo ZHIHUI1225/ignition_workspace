@@ -37,7 +37,7 @@ def generate_launch_description():
     from launch.actions import TimerAction
     
     # Default to 3 robots, can be adjusted by changing this value
-    num_robots = 3
+    num_robots = 2
     
     for i in range(num_robots):
         robot_namespace = f'turtlebot{i}'

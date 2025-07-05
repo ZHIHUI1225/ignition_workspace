@@ -29,29 +29,100 @@ class BehaviorTreeDiagnostic:
         """Scan for behavior tree processes and extract information"""
         bt_processes = []
         
+        try:
+            # Use subprocess to get process information as a fallback
+            import subprocess
+            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                for line in lines[1:]:  # Skip header
+                    if 'my_behaviour_tree_modular' in line and 'tree_' in line:
+                        parts = line.split()
+                        pid = int(parts[1])
+                        cpu_percent = float(parts[2])
+                        memory_percent = float(parts[3])
+                        
+                        # Extract robot ID from command line
+                        robot_match = re.search(r'tree_(\d+)', line)
+                        robot_id = robot_match.group(1) if robot_match else 'unknown'
+                        
+                        # Try to get more detailed info from psutil if possible
+                        try:
+                            proc = psutil.Process(pid)
+                            memory_mb = proc.memory_info().rss / 1024 / 1024
+                            threads = proc.num_threads()
+                            uptime_seconds = time.time() - proc.create_time()
+                        except:
+                            # Fallback to estimated values
+                            memory_mb = memory_percent * 16  # Rough estimate assuming 16GB RAM
+                            threads = 10  # Rough estimate
+                            uptime_seconds = 0
+                        
+                        bt_processes.append({
+                            'pid': pid,
+                            'robot_id': robot_id,
+                            'robot_namespace': f'turtlebot{robot_id}',
+                            'cpu_percent': cpu_percent,
+                            'memory_mb': memory_mb,
+                            'threads': threads,
+                            'uptime_seconds': uptime_seconds,
+                            'cmdline': line
+                        })
+                        print(f"DEBUG: Found BT process via ps - PID: {pid}, Robot: {robot_id}")
+            
+            # If ps method found processes, return them
+            if bt_processes:
+                print(f"DEBUG: Found {len(bt_processes)} behavior tree processes via ps command")
+                return bt_processes
+        
+        except Exception as e:
+            print(f"DEBUG: Error using ps command: {e}")
+        
+        # Fallback to psutil method
+        total_python_procs = 0
+        debug_matches = []
+        
         for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_info', 'num_threads', 'create_time']):
             try:
-                if (proc.info['name'] == 'python3' and 
-                    proc.info['cmdline'] and 
-                    any('behaviour_tree' in arg for arg in proc.info['cmdline'])):
-                    
-                    # Extract robot information from command line
-                    cmdline = ' '.join(proc.info['cmdline'])
-                    robot_match = re.search(r'tree_(\d+)', cmdline)
-                    robot_id = robot_match.group(1) if robot_match else 'unknown'
-                    
-                    bt_processes.append({
-                        'pid': proc.info['pid'],
-                        'robot_id': robot_id,
-                        'robot_namespace': f'turtlebot{robot_id}',
-                        'cpu_percent': proc.info['cpu_percent'],
-                        'memory_mb': proc.info['memory_info'].rss / 1024 / 1024,
-                        'threads': proc.info['num_threads'],
-                        'uptime_seconds': time.time() - proc.info['create_time'],
-                        'cmdline': cmdline
-                    })
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                if proc.info['name'] == 'python3':
+                    total_python_procs += 1
+                    if proc.info['cmdline']:
+                        cmdline = ' '.join(proc.info['cmdline'])
+                        
+                        # Debug: Check for any behavior tree related processes
+                        if 'behaviour_tree' in cmdline.lower() or 'my_behaviour_tree' in cmdline:
+                            debug_matches.append(f"PID {proc.info['pid']}: {cmdline[:100]}...")
+                        
+                        # Look for the behavior tree executable in the command line
+                        if 'my_behaviour_tree_modular' in cmdline:
+                            # Extract robot information from command line
+                            robot_match = re.search(r'tree_(\d+)', cmdline)
+                            robot_id = robot_match.group(1) if robot_match else 'unknown'
+                            
+                            bt_processes.append({
+                                'pid': proc.info['pid'],
+                                'robot_id': robot_id,
+                                'robot_namespace': f'turtlebot{robot_id}',
+                                'cpu_percent': proc.info['cpu_percent'],
+                                'memory_mb': proc.info['memory_info'].rss / 1024 / 1024,
+                                'threads': proc.info['num_threads'],
+                                'uptime_seconds': time.time() - proc.info['create_time'],
+                                'cmdline': cmdline
+                            })
+                            print(f"DEBUG: Found BT process via psutil - PID: {proc.info['pid']}, Robot: {robot_id}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
                 continue
+            except Exception as e:
+                print(f"DEBUG: Error processing PID {proc.info.get('pid', 'unknown')}: {e}")
+                continue
+        
+        # Debug output
+        print(f"DEBUG: Found {total_python_procs} python3 processes via psutil, {len(bt_processes)} behavior tree processes")
+        if debug_matches:
+            print("DEBUG: Behavior tree related processes found:")
+            for match in debug_matches:
+                print(f"  {match}")
         
         return bt_processes
     
@@ -81,8 +152,10 @@ class BehaviorTreeDiagnostic:
     def check_ros_node_health(self):
         """Check ROS node health by attempting to query topics"""
         try:
-            # Initialize a temporary ROS node for querying
-            rclpy.init()
+            # Check if ROS is already initialized
+            if not rclpy.ok():
+                rclpy.init()
+            
             temp_node = rclpy.create_node('diagnostic_node')
             
             # Get list of all nodes
@@ -117,7 +190,7 @@ class BehaviorTreeDiagnostic:
             }
             
             temp_node.destroy_node()
-            rclpy.shutdown()
+            # Don't shutdown ROS as other parts might need it
             
             return result
             
@@ -127,7 +200,9 @@ class BehaviorTreeDiagnostic:
     def monitor_topic_publishers_subscribers(self):
         """Monitor topic publishers and subscribers for each robot"""
         try:
-            rclpy.init()
+            if not rclpy.ok():
+                rclpy.init()
+            
             temp_node = rclpy.create_node('topic_monitor')
             
             # Topics of interest for each robot
@@ -162,7 +237,7 @@ class BehaviorTreeDiagnostic:
                 topic_health[robot] = robot_health
             
             temp_node.destroy_node()
-            rclpy.shutdown()
+            # Don't shutdown ROS as other parts might need it
             
             return topic_health
             
