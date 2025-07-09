@@ -9,10 +9,16 @@ from .basic_behaviors import (
    WaitAction, WaitForPush, WaitForPick, StopSystem, 
     CheckPairComplete, IncrementIndex
 )
+from .event_driven_behaviors import (
+    EventDrivenWaitForPush, create_event_driven_wait_for_push
+)
 from .ReplanPath_behaviour import ReplanPath
 from .movement_behaviors import ApproachObject, MoveBackward
 from .manipulation_behaviors import PushObject
 from .Pickup import PickObject
+
+# Control frequency for all behaviors (in seconds)
+CONTROL_DT = 0.5  # 2Hz control frequency
 
 
 def report_node_failure(node_name, error_info, robot_namespace, blackboard_client=None):
@@ -232,7 +238,7 @@ def create_root(robot_namespace="turtlebot0"):
     # Pushing sequence
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
-        WaitForPush("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
+        create_event_driven_wait_for_push("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
         ApproachObject("ApproachingPush", robot_namespace),
         PushObject("Pushing", robot_namespace, distance_threshold=0.09)
     ])
@@ -244,14 +250,14 @@ def create_root(robot_namespace="turtlebot0"):
     )
     parallel_move_replan.add_children([
         MoveBackward("BackwardToSafeDistance", distance=0.2),
-        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze")
+        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze", dt=CONTROL_DT)
     ])
     
     # Picking sequence
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        PickObject("PickingUp", robot_namespace, timeout=100.0),
+        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=CONTROL_DT),
         StopSystem("Stop", 1.5)
     ])
     
@@ -380,7 +386,7 @@ def create_main_business_logic_sequence(robot_namespace="turtlebot0"):
     # Pushing sequence
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
-        WaitForPush("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
+        create_event_driven_wait_for_push("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
         ApproachObject("ApproachingPush", robot_namespace),
         PushObject("Pushing", robot_namespace, distance_threshold=0.09)
     ])
@@ -392,14 +398,14 @@ def create_main_business_logic_sequence(robot_namespace="turtlebot0"):
     )
     parallel_move_replan.add_children([
         MoveBackward("BackwardToSafeDistance", distance=0.2),
-        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze")
+        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze", dt=CONTROL_DT)
     ])
     
     # Picking sequence
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        PickObject("PickingUp", robot_namespace, timeout=100.0),
+        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=CONTROL_DT),
         StopSystem("Stop", 1.5)
     ])
     

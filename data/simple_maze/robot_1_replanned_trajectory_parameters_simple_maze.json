@@ -110,7 +110,7 @@
     "case": "simple_maze",
     "N": 3,
     "replanned": true,
-    "replan_timestamp": "2025-07-07T12:23:25",
+    "replan_timestamp": "2025-07-09T13:35:42",
     "original_total_time": 54.815230047906866,
     "replanned_total_time": 50.00045311993302,
     "detailed_optimization": true

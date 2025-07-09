@@ -35,7 +35,7 @@ class MobileRobotMPC:
         # MPC parameters - optimized for position convergence
         self.N = 8           # Longer horizon for better convergence
         self.N_c = 3         # Longer control horizon for smoother control
-        self.dt = 0.1        # Time step
+        self.dt = 0.5        # Time step (increased from 0.1s to 0.5s)
         
         # Increased weights for better position convergence
         self.Q = np.diag([150.0, 150.0, 20.0, 1.0, 1.0])  # Higher position weights (x, y, theta, v, omega)
@@ -90,10 +90,11 @@ class MobileRobotMPC:
             cost += progress_factor * self.Q[0,0] * pos_error_x**2 
             cost += progress_factor * self.Q[1,1] * pos_error_y**2
             
-            # Orientation tracking - simplified without complex angle wrapping
-            theta_error = self.X[2, k] - self.ref[2, k]
-            # Simple bounded theta cost to prevent numerical issues
-            cost += self.Q[2,2] * ca.fmin(ca.fmax(theta_error**2, 0), 10.0)
+            # Orientation tracking - using atan2(sin(θ), cos(θ)) to avoid discontinuity at ±π
+            theta_diff = self.X[2, k] - self.ref[2, k]
+            # Use atan2(sin(θ), cos(θ)) for smooth angle differences
+            theta_error = ca.atan2(ca.sin(theta_diff), ca.cos(theta_diff))
+            cost += self.Q[2,2] * theta_error**2
             
             # Velocity tracking - bounded to prevent extreme values
             v_error = ca.fmin(ca.fmax(self.X[3, k] - self.ref[3, k], -5.0), 5.0)
@@ -112,12 +113,15 @@ class MobileRobotMPC:
         # Terminal cost - simplified
         pos_error_x_f = self.X[0, -1] - self.ref[0, -1]
         pos_error_y_f = self.X[1, -1] - self.ref[1, -1]
-        theta_error_f = self.X[2, -1] - self.ref[2, -1]
+        theta_diff_f = self.X[2, -1] - self.ref[2, -1]
+        
+        # Use atan2(sin(θ), cos(θ)) for terminal orientation error as well
+        theta_error_f = ca.atan2(ca.sin(theta_diff_f), ca.cos(theta_diff_f))
         
         # Very strong terminal position cost to force convergence
         cost += 5.0 * self.F[0,0] * pos_error_x_f**2 
         cost += 5.0 * self.F[1,1] * pos_error_y_f**2 
-        cost += self.F[2,2] * ca.fmin(ca.fmax(theta_error_f**2, 0), 10.0)
+        cost += self.F[2,2] * theta_error_f**2
         
         # Additional strong terminal position constraint for final convergence
         terminal_pos_error = ca.sqrt(pos_error_x_f**2 + pos_error_y_f**2)
@@ -152,7 +156,7 @@ class MobileRobotMPC:
             'ipopt.print_level': 0, 
             'print_time': 0, 
             'ipopt.max_iter': 40,        # Reduced iterations for speed
-            'ipopt.max_cpu_time': 0.08,  # Much shorter time limit for responsiveness
+            'ipopt.max_cpu_time': 0.4,   # Increased time limit (from 0.08s to 0.4s) for 0.5s control frequency
             'ipopt.tol': 5e-2,           # Relaxed tolerance for speed
             'ipopt.acceptable_tol': 1e-1, # Very relaxed acceptable tolerance
             'ipopt.acceptable_iter': 2,   # Accept quickly if reasonable
@@ -273,13 +277,10 @@ class MobileRobotMPC:
                 # Calculate errors
                 dx = target_x - current_state[0]
                 dy = target_y - current_state[1]
-                dtheta = target_theta - current_state[2]
+                theta_diff = target_theta - current_state[2]
                 
-                # Normalize angle error
-                while dtheta > np.pi:
-                    dtheta -= 2*np.pi
-                while dtheta < -np.pi:
-                    dtheta += 2*np.pi
+                # Use atan2(sin(θ), cos(θ)) for smooth angle difference calculation
+                dtheta = np.arctan2(np.sin(theta_diff), np.cos(theta_diff))
                 
                 # Simple proportional control
                 distance = np.sqrt(dx*dx + dy*dy)
@@ -307,12 +308,8 @@ class MobileRobotMPC:
         ])
 
     def _normalize_angle(self, angle):
-        """Normalize angle to [-pi, pi] range to prevent numerical issues"""
-        while angle > np.pi:
-            angle -= 2*np.pi
-        while angle < -np.pi:
-            angle += 2*np.pi
-        return angle
+        """Normalize angle to [-pi, pi] range using atan2 for smoother handling of discontinuities"""
+        return np.arctan2(np.sin(angle), np.cos(angle))
 
     def get_predicted_trajectory(self):
         try:
@@ -377,7 +374,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         # Control sequence management (will be reset in initialise)
         self.control_sequence = None
         self.control_step = 0
-        self.dt = 0.1  # 0.1s timer period for MPC control
+        self.dt = 0.5  # 0.5s timer period for MPC control
         
         # State tracking (will be reset in initialise)
         self.pushing_active = False
@@ -863,7 +860,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self._pose_warning_count = 0
             self._pose_warning_count += 1
             
-            if self._pose_warning_count % 100 == 1:  # Only warn every 100 iterations (10 seconds at 10Hz)
+            if self._pose_warning_count % 20 == 1:  # Only warn every 20 iterations (10 seconds at 2Hz)
                 self._log_pose_data_status("CONTROL SKIPPED: Missing pose data")
             
             # Publish zero velocity to ensure robot stops
@@ -889,7 +886,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self._traj_warning_count = 0
             self._traj_warning_count += 1
             
-            if self._traj_warning_count % 50 == 1:  # Only warn every 50 iterations (5 seconds at 10Hz)
+            if self._traj_warning_count % 50 == 1:  # Only warn every 50 iterations (25 seconds at 2Hz)
                 pass
             return
 
@@ -1250,7 +1247,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         # 启动控制定时器（替代专用线程）- 使用共享回调组
         if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
             self.control_timer = self.node.create_timer(
-                self.dt,  # 0.1s 定时器周期
+                self.dt,  # 0.5s 定时器周期
                 self.control_loop,
                 callback_group=self.control_callback_group  # 使用共享回调组
             )
@@ -1258,7 +1255,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         else:
             # 回退方案：使用默认回调组
             self.control_timer = self.node.create_timer(
-                self.dt,  # 0.1s 定时器周期
+                self.dt,  # 0.5s 定时器周期
                 self.control_loop
             )
             print(f"[{self.name}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用默认回调组)")
@@ -1334,6 +1331,14 @@ class PushObject(py_trees.behaviour.Behaviour):
             msg = Bool()
             msg.data = finished_status
             self.pushing_finished_pub.publish(msg)
+            
+            # Only log meaningful state changes to avoid log spam
+            if finished_status or not hasattr(self, '_last_logged_finished_status') or self._last_logged_finished_status != finished_status:
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                status_text = "FINISHED" if finished_status else "still active"
+                print(f"[{self.name}] 📤 [{timestamp}] Published {self.robot_namespace}/pushing_finished = {finished_status} ({status_text})")
+                self._last_logged_finished_status = finished_status
 
     def update(self):
         """Update pushing behavior status - behavior tree logic only"""
@@ -1762,10 +1767,6 @@ class PushObject(py_trees.behaviour.Behaviour):
             robot_position_zero = np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])
             robot_not_zero = not robot_position_zero
             
-            # # 详细调试机器人状态
-            # if self._validity_check_count % 10 == 0:
-            #     print(f"   机器人状态详情: pos=({self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f})")
-            #     print(f"   位置是否为零: {robot_position_zero}")
         
         robot_data_basic = robot_state_exists and robot_callback_count_ok and robot_not_zero
         
@@ -1799,26 +1800,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         # 递增计数器（已在上面初始化）
         self._validity_check_count += 1
         
-        # 更频繁的调试输出来诊断问题
-        # if self._validity_check_count % 10 == 0:  # 每10次检查输出一次详细信息
-        #     print(f"[{self.name}] � 数据有效性诊断 #{self._validity_check_count}:")
-        #     print(f"   机器人数据: 基础={robot_data_basic}, 时效={robot_data_fresh}, 最终={robot_data_valid}")
-        #     print(f"   包裹数据: 基础={parcel_data_basic}, 时效={parcel_data_fresh}, 最终={parcel_data_valid}")
-        #     print(f"   机器人状态非零: {self.current_state is not None and not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0]) if self.current_state is not None else False}")
-        #     print(f"   回调次数: robot={getattr(self, '_robot_callback_count', 0)}, parcel={getattr(self, '_parcel_callback_count', 0)}")
-            
-        #     # 添加时间戳调试
-        #     if hasattr(self, '_last_robot_callback_time'):
-        #         robot_age = current_time - self._last_robot_callback_time
-        #         print(f"   机器人数据年龄: {robot_age:.2f}s")
-        #     else:
-        #         print(f"   机器人时间戳: 未设置")
-                
-        #     if hasattr(self, '_last_parcel_callback_time'):
-        #         parcel_age = current_time - self._last_parcel_callback_time
-        #         print(f"   包裹数据年龄: {parcel_age:.2f}s")
-        #     else:
-        #         print(f"   包裹时间戳: 未设置")
         
         final_result = robot_data_valid and parcel_data_valid
         
@@ -1948,7 +1929,3 @@ class PushObject(py_trees.behaviour.Behaviour):
                 if current_time - cached_data['timestamp'] < 1.0:  # 1秒内的数据
                     return cached_data['data']
         return self.parcel_pose
-
-
-
-

@@ -14,6 +14,7 @@ import os
 from collections import defaultdict
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped
+import subprocess  # Ensure subprocess is imported at the top level
 
 
 class BehaviorTreeDiagnostic:
@@ -24,6 +25,9 @@ class BehaviorTreeDiagnostic:
         self.callback_group_stats = defaultdict(dict)
         self.subscription_health = defaultdict(dict)
         self.monitoring = True
+        self.previous_cpu_samples = {}  # Store previous CPU readings for trend analysis
+        self.cpu_history = defaultdict(list)  # Store CPU history per process
+        self.sample_count = 0  # Count of samples for averaging
         
     def scan_behavior_tree_processes(self):
         """Scan for behavior tree processes and extract information"""
@@ -31,7 +35,6 @@ class BehaviorTreeDiagnostic:
         
         try:
             # Use subprocess to get process information as a fallback
-            import subprocess
             result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
             
             if result.returncode == 0:
@@ -245,11 +248,10 @@ class BehaviorTreeDiagnostic:
             return {'error': str(e)}
     
     def analyze_callback_group_conflicts(self, bt_processes):
-        """Analyze potential callback group conflicts"""
+        """Analyze process resource usage without providing recommendations"""
         analysis = {
             'total_processes': len(bt_processes),
             'thread_distribution': {},
-            'potential_conflicts': [],
             'resource_pressure': {}
         }
         
@@ -262,21 +264,121 @@ class BehaviorTreeDiagnostic:
                 'memory_mb': proc['memory_mb']
             }
         
-        # Check for potential conflicts
+        # Calculate total resource usage (for informational purposes only)
         total_threads = sum(proc['threads'] for proc in bt_processes)
-        if total_threads > 50:  # Arbitrary threshold
-            analysis['potential_conflicts'].append(f"High thread count: {total_threads} total threads")
-        
-        # Check for resource pressure
-        high_cpu_processes = [proc for proc in bt_processes if proc['cpu_percent'] > 50]
-        if high_cpu_processes:
-            analysis['potential_conflicts'].append(f"High CPU usage processes: {len(high_cpu_processes)}")
-        
-        high_memory_processes = [proc for proc in bt_processes if proc['memory_mb'] > 200]
-        if high_memory_processes:
-            analysis['potential_conflicts'].append(f"High memory usage processes: {len(high_memory_processes)}")
+        analysis['total_threads'] = total_threads
         
         return analysis
+    
+    def get_detailed_cpu_analysis(self, bt_processes):
+        """Get detailed CPU analysis including per-thread CPU usage and top functions"""
+        cpu_analysis = {}
+        
+        for proc_info in bt_processes:
+            pid = proc_info['pid']
+            robot_id = proc_info['robot_id']
+            
+            try:
+                proc = psutil.Process(pid)
+                
+                # Store current CPU sample and calculate delta if we have previous samples
+                current_time = time.time()
+                current_cpu_times = proc.cpu_times()
+                
+                if pid in self.previous_cpu_samples:
+                    prev_sample = self.previous_cpu_samples[pid]
+                    time_delta = current_time - prev_sample['time']
+                    
+                    # Calculate CPU time delta in seconds
+                    user_delta = current_cpu_times.user - prev_sample['cpu_times'].user
+                    system_delta = current_cpu_times.system - prev_sample['cpu_times'].system
+                    
+                    # Calculate percentage of CPU time
+                    if time_delta > 0:
+                        user_percent = (user_delta / time_delta) * 100
+                        system_percent = (system_delta / time_delta) * 100
+                    else:
+                        user_percent = system_percent = 0
+                        
+                    # Store for analysis
+                    cpu_analysis[robot_id] = {
+                        'user_cpu_percent': user_percent,
+                        'system_cpu_percent': system_percent,
+                        'total_cpu_percent': user_percent + system_percent,
+                        'time_delta': time_delta,
+                    }
+                    
+                    # Store history for trending
+                    self.cpu_history[robot_id].append(user_percent + system_percent)
+                    # Keep only last 10 samples
+                    if len(self.cpu_history[robot_id]) > 10:
+                        self.cpu_history[robot_id].pop(0)
+                    
+                # Update the previous sample
+                self.previous_cpu_samples[pid] = {
+                    'time': current_time,
+                    'cpu_times': current_cpu_times
+                }
+                
+                # Get thread-specific CPU usage if available
+                try:
+                    threads = []
+                    for thread in proc.threads():
+                        thread_id = thread.id
+                        # Calculate thread CPU if we have previous data
+                        threads.append({
+                            'id': thread_id,
+                            'user_time': thread.user_time,
+                            'system_time': thread.system_time,
+                            'total_time': thread.user_time + thread.system_time
+                        })
+                    
+                    # Sort threads by total CPU time
+                    threads.sort(key=lambda x: x['total_time'], reverse=True)
+                    
+                    # Add the top 5 threads to the analysis
+                    if robot_id in cpu_analysis:
+                        top_threads = threads[:5]
+                        cpu_analysis[robot_id]['top_threads'] = top_threads
+                        
+                        # Try to get stack traces for the top 2 CPU-intensive threads
+                        if top_threads:
+                            try:
+                                top_thread_ids = [t['id'] for t in top_threads[:2]]
+                                stack_traces = self.get_thread_stack_traces(pid, top_thread_ids)
+                                cpu_analysis[robot_id]['stack_traces'] = stack_traces
+                            except Exception as e:
+                                print(f"Failed to get stack traces: {e}")
+                
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    if robot_id in cpu_analysis:
+                        cpu_analysis[robot_id]['top_threads'] = []
+                
+                # Try to get command line for the process to identify its role
+                try:
+                    cmdline = proc.cmdline()
+                    if robot_id in cpu_analysis:
+                        cpu_analysis[robot_id]['cmdline'] = ' '.join(cmdline)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                    
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                print(f"Error analyzing CPU for process {pid}: {e}")
+                continue
+        
+        # Add trend analysis
+        for robot_id, history in self.cpu_history.items():
+            if robot_id in cpu_analysis and len(history) > 1:
+                # Calculate trend (positive = increasing, negative = decreasing)
+                trend = history[-1] - history[0]
+                cpu_analysis[robot_id]['cpu_trend'] = trend
+                
+                # Calculate average
+                avg = sum(history) / len(history)
+                cpu_analysis[robot_id]['cpu_average'] = avg
+        
+        self.sample_count += 1
+        return cpu_analysis
     
     def run_comprehensive_diagnostic(self):
         """Run comprehensive diagnostic and generate report"""
@@ -336,64 +438,51 @@ class BehaviorTreeDiagnostic:
         else:
             print(f"   Error: {topic_health['error']}")
         
-        # 5. Callback group conflict analysis
-        print(f"\n⚠️  CALLBACK GROUP CONFLICT ANALYSIS:")
-        conflict_analysis = self.analyze_callback_group_conflicts(bt_processes)
-        print(f"   Total BT processes: {conflict_analysis['total_processes']}")
+        # 5. Process resource usage analysis
+        print(f"\n📊 PROCESS RESOURCE USAGE:")
+        resource_analysis = self.analyze_callback_group_conflicts(bt_processes)
+        print(f"   Total BT processes: {resource_analysis['total_processes']}")
+        print(f"   Total threads: {resource_analysis.get('total_threads', 0)}")
         
-        for robot_id, stats in conflict_analysis['thread_distribution'].items():
+        for robot_id, stats in resource_analysis['thread_distribution'].items():
             print(f"   Robot {robot_id}: {stats['threads']} threads, {stats['cpu_percent']:.1f}% CPU, {stats['memory_mb']:.1f}MB")
         
-        if conflict_analysis['potential_conflicts']:
-            print(f"\n🚨 POTENTIAL ISSUES DETECTED:")
-            for conflict in conflict_analysis['potential_conflicts']:
-                print(f"   • {conflict}")
-        else:
-            print(f"   ✅ No obvious callback group conflicts detected")
+        # 6. Detailed CPU analysis
+        print(f"\n🖥️ DETAILED CPU ANALYSIS:")
+        cpu_analysis = self.get_detailed_cpu_analysis(bt_processes)
         
-        # 6. Recommendations
-        print(f"\n💡 RECOMMENDATIONS:")
-        self.generate_recommendations(bt_processes, conflict_analysis, topic_health)
+        for robot_id, stats in cpu_analysis.items():
+            print(f"   Robot {robot_id}:")
+            print(f"      Total CPU: {stats['total_cpu_percent']:.1f}%")
+            print(f"      User CPU: {stats['user_cpu_percent']:.1f}%")
+            print(f"      System CPU: {stats['system_cpu_percent']:.1f}%")
+            if 'cpu_trend' in stats:
+                trend = "increasing" if stats['cpu_trend'] > 0 else "decreasing"
+                print(f"      Trend: {trend} ({stats['cpu_trend']:.1f})")
+            if 'cpu_average' in stats:
+                print(f"      Average CPU: {stats['cpu_average']:.1f}%")
+            if 'top_threads' in stats:
+                print(f"      Top threads by CPU usage:")
+                for i, thread in enumerate(stats['top_threads'][:3]):  # Show top 3 threads
+                    print(f"         #{i+1} Thread {thread['id']}: {thread['total_time']:.1f}s total "
+                          f"(User: {thread['user_time']:.1f}s, System: {thread['system_time']:.1f}s)")
+                
+                # Show stack traces for top threads if available
+                if 'stack_traces' in stats:
+                    print("\n      Stack traces for top CPU threads:")
+                    for thread_id, trace in stats['stack_traces'].items():
+                        print(f"         Thread {thread_id} stack:")
+                        # Extract the useful parts of the stack trace (limit to first 15 lines)
+                        trace_lines = trace.split('\n')
+                        relevant_lines = [line for line in trace_lines if 'Thread' in line or '#' in line][:15]
+                        for line in relevant_lines:
+                            print(f"            {line.strip()}")
+            if 'cmdline' in stats:
+                print(f"      Command line: {stats['cmdline']}")
         
         print("=" * 80)
         print("🔍 Diagnostic analysis complete")
     
-    def generate_recommendations(self, bt_processes, conflict_analysis, topic_health):
-        """Generate recommendations based on diagnostic results"""
-        recommendations = []
-        
-        # Check for high resource usage
-        for proc in bt_processes:
-            if proc['cpu_percent'] > 30:
-                recommendations.append(f"Robot {proc['robot_id']}: High CPU usage ({proc['cpu_percent']:.1f}%) - consider reducing control frequency")
-            
-            if proc['threads'] > 15:
-                recommendations.append(f"Robot {proc['robot_id']}: High thread count ({proc['threads']}) - check for callback group proliferation")
-            
-            if proc['memory_mb'] > 150:
-                recommendations.append(f"Robot {proc['robot_id']}: High memory usage ({proc['memory_mb']:.1f}MB) - check for memory leaks")
-        
-        # Check topic health issues
-        if 'error' not in topic_health:
-            unhealthy_robots = []
-            for robot, topics in topic_health.items():
-                unhealthy_topics = [topic for topic, health in topics.items() if health['status'] != 'HEALTHY']
-                if unhealthy_topics:
-                    unhealthy_robots.append(f"{robot}: {len(unhealthy_topics)} unhealthy topics")
-            
-            if unhealthy_robots:
-                recommendations.append("Topic connectivity issues detected - check Gazebo simulation and topic publishers")
-        
-        # General recommendations
-        if len(bt_processes) >= 3:
-            recommendations.append("Consider using staggered startup delays for behavior tree nodes")
-            recommendations.append("Ensure each robot uses isolated callback groups and executors")
-        
-        if not recommendations:
-            recommendations.append("✅ System appears healthy - no specific recommendations")
-        
-        for i, rec in enumerate(recommendations, 1):
-            print(f"   {i}. {rec}")
     
     def start_continuous_monitoring(self, interval=10):
         """Start continuous monitoring with periodic reports"""
@@ -411,6 +500,29 @@ class BehaviorTreeDiagnostic:
             print(f"\n❌ Error in continuous monitoring: {e}")
             import traceback
             traceback.print_exc()
+    
+    def get_thread_stack_traces(self, pid, thread_ids):
+        """Get stack traces for specific threads in a process"""
+        stack_traces = {}
+        try:
+            # Use gdb to get stack traces (requires root)
+            for thread_id in thread_ids:
+                cmd = [
+                    'gdb', '-ex', f'attach {pid}', 
+                    '-ex', f'thread {thread_id}', 
+                    '-ex', 'bt', 
+                    '-ex', 'detach', 
+                    '-ex', 'quit', 
+                    '--batch'
+                ]
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    stack_traces[thread_id] = result.stdout
+                except (subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+                    stack_traces[thread_id] = f"Error getting stack trace: {e}"
+        except Exception as e:
+            print(f"Error getting stack traces: {e}")
+        return stack_traces
 
 
 def main():
