@@ -20,7 +20,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
     and uses the optimization functions to replan the robot's trajectory accordingly.
     """
     
-    def __init__(self, name, duration=20.0, robot_namespace="turtlebot0", case="simple_maze"):
+    def __init__(self, name, duration=20.0, robot_namespace="turtlebot0", case="simple_maze", dt=0.5):
         """
         Initialize the ReplanPath behavior.
         
@@ -29,11 +29,13 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             duration (float): Maximum duration for the replanning process (seconds)
             robot_namespace (str): Robot namespace for ROS topics
             case (str): Case name for trajectory data (e.g., "simple_maze")
+            dt (float): Control loop frequency/time step in seconds (default: 0.5s for 2Hz)
         """
         super().__init__(name)
         self.duration = duration
         self.robot_namespace = robot_namespace
         self.case = case
+        self.dt = dt  # Control frequency for trajectory sampling
         self.start_time = None
         self.replanning_completed = False
         self.replanning_successful = False
@@ -132,7 +134,8 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     case=self.case,
                     target_time=self.target_time,
                     robot_id=self.robot_id,
-                    save_results=True
+                    save_results=True,
+                    dt=self.dt  # Pass the dt parameter from the ReplanPath instance
                 )
                 
                 if result is not None:

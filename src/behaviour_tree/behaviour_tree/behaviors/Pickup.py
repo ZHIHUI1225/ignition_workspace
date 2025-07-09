@@ -52,7 +52,7 @@ class MobileRobotMPC:
         # MPC parameters - 5-state control (x, y, theta, v, omega)
         self.N = 8           # Prediction horizon for good tracking
         self.N_c = 3         # Control horizon for smoother control
-        self.dt = 0.1        # Time step
+        self.dt = 0.5        # Time step (2Hz)
         
         # Balanced weights for 5-state formulation
         self.Q = np.diag([50.0, 50.0, 1.0, 1.0, 1.0])   # State weights (x, y, theta, v, omega)
@@ -246,7 +246,7 @@ class MobileRobotMPC:
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0, estimated_time=55.0):
+    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0, estimated_time=55.0, dt=0.5):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
@@ -277,7 +277,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         # Replace dedicated control thread with ROS timer
         self.control_timer = None
         self.control_thread_active = False  # Keeping for compatibility with existing code
-        self.dt = 0.1  # 10Hz control frequency
+        self.dt = dt  # Control frequency (default: 0.5s for 2Hz)
         
         # Relay point tracking
         self.relay_pose_sub = None
@@ -308,7 +308,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         self._freshness_check_count = 0
         
     def start_control_thread(self):
-        """Start the control timer for 10Hz control loop using ROS timer"""
+        """Start the control timer for 2Hz control loop using ROS timer"""
         if self.control_thread_active or self.control_timer is not None:
             return  # Already running
         
@@ -337,7 +337,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Create a ROS timer with the appropriate callback group
             print(f"[{self.name}] Creating control timer with period {self.dt}s")
             self.control_timer = self.node.create_timer(
-                self.dt,  # 10Hz frequency = 0.1s period
+                self.dt,  # 2Hz frequency = 0.5s period
                 self.control_step,  # Use the existing control_step as callback
                 callback_group=callback_group
             )
@@ -682,7 +682,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Add interpolation points for smoother approach
             num_interp_points = 5
             interp_points = []
-            dt = 0.1  # Time interval in seconds
+            dt = 0.5  # Time interval in seconds (2Hz)
             
             for i in range(num_interp_points):
                 alpha = i / (num_interp_points - 1)  # Interpolation factor (0 to 1)
@@ -1045,56 +1045,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         
         return py_trees.common.Status.RUNNING
 
-    
-    def _mpc_trajectory_following(self):
-        """MPC-based trajectory following for picking operation"""
-        try:
-            # Calculate distance to target
-            with self.state_lock:
-                current_state = self.current_state.copy()
-            
-            distance_error = np.sqrt((current_state[0] - self.target_pose[0])**2 + 
-                                   (current_state[1] - self.target_pose[1])**2)
-            
-            # Calculate orientation error
-            angle_error = abs(current_state[2] - self.target_pose[2])
-            angle_error = min(angle_error, 2*np.pi - angle_error)  # Normalize to [0, pi]
-            
-            # Define stopping criteria
-            position_tolerance = 0.025 # 2cm position tolerance
-            orientation_tolerance = 0.2  # ~17 degrees orientation tolerance (increased from ~5.7 degrees)
-            
-            # Check if picking is complete
-            position_reached = distance_error <= position_tolerance
-            orientation_reached = angle_error <= orientation_tolerance
-            
-            if position_reached and orientation_reached:
-                # Stop robot
-                cmd_msg = Twist()
-                cmd_msg.linear.x = 0.0
-                cmd_msg.angular.z = 0.0
-                self.cmd_vel_pub.publish(cmd_msg)
-                
-                self.picking_complete = True
-                print(f"[{self.name}] Successfully reached pick target and completed picking!")
-                return py_trees.common.Status.SUCCESS
-            
-            # Continue trajectory following if not at target
-            if not self._follow_trajectory_with_mpc():
-                print(f"[{self.name}] MPC trajectory following failed")
-                return py_trees.common.Status.FAILURE
-            
-            # Timeout check
-            elapsed = time.time() - self.start_time
-            if elapsed >= self.timeout:  # Extended timeout for trajectory following
-                print(f"[{self.name}] Pick operation timed out after {self.timeout}s")
-                return py_trees.common.Status.FAILURE
-            
-            return py_trees.common.Status.RUNNING
-            
-        except Exception as e:
-            print(f"[{self.name}] Error in MPC trajectory following: {e}")
-            return py_trees.common.Status.FAILURE
+
     
     def _follow_trajectory_with_mpc(self):
         """Follow trajectory using MPC controller with control sequence management (similar to PushObject)"""
@@ -1158,7 +1109,7 @@ class PickObject(py_trees.behaviour.Behaviour):
                     else:
                         # Estimate velocities from position differences
                         next_idx = min(idx + 1, len(self.trajectory_data) - 1)
-                        dt = 0.1  # Time step
+                        dt = 0.5  # Time step (2Hz)
                         dx = (self.trajectory_data[next_idx][0] - self.trajectory_data[idx][0]) / dt
                         dy = (self.trajectory_data[next_idx][1] - self.trajectory_data[idx][1]) / dt
                         dtheta = (self.trajectory_data[next_idx][2] - self.trajectory_data[idx][2]) / dt
@@ -1210,91 +1161,6 @@ class PickObject(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] Error in trajectory following: {str(e)}")
             print(f"[{self.name}] Traceback: {traceback.format_exc()}")
             return False
-    
-    def _apply_fallback_control(self, current_state):
-        """Enhanced fallback controller for pickup behavior when MPC fails"""
-        try:
-            # Get target from current trajectory index or target pose
-            if self.trajectory_index < len(self.trajectory_data):
-                target_x = self.trajectory_data[self.trajectory_index][0]
-                target_y = self.trajectory_data[self.trajectory_index][1]
-                target_theta = self.trajectory_data[self.trajectory_index][2]
-            else:
-                target_x = self.target_pose[0]
-                target_y = self.target_pose[1]
-                target_theta = self.target_pose[2]
-            
-            # Calculate errors
-            dx = target_x - current_state[0]
-            dy = target_y - current_state[1]
-            distance = np.sqrt(dx**2 + dy**2)
-            bearing_to_target = np.arctan2(dy, dx)
-            
-            # Normalize angle difference
-            angle_error = bearing_to_target - current_state[2]
-            while angle_error > np.pi:
-                angle_error -= 2*np.pi
-            while angle_error < -np.pi:
-                angle_error += 2*np.pi
-            
-            # Orientation error to target orientation
-            orientation_error = target_theta - current_state[2]
-            while orientation_error > np.pi:
-                orientation_error -= 2*np.pi
-            while orientation_error < -np.pi:
-                orientation_error += 2*np.pi
-            
-            # Distance-based control strategy
-            if distance < 0.05:
-                # Very close - just align orientation
-                v_cmd = 0.0
-                w_cmd = 2.0 * orientation_error
-                w_cmd = np.clip(w_cmd, -np.pi/4, np.pi/4)
-            elif distance < 0.15:
-                # Close approach - precise positioning
-                kp_linear = 1.5
-                kp_angular = 2.5
-                
-                # Move toward target with orientation correction
-                v_cmd = kp_linear * distance
-                w_cmd = kp_angular * angle_error + 0.5 * orientation_error
-                
-                v_cmd = np.clip(v_cmd, 0.0, 0.15)
-                w_cmd = np.clip(w_cmd, -np.pi/3, np.pi/3)
-            else:
-                # Far approach - trajectory following mode
-                kp_linear = 1.0
-                kp_angular = 1.5
-                
-                # Align with path direction first if large angle error
-                if abs(angle_error) > np.pi/3:
-                    v_cmd = 0.05  # Very slow forward motion while turning
-                    w_cmd = kp_angular * angle_error
-                else:
-                    v_cmd = kp_linear * distance * np.cos(angle_error)
-                    w_cmd = kp_angular * angle_error
-                
-                v_cmd = np.clip(v_cmd, 0.0, 0.4)
-                w_cmd = np.clip(w_cmd, -np.pi/2, np.pi/2)
-            
-            # Publish control command
-            cmd_msg = Twist()
-            cmd_msg.linear.x = float(v_cmd)
-            cmd_msg.angular.z = float(w_cmd)
-            self.cmd_vel_pub.publish(cmd_msg)
-            
-            print(f"[{self.name}] Fallback control: dist={distance:.3f}m, angle_err={angle_error:.3f}rad, v={v_cmd:.3f}, w={w_cmd:.3f}")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] Error in fallback controller: {e}")
-            # Emergency stop
-            cmd_msg = Twist()
-            cmd_msg.linear.x = 0.0
-            cmd_msg.angular.z = 0.0
-            self.cmd_vel_pub.publish(cmd_msg)
-            return False
-    
     
     def terminate(self, new_status):
         """Cleanup when behavior is terminated"""

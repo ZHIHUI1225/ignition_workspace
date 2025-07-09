@@ -96,7 +96,7 @@ def load_trajectory_parameters_individual(case, robot_id=None):
     
     return trajectory_data
 
-def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_results=True):
+def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_results=True, dt=0.5):
     """
     Load trajectory parameters from individual robot file and replan to achieve target time
     
@@ -105,6 +105,7 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
         target_time: Target total time for the robot (seconds)
         robot_id: Robot ID
         save_results: Whether to save replanned results
+        dt: Time step for discrete trajectory generation (default: 0.5s for 2Hz)
         
     Returns:
         Dictionary with replanning results for the specified robot
@@ -679,7 +680,7 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
                     time_segments=time_segments,
                     Flagb=Flagb,
                     reeb_graph=reeb_graph,
-                    dt=0.1,
+                    dt=dt,
                     save_dir=f'/root/workspace/data/{case}/',
                     case=case
                 )
@@ -847,7 +848,7 @@ def save_single_robot_trajectory_parameters(result, case, robot_id):
     
     return output_file
 
-def generate_discrete_trajectories_from_replanned_data(case, N, dt=0.1, save_dir=None):
+def generate_discrete_trajectories_from_replanned_data(case, N, dt=0.5, save_dir=None):
     """
     Generate discrete trajectories for each robot from replanned trajectory data.
     Similar to compare_discretization_with_spline but processes individual robot data.
@@ -855,7 +856,7 @@ def generate_discrete_trajectories_from_replanned_data(case, N, dt=0.1, save_dir
     Args:
         case: Case name (e.g., "simple_maze", "simulation", "maze")
         N: Number of robots
-        dt: Time step for uniform sampling (default: 0.1s)
+        dt: Time step for uniform sampling (default: 0.5s)
         save_dir: Directory to save trajectory files (default: /home/zhihui/data/{case}/)
     
     Returns:

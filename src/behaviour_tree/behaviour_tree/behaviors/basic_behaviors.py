@@ -20,6 +20,7 @@ import casadi as ca
 import traceback
 import threading
 import tf_transformations
+import pyinotify  # For monitoring file system events
 from scipy.interpolate import CubicSpline
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
@@ -45,6 +46,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.start_time = 0
         self.robot_namespace = robot_namespace
         self.distance_threshold = distance_threshold
+        
+        # Flag to track if behavior has been terminated
+        self._terminated = False
         
         # Extract namespace number for relay point indexing
         self.namespace_number = self.extract_namespace_number(robot_namespace)
@@ -105,32 +109,55 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         # For turtlebot0, default to True (no previous robot)
         if previous_robot_namespace is None:
-            print(f"[{self.name}] DEBUG: No previous robot (this is turtlebot0), returning True")
+            # Avoid excessive logging
             return True
         
         # For other robots, check the previous robot's pushing_finished flag via ROS topic
-        print(f"[{self.name}] DEBUG: Current robot: {self.robot_namespace}, checking previous robot: {previous_robot_namespace}")
-        print(f"[{self.name}] DEBUG: Previous robot pushing finished status: {self.previous_robot_pushing_finished}")
+        # Only log occasionally to reduce CPU usage
+        if not hasattr(self, '_check_print_count'):
+            self._check_print_count = 0
+        self._check_print_count += 1
+        
+        if self._check_print_count % 20 == 1:  # Print only once every 20 calls
+            print(f"[{self.name}] DEBUG: Current robot: {self.robot_namespace}, checking previous robot: {previous_robot_namespace}")
+            print(f"[{self.name}] DEBUG: Previous robot pushing finished status: {self.previous_robot_pushing_finished}")
         
         return self.previous_robot_pushing_finished
     
     def previous_robot_pushing_finished_callback(self, msg):
         """Callback for previous robot's pushing finished status"""
+        # Store the previous value to check if it changed
+        old_value = self.previous_robot_pushing_finished
         self.previous_robot_pushing_finished = msg.data
-        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
-        print(f"[{self.name}] DEBUG: Received {previous_robot_namespace}/pushing_finished = {msg.data}")
+        
+        # Only log status changes to reduce CPU overhead
+        if old_value != msg.data:
+            previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
+            
+            # Add timestamp to help track when we actually got an update
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            
+            # Only print on state change to reduce CPU load
+            if msg.data:
+                print(f"[{self.name}] ✅ [{timestamp}] CONFIRMED: Previous robot {previous_robot_namespace} has FINISHED pushing!")
+            else:
+                print(f"[{self.name}] 🔄 [{timestamp}] Previous robot {previous_robot_namespace} is still pushing")
     
     def setup_pushing_coordination_topics(self):
         """Setup ROS2 topics for pushing coordination"""
         if self.node is None:
+            print(f"[{self.name}] ERROR: Cannot setup pushing coordination - ROS node is None!")
             return
         
         # Publisher for this robot's pushing_finished status
+        topic_name = f'/{self.robot_namespace}/pushing_finished'
         self.pushing_finished_pub = self.node.create_publisher(
             Bool,
-            f'/{self.robot_namespace}/pushing_finished',
+            topic_name,
             10
         )
+        print(f"[{self.name}] ✅ Created publisher for {topic_name}")
         
         # Publisher for this robot's pushing_estimated_time
         self.pushing_estimated_time_pub = self.node.create_publisher(
@@ -142,18 +169,25 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         # Subscriber for previous robot's pushing_finished status with callback group
         previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
         if previous_robot_namespace:
+            prev_topic_name = f'/{previous_robot_namespace}/pushing_finished'
             self.pushing_finished_sub = self.node.create_subscription(
                 Bool,
-                f'/{previous_robot_namespace}/pushing_finished',
+                prev_topic_name,
                 self.previous_robot_pushing_finished_callback,
                 10,
                 callback_group=self.callback_group
             )
-            print(f"[{self.name}] DEBUG: Subscribed to {previous_robot_namespace}/pushing_finished topic with callback group")
+            print(f"[{self.name}] ✅ Subscribed to {prev_topic_name} topic with callback group")
+            
+            # Debug - publish a test message as the current robot to check topic communication
+            test_msg = Bool()
+            test_msg.data = False
+            self.pushing_finished_pub.publish(test_msg)
+            print(f"[{self.name}] 🔍 Published test message to {topic_name}")
         
         # Publish initial values
         self.publish_pushing_estimated_time()
-        print(f"[{self.name}] DEBUG: Setup pushing coordination topics with callback group")
+        print(f"[{self.name}] ✅ Setup pushing coordination topics complete")
     
     def publish_pushing_estimated_time(self):
         """Publish the pushing estimated time via ROS topic"""
@@ -204,25 +238,42 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates"""
+        # Check if behavior status indicates it should be terminated
+        if hasattr(self, '_terminated') and self._terminated:
+            print(f"[{self.name}] ⚠️ WARNING: Received callback after termination! This should not happen.")
+            return
+            
         self.robot_pose = msg.pose.pose
         # Only print occasionally to avoid spam
         if not hasattr(self, '_robot_pose_count'):
             self._robot_pose_count = 0
         self._robot_pose_count += 1
         if self._robot_pose_count % 50 == 1:  # Print every 50 callbacks
-            print(f"[{self.name}] DEBUG: Robot pose updated: ({self.robot_pose.position.x:.3f}, {self.robot_pose.position.y:.3f})")
+            print(f"[{self.name}] DEBUG: Robot pose updated: ({self.robot_pose.position.x:.3f}, {self.robot_pose.position.y:.3f}), count: {self._robot_pose_count}")
     
     def relay_pose_callback(self, msg):
         """Callback for relay point pose updates"""
+        # Check if behavior has been terminated
+        if hasattr(self, '_terminated') and self._terminated:
+            return
+            
         self.relay_pose = msg
         # print(f"[{self.name}] DEBUG: Relay{self.relay_number} pose updated: ({msg.position.x:.3f}, {msg.position.y:.3f})")
     
     def last_robot_pose_callback(self, msg):
         """Callback for last robot pose updates"""
+        # Check if behavior has been terminated
+        if hasattr(self, '_terminated') and self._terminated:
+            return
+            
         self.last_robot_pose = msg.pose.pose
     
     def parcel_pose_callback(self, msg):
         """Callback for parcel pose updates"""
+        # Check if behavior has been terminated
+        if hasattr(self, '_terminated') and self._terminated:
+            return
+            
         self.parcel_pose = msg
         # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
     
@@ -345,20 +396,30 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         previous_finished = self.check_previous_robot_finished()
         previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
         
-        print(f"[{self.name}] DEBUG: Elapsed: {elapsed:.1f}s, Previous robot finished: {previous_finished}")
+        # Only print status occasionally to reduce CPU load
+        if not hasattr(self, '_status_print_count'):
+            self._status_print_count = 0
+        self._status_print_count += 1
+        
+        if self._status_print_count % 10 == 0:  # Print only every 10 cycles
+            print(f"[{self.name}] DEBUG: Elapsed: {elapsed:.1f}s, Previous robot finished: {previous_finished}")
         
         if not previous_finished:
-            print(f"[{self.name}] DEBUG: Still waiting for {previous_robot_namespace} to finish pushing")
+            if self._status_print_count % 10 == 0:  # Print only every 10 cycles
+                print(f"[{self.name}] DEBUG: Still waiting for {previous_robot_namespace} to finish pushing")
             self.feedback_message = f"[{self.robot_namespace}] Waiting for {previous_robot_namespace} to finish pushing..."
             return py_trees.common.Status.RUNNING
         
         # For non-turtlebot0 robots, also check if last robot is out of relay range
         if not self.is_first_robot:
             last_robot_out = self.check_last_robot_out_of_relay_range()
-            print(f"[{self.name}] DEBUG: Last robot out of relay range: {last_robot_out}")
+            
+            if self._status_print_count % 10 == 0:  # Print only every 10 cycles
+                print(f"[{self.name}] DEBUG: Last robot out of relay range: {last_robot_out}")
             
             if not last_robot_out:
-                print(f"[{self.name}] DEBUG: Still waiting for last robot (tb{self.last_robot_number}) to move out of relay range")
+                if self._status_print_count % 10 == 0:  # Print only every 10 cycles
+                    print(f"[{self.name}] DEBUG: Still waiting for last robot (tb{self.last_robot_number}) to move out of relay range")
                 self.feedback_message = f"[{self.robot_namespace}] Waiting for tb{self.last_robot_number} to move out of relay range..."
                 return py_trees.common.Status.RUNNING
         
@@ -371,11 +432,19 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         """Clean up when behavior terminates"""
         # Don't destroy the shared node here - it's managed by the behavior tree
         # Just clean up subscriptions if needed
+        print(f"[{self.name}] 🔧 TERMINATING: Cleaning up subscriptions, status: {new_status}")
+        
+        # Mark as terminated to prevent further callbacks
+        self._terminated = True
+        
         if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub:
             try:
+                print(f"[{self.name}] 🔧 Destroying robot_pose_sub...")
                 self.node.destroy_subscription(self.robot_pose_sub)
                 self.robot_pose_sub = None
-            except:
+                print(f"[{self.name}] ✅ Successfully destroyed robot_pose_sub")
+            except Exception as e:
+                print(f"[{self.name}] ❌ Error destroying robot_pose_sub: {e}")
                 pass
         if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub:
             try:
@@ -445,6 +514,10 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         """
         在专属线程池中执行实际的回调处理逻辑
         """
+        # First check if behavior has been terminated - skip callbacks if so
+        if hasattr(self, '_terminated') and self._terminated:
+            return
+            
         try:
             if callback_type == 'robot_pose':
                 self.robot_pose_callback(msg)
@@ -464,7 +537,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
 
 class WaitForPick(py_trees.behaviour.Behaviour):
     """
-    Wait behavior for picking phase.
+    Wait behavior for picking phase using inotify for file system monitoring.
     Success condition: 
     - For turtlebot0 (first robot): Always succeed immediately
     - For non-turtlebot0 robots: Success only if replanned trajectory file exists from last robot
@@ -485,18 +558,30 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         
         # File-based coordination instead of ROS messages
         self.case_name = "simple_maze"  # Default case name
-        self.replanned_file_exists = True if self.is_first_robot else False
+        self._file_exists = True if self.is_first_robot else False  # Internal state, use property access
+        
+        # File monitoring components
+        self.watch_manager = None
+        self.notifier = None
+        self.watch_descriptor = None
+        self.watch_path = f"/root/workspace/data/{self.case_name}"
+        self.target_file = f"tb{self.last_robot_number}_Trajectory_replanned.json"
         
         # No ROS node needed for file-based coordination
         self.node = None
         
+    @property
+    def replanned_file_exists(self):
+        """Property accessor for file existence state - only updated by EventHandler"""
+        return self._file_exists
+    
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
     def check_replanned_file_exists(self):
-        """Check if the replanned trajectory file exists from the last robot"""
+        """Initial check if the replanned trajectory file exists from the last robot"""
         if self.is_first_robot:
             return True  # First robot doesn't need to wait for files
         
@@ -505,21 +590,109 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         replanned_file_path = f"/root/workspace/data/{self.case_name}/tb{self.last_robot_number}_Trajectory_replanned.json"
         
         file_exists = os.path.exists(replanned_file_path)
-        if file_exists and not self.replanned_file_exists:
+        if file_exists and not self._file_exists:
             # First time detecting the file
-            print(f"[{self.name}] Found replanned file: {replanned_file_path}")
-            self.replanned_file_exists = True
+            print(f"[{self.name}] Found replanned file during initial check: {replanned_file_path}")
+            self._file_exists = True
         
         return file_exists
     
     def check_success_conditions(self):
         """Check if success conditions are met for pick phase"""
-        # For turtlebot0 (first robot): always succeed
+        # Simplified logic: first robot always succeeds, others succeed when file exists
+        return self.is_first_robot or self.replanned_file_exists
+    
+    def setup_file_watcher(self):
+        """Set up inotify watcher for file creation events"""
         if self.is_first_robot:
+            return True  # First robot doesn't need to monitor files
+            
+        try:
+            # Ensure the directory to watch exists
+            if not os.path.exists(self.watch_path):
+                try:
+                    os.makedirs(self.watch_path, exist_ok=True)
+                    print(f"[{self.name}] Created watch directory: {self.watch_path}")
+                except Exception as e:
+                    print(f"[{self.name}] Error creating watch directory: {str(e)}")
+                    # Continue anyway - the directory might be created later
+            
+            # Setup inotify watcher
+            self.watch_manager = pyinotify.WatchManager()
+            
+            # Event handler for file creation/modification
+            class EventHandler(pyinotify.ProcessEvent):
+                def __init__(self, waitforpick_instance):
+                    self.waitforpick = waitforpick_instance
+                    
+                def process_IN_CREATE(self, event):
+                    self._check_target_file(event)
+                    
+                def process_IN_CLOSE_WRITE(self, event):
+                    self._check_target_file(event)
+                    
+                def process_IN_MOVED_TO(self, event):
+                    self._check_target_file(event)
+                    
+                def _check_target_file(self, event):
+                    if event.name == self.waitforpick.target_file:
+                        self.waitforpick._file_exists = True
+                        print(f"[{self.waitforpick.name}] ⚡ File event detected: {event.pathname} was created/modified")
+            
+            # Set up the notifier with our event handler
+            handler = EventHandler(self)
+            self.notifier = pyinotify.ThreadedNotifier(self.watch_manager, handler)
+            self.notifier.daemon = True  # Set as daemon thread to avoid blocking process exit
+            self.notifier.start()
+            
+            # Add a watch for the directory with auto_add to watch new subdirectories
+            mask = pyinotify.IN_CREATE | pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO
+            self.watch_descriptor = self.watch_manager.add_watch(self.watch_path, mask, rec=False, auto_add=True)
+            
+            if self.watch_path in self.watch_descriptor:
+                watch_success = (self.watch_descriptor[self.watch_path] > 0)
+                if watch_success:
+                    print(f"[{self.name}] ✓ File watcher set up for directory: {self.watch_path}")
+                    print(f"[{self.name}] ✓ Monitoring for file: {self.target_file}")
+                else:
+                    print(f"[{self.name}] ⚠️ Watch descriptor for {self.watch_path} appears invalid")
+            else:
+                print(f"[{self.name}] ⚠️ Directory {self.watch_path} not in watch descriptors")
+            
+            # Also do an initial check in case the file already exists
+            self.check_replanned_file_exists()
+            
             return True
+        except Exception as e:
+            print(f"[{self.name}] ❌ Error setting up file watcher: {str(e)}")
+            return False
+    
+    def _retry_file_watcher_setup(self):
+        """Try to re-setup the file watcher if it has failed or stopped working"""
+        if self.is_first_robot:
+            return True  # First robot doesn't need file monitoring
         
-        # For non-turtlebot0 robots: success only if replanned file exists
-        return self.check_replanned_file_exists()
+        # Clean up any existing watcher to prevent resource leaks
+        if self.notifier is not None:
+            try:
+                self.notifier.stop()
+                print(f"[{self.name}] Stopped existing file watcher before retry")
+            except Exception as e:
+                print(f"[{self.name}] Error stopping existing watcher: {str(e)}")
+                
+        # Reset components
+        self.watch_manager = None
+        self.notifier = None
+        self.watch_descriptor = None
+        
+        # Try to setup the watcher again
+        retry_success = self.setup_file_watcher()
+        if retry_success:
+            print(f"[{self.name}] ✅ Successfully restored file monitoring")
+        else:
+            print(f"[{self.name}] ❌ Failed to restore file monitoring")
+            
+        return retry_success
     
     def initialise(self):
         """Initialize the behavior when it starts running"""
@@ -530,21 +703,44 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         if self.is_first_robot:
             print(f"[{self.name}] turtlebot0: Always ready for PICK")
         else:
+            # Set up the file watcher using inotify
+            if not self.setup_file_watcher():
+                print(f"[{self.name}] ERROR: Failed to set up file watcher - file detection may not work!")
+            
             print(f"[{self.name}] tb{self.namespace_number}: Waiting for replanned file from tb{self.last_robot_number}")
     
     def update(self) -> py_trees.common.Status:
-        """Main update method"""
+        """Main update method - fully event-driven, no polling"""
         # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
         
         elapsed = time.time() - self.start_time
         
-        # Check success conditions
+        # Check success conditions - file existence flag is updated by inotify events in background
         if self.check_success_conditions():
             if self.is_first_robot:
                 print(f"[{self.name}] SUCCESS: turtlebot0 ready for PICK!")
             else:
                 print(f"[{self.name}] SUCCESS: Replanned file found from tb{self.last_robot_number}, ready for PICK!")
             return py_trees.common.Status.SUCCESS
+        
+        # Check and attempt to restore inotify watcher if needed (every 5 seconds)
+        # This handles cases where the directory was deleted/recreated or other monitoring failures
+        if not self.is_first_robot and elapsed % 5.0 < 0.1:
+            watcher_inactive = (
+                self.notifier is None or 
+                self.watch_manager is None or 
+                not self.watch_descriptor or 
+                self.watch_path not in self.watch_descriptor
+            )
+            
+            if watcher_inactive:
+                print(f"[{self.name}] WARNING: File monitoring appears to be inactive, attempting to restore...")
+                self._retry_file_watcher_setup()
+            
+            # Also check if the watch directory exists, if not, retry setup
+            elif not os.path.exists(self.watch_path):
+                print(f"[{self.name}] WARNING: Watch directory {self.watch_path} no longer exists, attempting to restore...")
+                self._retry_file_watcher_setup()
         
         # Timeout condition - FAILURE if conditions not met
         if elapsed >= self.duration:
@@ -564,15 +760,38 @@ class WaitForPick(py_trees.behaviour.Behaviour):
             if self.is_first_robot:
                 print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | turtlebot0 ready")
             else:
-                file_exists = self.check_replanned_file_exists()
-                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | Replanned file exists: {file_exists}")
+                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | Replanned file exists: {self.replanned_file_exists}")
         
         return py_trees.common.Status.RUNNING
     
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
+        # Clean up file watcher components
+        if self.notifier is not None:
+            try:
+                self.notifier.stop()
+                print(f"[{self.name}] File watcher notifier stopped")
+            except Exception as e:
+                print(f"[{self.name}] Error stopping notifier: {str(e)}")
+        
+        # Release watch descriptors and manager
+        if self.watch_manager is not None:
+            try:
+                if self.watch_descriptor and self.watch_path in self.watch_descriptor:
+                    self.watch_manager.rm_watch(self.watch_descriptor[self.watch_path])
+                self.watch_manager = None
+                print(f"[{self.name}] Watch manager cleaned up")
+            except Exception as e:
+                print(f"[{self.name}] Error cleaning up watch manager: {str(e)}")
+            
+        # Clean up ROS node if it exists
         if hasattr(self, 'node') and self.node is not None:
-            self.node.destroy_node()
+            try:
+                self.node.destroy_node()
+                print(f"[{self.name}] Node destroyed")
+            except:
+                pass
+            
         super().terminate(new_status)
 
 
@@ -734,287 +953,6 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         return py_trees.common.Status.RUNNING
     
-    def terminate(self, new_status):
-        """Clean up when behavior terminates"""
-        if hasattr(self, 'node') and self.node:
-            self.node.destroy_node()
-        super().terminate(new_status)
-
-
-
-class ApproachObject(py_trees.behaviour.Behaviour):
-    """
-    Approach Object behavior - integrates with State_switch approaching_target logic.
-    Uses MPC controller to make the robot approach the parcel based on the logic from State_switch.py.
-    """
-
-    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.12):
-        """
-        Initialize the ApproachObject behavior.
-        
-        Args:
-            name: Name of the behavior node
-            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
-            approach_distance: Distance to maintain from the parcel (default 0.12m)
-        """
-        super(ApproachObject, self).__init__(name)
-        self.robot_namespace = robot_namespace
-        self.approach_distance = approach_distance
-        
-        # Extract namespace number for topic subscriptions
-        self.namespace_number = self.extract_namespace_number(robot_namespace)
-        
-        # Pose storage
-        self.robot_pose = None
-        self.parcel_pose = None
-        self.current_parcel_index = 0
-        
-        # State variables
-        self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
-        self.target_state = np.array([0.0, 0.0, 0.0])   # [x, y, theta]
-        self.approaching_target = False
-        
-        # ROS2 components (will be initialized in setup)
-        self.ros_node = None
-        self.callback_group = None  # Will be initialized in setup
-        self.robot_pose_sub = None
-        self.parcel_pose_sub = None
-        self.current_index_sub = None
-        self.cmd_vel_pub = None
-        
-        # MPC controller
-        self.mpc = MobileRobotMPC()
-        
-        # Threading lock for state protection
-        self.lock = threading.Lock()
-        
-    def extract_namespace_number(self, namespace):
-        """Extract numerical index from namespace string using regex"""
-        import re
-        match = re.search(r'\d+', namespace)
-        return int(match.group()) if match else 0
-
-    def setup(self, **kwargs):
-        """Setup ROS connections"""
-        try:
-            # Get or create ROS node
-            if 'node' in kwargs:
-                self.ros_node = kwargs['node']
-            else:
-                import rclpy
-                from rclpy.node import Node
-                
-                if not rclpy.ok():
-                    rclpy.init()
-                
-                class ApproachObjectNode(Node):
-                    def __init__(self):
-                        super().__init__(f'approach_object_{self.robot_namespace}')
-                
-                self.ros_node = ApproachObjectNode()
-            
-            # 🔧 关键优化：使用机器人专用的MutuallyExclusiveCallbackGroup实现线程隔离
-            # 🔧 CRITICAL FIX: Use shared callback groups to prevent proliferation
-            if hasattr(self.ros_node, 'shared_callback_manager'):
-                self.callback_group = self.ros_node.shared_callback_manager.get_group('sensor')
-                print(f"[{self.name}] ✅ Using shared sensor callback group: {id(self.callback_group)}")
-            elif hasattr(self.ros_node, 'robot_dedicated_callback_group'):
-                self.callback_group = self.ros_node.robot_dedicated_callback_group
-                print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
-            else:
-                print(f"[{self.name}] ❌ 错误：没有找到shared_callback_manager，无法使用共享回调组")
-                return False
-            
-            # Create command velocity publisher
-            self.cmd_vel_pub = self.ros_node.create_publisher(
-                Twist, f'/{self.robot_namespace}/cmd_vel', 10)
-            
-            # Subscribe to robot pose (Odometry) with callback group
-            self.robot_pose_sub = self.ros_node.create_subscription(
-                Odometry, f'/turtlebot{self.namespace_number}/odom_map',
-                self.robot_pose_callback, 10, callback_group=self.callback_group)
-            
-            # Subscribe to current parcel index with callback group
-            self.current_index_sub = self.ros_node.create_subscription(
-                Int32, f'/{self.robot_namespace}/current_parcel_index',
-                self.current_index_callback, 10, callback_group=self.callback_group)
-            
-            # Initial parcel subscription (will be updated based on current index)
-            self.update_parcel_subscription()
-            
-            self.ros_node.get_logger().info(
-                f'ApproachObject setup complete for {self.robot_namespace} with callback group')
-            return True
-            
-        except Exception as e:
-            print(f"ApproachObject setup failed: {e}")
-            return False
-
-    def update_parcel_subscription(self):
-        """Update subscription to the correct parcel topic based on current index"""
-        if self.ros_node is None:
-            return
-            
-        # Unsubscribe from previous parcel topic if it exists
-        if self.parcel_pose_sub is not None:
-            self.ros_node.destroy_subscription(self.parcel_pose_sub)
-        
-        # Subscribe to current parcel topic with callback group
-        parcel_topic = f'/parcel{self.current_parcel_index}/pose'
-        self.parcel_pose_sub = self.ros_node.create_subscription(
-            PoseStamped, parcel_topic, self.parcel_pose_callback, 10,
-            callback_group=self.callback_group)
-        
-        self.ros_node.get_logger().info(f'Updated parcel subscription to: {parcel_topic} with callback group')
-
-    def robot_pose_callback(self, msg):
-        """Callback for robot pose updates (Odometry message)"""
-        with self.lock:
-            self.robot_pose = msg.pose.pose
-            # Update current state for MPC
-            self.current_state = np.array([
-                self.robot_pose.position.x,
-                self.robot_pose.position.y,
-                self.quaternion_to_yaw(self.robot_pose.orientation)
-            ])
-
-    def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates (PoseStamped message)"""
-        with self.lock:
-            self.parcel_pose = msg.pose
-
-    def current_index_callback(self, msg):
-        """Callback for current parcel index updates"""
-        new_index = msg.data
-        if new_index != self.current_parcel_index:
-            with self.lock:
-                old_index = self.current_parcel_index
-                self.current_parcel_index = new_index
-                self.update_parcel_subscription()
-                self.ros_node.get_logger().info(
-                    f'ApproachObject updated parcel index: {old_index} -> {self.current_parcel_index}')
-
-    def calculate_distance(self, pose1, pose2):
-        """Calculate Euclidean distance between two poses"""
-        if pose1 is None or pose2 is None:
-            return float('inf')
-        
-        # Handle different pose message types
-        if hasattr(pose1, 'pose'):
-            pose1 = pose1.pose
-        if hasattr(pose2, 'pose'):
-            pose2 = pose2.pose
-            
-        dx = pose1.position.x - pose2.position.x
-        dy = pose1.position.y - pose2.position.y
-        return math.sqrt(dx**2 + dy**2)
-
-    def quaternion_to_yaw(self, quat):
-        """Convert quaternion to yaw angle"""
-        x = quat.x
-        y = quat.y
-        z = quat.z
-        w = quat.w
-        quat_list = [x, y, z, w]
-        euler = tf_transformations.euler_from_quaternion(quat_list)
-        return euler[2]
-
-    def get_direction(self, robot_theta, parcel_theta):
-        """Get optimal approach direction - from State_switch.py"""
-        # Normalize input angles to [-π, π]
-        def normalize(angle):
-            return (angle + np.pi) % (2 * np.pi) - np.pi
-        
-        robot_theta = normalize(robot_theta)
-        parcel_theta = normalize(parcel_theta)
-        
-        # Generate candidate angles and normalize
-        candidates = [
-            parcel_theta,
-            normalize(parcel_theta + np.pi/2),  # Turn right 90 degrees
-            normalize(parcel_theta - np.pi/2),  # Turn left 90 degrees
-            normalize(parcel_theta + np.pi),    # 180 degrees
-        ]
-        
-        # Calculate minimum circular angle difference
-        diffs = [abs(normalize(c - robot_theta)) for c in candidates]
-        
-        index_min = np.argmin(diffs)
-        return candidates[index_min]
-
-    def initialise(self):
-        """Initialize the behavior when it starts running"""
-        self.approaching_target = False
-        self.feedback_message = "Initializing approach behavior"
-        
-        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
-
-    def update(self):
-        """
-        Main update method - implements the approaching_target logic from State_switch.py
-        """
-        # NOTE: Do NOT call rclpy.spin_once() here as we're using MultiThreadedExecutor
-
-        with self.lock:
-            # Check if we have the necessary pose data
-            if self.robot_pose is None or self.parcel_pose is None:
-                self.feedback_message = "Waiting for pose data..."
-                return py_trees.common.Status.RUNNING
-
-            # Calculate distance to parcel
-            distance_to_parcel = self.calculate_distance(self.robot_pose, self.parcel_pose)
-            
-            # Check if we need to approach (distance > 0.25m as in State_switch.py)
-            if distance_to_parcel > 0.25:
-                self.approaching_target = True
-                self.feedback_message = f"Approaching parcel - Distance: {distance_to_parcel:.2f}m"
-                
-                # Compute target state following State_switch.py logic
-                self.target_state = np.array([
-                    self.parcel_pose.position.x,
-                    self.parcel_pose.position.y,
-                    self.quaternion_to_yaw(self.parcel_pose.orientation)
-                ])
-                
-                # Get optimal direction and apply offset (0.12m as in State_switch.py)
-                optimal_direction = self.get_direction(
-                    self.current_state[2],
-                    self.target_state[2]
-                )
-                self.target_state[2] = optimal_direction
-                self.target_state[0] = self.target_state[0] - self.approach_distance * math.cos(optimal_direction)
-                self.target_state[1] = self.target_state[1] - self.approach_distance * math.sin(optimal_direction)
-                
-                # Generate and apply control using MPC
-                u = self.mpc.update_control(self.current_state, self.target_state)
-                
-                if u is not None and self.cmd_vel_pub:
-                    cmd = Twist()
-                    cmd.linear.x = float(u[0])
-                    cmd.angular.z = float(u[1])
-                    self.cmd_vel_pub.publish(cmd)
-                
-                return py_trees.common.Status.RUNNING
-                
-            else:
-                # Robot reached target position (distance <= 0.25m)
-                if self.approaching_target:
-                    self.approaching_target = False
-                    self.feedback_message = "Target position reached, approach complete"
-                    
-                    # Stop the robot
-                    if self.cmd_vel_pub:
-                        cmd = Twist()
-                        cmd.linear.x = 0.0
-                        cmd.angular.z = 0.0
-                        self.cmd_vel_pub.publish(cmd)
-                    
-                    return py_trees.common.Status.SUCCESS
-                else:
-                    # Already at target, return success immediately
-                    self.feedback_message = f"Already at target - Distance: {distance_to_parcel:.2f}m"
-                    return py_trees.common.Status.SUCCESS
-
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
         # Stop the robot

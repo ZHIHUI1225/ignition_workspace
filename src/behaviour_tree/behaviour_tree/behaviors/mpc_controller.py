@@ -30,7 +30,7 @@ class GeneralMPCController:
         # MPC parameters - optimized for trajectory following
         self.N = 10           # Prediction horizon
         self.N_c = 3          # Control horizon
-        self.dt = 0.1         # Time step
+        self.dt = 0.5         # Time step (2Hz)
         
         # Tuned weights for precise trajectory tracking
         if controller_type == "pick":
