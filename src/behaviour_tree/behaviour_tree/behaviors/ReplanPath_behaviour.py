@@ -66,11 +66,11 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] Using default target time for turtlebot0: {raw_target_time:.2f}s")
         else:
             # turtlebotN gets pushing_estimated_time from turtlebot(N-1) via ROS topic
-            raw_target_time = self.previous_robot_pushing_estimated_time-5 # 5 seconds earlier than previous robot's estimate
+            raw_target_time = self.previous_robot_pushing_estimated_time-7# 7 seconds earlier than previous robot's estimate
             print(f"[{self.name}] Getting target time from {self.previous_robot_namespace} via ROS topic: {raw_target_time:.2f}s")
 
-        # Check if pushing_estimated_time is too small (< 20 seconds)
-        if raw_target_time < 20.0:
+        # Check if pushing_estimated_time is too small (< 5 seconds)
+        if raw_target_time < 5.0:
             from .tree_builder import report_node_failure
             error_msg = f"Pushing estimated time ({raw_target_time:.2f}s) is too small (< 20s) and fallback copy failed"
             report_node_failure(self.name, error_msg, self.robot_namespace)

@@ -14,8 +14,8 @@ sys.path.append('/root/workspace/src/Replanning/scripts')
 from Graph import load_reeb_graph_from_file
 
 # Differential drive constants (from Planning_deltaT.py)
-aw_max = 0.2 * np.pi  # the maximum angular acceleration
-w_max = 0.6 * np.pi   # the maximum angular velocity
+aw_max = 0.4 * np.pi  # the maximum angular acceleration
+w_max = 0.8 * np.pi   # the maximum angular velocity
 r_limit = 0.75        # m
 r_w = 0.033          # the radius of the wheel
 v_max = w_max * r_w  # m/s
@@ -400,9 +400,9 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
         
         opti.minimize(objective)
         
-        # Total time constraints (allow 20% flexibility for more robust optimization)
-        opti.subject_to(total_time >= target_time * 0.8)
-        opti.subject_to(total_time <= target_time * 1.2)
+        # Total time constraints
+        opti.subject_to(total_time >= target_time -5)
+        opti.subject_to(total_time <= target_time +5)
         
 
         # Detailed subsegment optimization - use loaded data and physics-based estimates

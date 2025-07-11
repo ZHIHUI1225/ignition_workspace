@@ -240,12 +240,15 @@ def main():
         try:
             temp_node.declare_parameter('robot_id', 0)
             temp_node.declare_parameter('robot_namespace', 'turtlebot0')
+            temp_node.declare_parameter('case', 'simple_maze')
             robot_id = temp_node.get_parameter('robot_id').get_parameter_value().integer_value
             robot_namespace = temp_node.get_parameter('robot_namespace').get_parameter_value().string_value
+            case = temp_node.get_parameter('case').get_parameter_value().string_value
         except Exception as e:
             print(f"Warning: Could not get robot parameters: {e}")
             robot_id = 0
             robot_namespace = "turtlebot0"
+            case = "simple_maze"
         
         # Destroy temporary node
         temp_node.destroy_node()
@@ -295,14 +298,17 @@ def main():
         # Declare robot parameters to main node
         ros_node.declare_parameter('robot_id', robot_id)
         ros_node.declare_parameter('robot_namespace', robot_namespace)
+        ros_node.declare_parameter('case', case)
         
         print(f"="*80)
         print(f"BEHAVIOR TREE FOR ROBOT {robot_id} ({robot_namespace})")
+        print(f"CASE: {case}")
         print(f"="*80)
         
         # Create behavior tree
         # Use robot_namespace directly since we now use "turtlebot{i}" format throughout
-        root = create_root(robot_namespace)
+        # Use case parameter from launch file
+        root = create_root(robot_namespace, case=case)
         
         # CRITICAL FIX: Initialize blackboard variables BEFORE setup phase
         # This ensures behaviors can access blackboard keys during their setup() calls

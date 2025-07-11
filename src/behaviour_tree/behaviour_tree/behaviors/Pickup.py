@@ -246,7 +246,7 @@ class MobileRobotMPC:
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0, estimated_time=55.0, dt=0.5):
+    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0, estimated_time=55.0, dt=0.5, case="simple_maze"):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
@@ -254,7 +254,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.number=extract_namespace_number(robot_namespace)
         self.picking_complete = False
         self.robot_namespace = robot_namespace  # Use provided robot_namespace
-        self.case = "simple_maze"  # Default case
+        self.case = case  # Use provided case instead of hardcoded default
         self.timeout = timeout  # Timeout in seconds
         self.estimated_time = estimated_time  # Estimated time for pushing operation in seconds
         
