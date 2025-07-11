@@ -44,40 +44,6 @@ def report_node_failure(node_name, error_info, robot_namespace, blackboard_clien
         print(f"[ERROR][{robot_namespace}] Failed to report failure for {node_name}: {e}")
 
 
-class FailureHandler(py_trees.behaviour.Behaviour):
-    """简化的失败处理器 - 处理单个节点失败"""
-    
-    def __init__(self, name, robot_namespace="turtlebot0"):
-        super().__init__(name)
-        self.robot_namespace = robot_namespace
-        self.blackboard = py_trees.blackboard.Client(name=self.name)
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/system_failed",
-            access=py_trees.common.Access.WRITE
-        )
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/failure_context",
-            access=py_trees.common.Access.READ
-        )
-    
-    def update(self):
-        print(f"[{self.name}][{self.robot_namespace}] FailureHandler 激活 - 单节点失败处理")
-        
-        # 设置系统失败标志
-        self.blackboard.set(f"{self.robot_namespace}/system_failed", True)
-        
-        # 尝试读取失败上下文
-        try:
-            failure_context = self.blackboard.get(f"{self.robot_namespace}/failure_context")
-            if failure_context:
-                print(f"[{self.name}][{self.robot_namespace}] 失败上下文: {failure_context}")
-        except KeyError:
-            pass
-        
-        print(f"[{self.name}][{self.robot_namespace}] 返回 FAILURE - 触发循环终止")
-        return py_trees.common.Status.FAILURE
-
-
 class LoopCondition(py_trees.behaviour.Behaviour):
     """强化循环条件检查器 - 精确失败检测与快速响应"""
     
@@ -195,7 +161,7 @@ class GlobalExceptionHandler(py_trees.behaviour.Behaviour):
 
 
 
-def create_root(robot_namespace="turtlebot0"):
+def create_root(robot_namespace="turtlebot0", case="simple_maze"):
     """Create behavior tree root node with optimized Selector+LoopCondition control and parallel blackboard init"""
     root = py_trees.composites.Sequence(name="MainSequence", memory=True)
     
@@ -240,7 +206,7 @@ def create_root(robot_namespace="turtlebot0"):
     pushing_sequence.add_children([
         create_event_driven_wait_for_push("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
         ApproachObject("ApproachingPush", robot_namespace),
-        PushObject("Pushing", robot_namespace, distance_threshold=0.09)
+        PushObject("Pushing", robot_namespace, distance_threshold=0.07, case=case)
     ])
     
     # Parallel execution for move + replan
@@ -250,14 +216,14 @@ def create_root(robot_namespace="turtlebot0"):
     )
     parallel_move_replan.add_children([
         MoveBackward("BackwardToSafeDistance", distance=0.2),
-        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze", dt=CONTROL_DT)
+        ReplanPath("Replanning", 20.0, robot_namespace, case, dt=CONTROL_DT)
     ])
     
     # Picking sequence
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=CONTROL_DT),
+        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=CONTROL_DT, case=case),
         StopSystem("Stop", 1.5)
     ])
     
@@ -308,120 +274,3 @@ def create_root(robot_namespace="turtlebot0"):
     ])
     
     return root
-
-
-def create_alternate_root_with_selector_loop(robot_namespace="turtlebot0"):
-    """Alternative root creation using pure Selector+LoopCondition approach (no Repeat decorator)"""
-    root = py_trees.composites.Sequence(name="RootSequence", memory=True)
-    
-    # OPTIMIZATION: Parallel blackboard initialization for faster startup
-    init_blackboard_parallel = py_trees.composites.Parallel(
-        name="InitBlackboardParallel",
-        policy=py_trees.common.ParallelPolicy.SuccessOnAll()
-    )
-    
-    init_blackboard_parallel.add_children([
-        py_trees.behaviours.SetBlackboardVariable(
-            name="InitParcelIndex",
-            variable_name=f"{robot_namespace}/current_parcel_index",
-            variable_value=0,
-            overwrite=True
-        ),
-        py_trees.behaviours.SetBlackboardVariable(
-            name="InitSystemFailedFlag",
-            variable_name=f"{robot_namespace}/system_failed",
-            variable_value=False,
-            overwrite=True
-        ),
-        py_trees.behaviours.SetBlackboardVariable(
-            name="InitLoopIterationCount",
-            variable_name=f"{robot_namespace}/loop_iteration_count",
-            variable_value=0,
-            overwrite=True
-        ),
-        py_trees.behaviours.SetBlackboardVariable(
-            name="InitFailureContext",
-            variable_name=f"{robot_namespace}/failure_context",
-            variable_value=None,
-            overwrite=True
-        )
-    ])
-    
-    # Create main business logic sequence
-    main_logic_sequence = create_main_business_logic_sequence(robot_namespace)
-    
-    # Pure Selector-based loop implementation
-    # This selector implements the loop using recursive selection
-    main_loop_selector = py_trees.composites.Selector(
-        name="InfiniteLoopSelector",
-        memory=False  # Always start from first child
-    )
-    
-    # Loop body: condition check + business logic
-    loop_body = py_trees.composites.Sequence(name="LoopBody", memory=True)
-    loop_body.add_children([
-        LoopCondition("LoopConditionCheck", robot_namespace),
-        main_logic_sequence,
-        # Recursive call to selector to continue loop
-        py_trees.behaviours.Success(name="LoopContinue")  # Forces selector to restart
-    ])
-    
-    main_loop_selector.add_children([
-        loop_body,
-        GlobalExceptionHandler("GlobalFailureHandler", robot_namespace)
-    ])
-    
-    root.add_children([
-        init_blackboard_parallel,
-        main_loop_selector
-    ])
-    
-    return root
-
-
-def create_main_business_logic_sequence(robot_namespace="turtlebot0"):
-    """Create the main business logic sequence - separated for clarity"""
-    main_sequence = py_trees.composites.Sequence(name="MainBusinessLogic", memory=True)
-    
-    # Pushing sequence
-    pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
-    pushing_sequence.add_children([
-        create_event_driven_wait_for_push("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
-        ApproachObject("ApproachingPush", robot_namespace),
-        PushObject("Pushing", robot_namespace, distance_threshold=0.09)
-    ])
-    
-    # Parallel execution for move + replan
-    parallel_move_replan = py_trees.composites.Parallel(
-        name="ParallelMoveReplan",
-        policy=py_trees.common.ParallelPolicy.SuccessOnAll()
-    )
-    parallel_move_replan.add_children([
-        MoveBackward("BackwardToSafeDistance", distance=0.2),
-        ReplanPath("Replanning", 20.0, robot_namespace, "simple_maze", dt=CONTROL_DT)
-    ])
-    
-    # Picking sequence
-    picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
-    picking_up_sequence.add_children([
-        WaitForPick("WaitingPick", 2.0, robot_namespace),
-        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=CONTROL_DT),
-        StopSystem("Stop", 1.5)
-    ])
-    
-    # Completion check sequence
-    completion_sequence = py_trees.composites.Sequence(name="CompletionSequence", memory=True)
-    completion_sequence.add_children([
-        CheckPairComplete("CheckPairComplete", robot_namespace),
-        IncrementIndex("IncrementIndex", robot_namespace),
-    ])
-    
-    # Assemble main sequence
-    main_sequence.add_children([
-        pushing_sequence, 
-        parallel_move_replan, 
-        picking_up_sequence,
-        completion_sequence
-    ])
-    
-    return main_sequence

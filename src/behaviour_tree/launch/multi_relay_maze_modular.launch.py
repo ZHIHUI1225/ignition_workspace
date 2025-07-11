@@ -2,16 +2,6 @@
 """
 Launch file for multi-robot behavior trees using the modular structure.
 This launches separate behavior tree instances for each robot using the new modular behaviors.
-
-Usage examples:
-    # Launch with default case (simple_maze)
-    ros2 launch behaviour_tree multi_robot_behaviour_modular.launch.py
-    
-    # Launch with specific case
-    ros2 launch behaviour_tree multi_robot_behaviour_modular.launch.py case:=simulation
-    
-    # Launch with different number of robots and case
-    ros2 launch behaviour_tree multi_robot_behaviour_modular.launch.py num_robots:=2 case:=complex_maze
 """
 
 import os
@@ -28,7 +18,6 @@ def generate_launch_description():
     # Launch Arguments
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
     num_robots_config = LaunchConfiguration('num_robots', default='3')
-    case = LaunchConfiguration('case', default='simple_maze')
     
     # Launch description
     ld = LaunchDescription()
@@ -43,11 +32,6 @@ def generate_launch_description():
         'num_robots',
         default_value='3',
         description='Number of robots to launch behavior trees for'))
-    
-    ld.add_action(DeclareLaunchArgument(
-        'case',
-        default_value='simple_maze',
-        description='Case name for trajectory data and configuration'))
      # Direct robot node creation to avoid OpaqueFunction issues
     # Create behavior tree nodes for each robot with staggered startup
     from launch.actions import TimerAction
@@ -73,8 +57,7 @@ def generate_launch_description():
                     'use_sim_time': use_sim_time,
                     'robot_id': i,
                     'robot_namespace': robot_namespace,
-                    'tree_name': f'BehaviorTree_{i}',
-                    'case': case
+                    'tree_name': f'BehaviorTree_{i}'
                 }],
                 remappings=[
                     # Robot-specific topic remappings
