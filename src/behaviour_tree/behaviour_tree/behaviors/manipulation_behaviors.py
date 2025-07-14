@@ -155,7 +155,7 @@ class MobileRobotMPC:
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
-            'ipopt.max_iter': 40,        # Reduced iterations for speed
+            'ipopt.max_iter': 100,        # Reduced iterations for speed
             'ipopt.max_cpu_time': 0.4,   # Increased time limit (from 0.08s to 0.4s) for 0.5s control frequency
             'ipopt.tol': 5e-2,           # Relaxed tolerance for speed
             'ipopt.acceptable_tol': 1e-1, # Very relaxed acceptable tolerance
@@ -388,27 +388,27 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.state_lock = Lock()
     
     def setup(self, **kwargs):
-        """设置ROS节点和通信组件（优化：使用共享回调组管理器）"""
+        """Setup ROS node and communication components (optimized: using shared callback group manager)"""
         if 'node' in kwargs:
             self.node = kwargs['node']
             
-            # 🔧 关键修复：使用共享回调组管理器，避免创建新的回调组
+            # 🔧 CRITICAL FIX: Use shared callback group manager, avoid creating new callback groups
             if hasattr(self.node, 'shared_callback_manager'):
                 self.pose_callback_group = self.node.shared_callback_manager.get_group('sensor')
                 self.control_callback_group = self.node.shared_callback_manager.get_group('control')
             else:
-                # 错误情况：如果没有共享管理器，则记录错误并使用默认组
+                # Error case: If no shared manager, log error and use default group
                 self.pose_callback_group = None
                 self.control_callback_group = None
                 return False
             
-            # 获取命名空间参数
+            # Get namespace parameters
             try:
                 self.robot_namespace = self.node.get_parameter('robot_namespace').value
             except:
                 self.robot_namespace = "turtlebot0"
             
-            # 创建发布者（无回调组）
+            # Create publishers (no callback group)
             self.cmd_vel_pub = self.node.create_publisher(
                 Twist, f'/{self.robot_namespace}/cmd_vel', 10
             )
@@ -419,7 +419,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10
             )
             
-            # 创建可视化发布者
+            # Create visualization publishers
             self.prediction_pub = self.node.create_publisher(
                 Path, f'/{self.robot_namespace}/predicted_path', 10
             )
@@ -427,13 +427,13 @@ class PushObject(py_trees.behaviour.Behaviour):
                 Path, f'/{self.robot_namespace}/reference_path', 10
             )
             
-            # 初始化路径消息对象
+            # Initialize path message objects
             self.ref_path = Path()
             self.ref_path.header.frame_id = 'world'
             self.pred_path = Path()
             self.pred_path.header.frame_id = 'world'
             
-            # 初始化控制定时器为None (将在update中创建)
+            # Initialize control timer as None (will be created in update)
             self.control_timer = None
         return True
     
@@ -511,24 +511,24 @@ class PushObject(py_trees.behaviour.Behaviour):
 
     
     def robot_pose_callback(self, msg):
-        """Update robot state from odometry message - 优化为非阻塞快速处理"""
+        """Update robot state from odometry message - optimized for non-blocking fast processing"""
         try:
-            # 记录回调时间戳和调试信息
+            # Record callback timestamp and debug information
             current_time = time.time()
             self._last_robot_callback_time = current_time
             
-            # 🔧 关键调试：跟踪回调频率，特别是第三个机器人
+            # 🔧 CRITICAL DEBUG: Track callback frequency, especially for the third robot
             if not hasattr(self, '_robot_callback_count'):
                 self._robot_callback_count = 0
                 self._robot_callback_start_time = current_time
             
             self._robot_callback_count += 1
             
-            # 快速数据提取和更新（最小化锁持有时间）
+            # Fast data extraction and update (minimize lock holding time)
             position_x = msg.pose.pose.position.x
             position_y = msg.pose.pose.position.y
             
-            # 快速四元数转欧拉角
+            # Fast quaternion to euler conversion
             quat = [
                 msg.pose.pose.orientation.x,
                 msg.pose.pose.orientation.y,
@@ -538,11 +538,11 @@ class PushObject(py_trees.behaviour.Behaviour):
             euler = tf.euler_from_quaternion(quat)
             yaw = euler[2]
             
-            # 快速速度提取
+            # Fast velocity extraction
             linear_x = msg.twist.twist.linear.x
             angular_z = msg.twist.twist.angular.z
             
-            # 原子操作更新状态（最短锁时间）
+            # Atomic operation state update (shortest lock time)
             with self.state_lock:
                 if self.current_state is None:
                     self.current_state = np.zeros(5)  # [x, y, theta, v, omega]
@@ -553,22 +553,22 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.current_state[3] = linear_x
                 self.current_state[4] = angular_z
                 
-                # 添加到缓存
+                # Add to cache
                 try:
                     self._add_to_robot_cache(self.current_state)
                 except Exception as cache_error:
-                    # 缓存失败不应该影响主要功能
+                    # Cache failure should not affect main functionality
                     pass
 
             
         except Exception as e:
-            # 不打印完整traceback以避免I/O阻塞
+            # Don't print full traceback to avoid I/O blocking
             pass
 
     def parcel_pose_callback(self, msg):
-        """Update parcel pose from PoseStamped message - 优化为原子操作"""
+        """Update parcel pose from PoseStamped message - optimized as atomic operation"""
         try:
-            # 原子操作更新姿态数据（最小化锁持有时间）
+            # Atomic operation to update pose data (minimize lock holding time)
             with self.state_lock:
                 self.parcel_pose = msg.pose
                 # 添加到缓存
@@ -847,7 +847,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.cmd_vel_pub.publish(cmd_msg)
         
         # Debug output for control verification
-        print(f"[{self.name}] 控制命令已发布: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f} [存储序列 {self.control_step+1}/{self.mpc.N_c}]")
+        print(f"[{self.name}] Control command published: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f} [stored sequence {self.control_step+1}/{self.mpc.N_c}]")
         return True
     
     def control_loop(self):
@@ -923,7 +923,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                         
                         # Reduced position error logging frequency
                         if self._mpc_call_counter % 20 == 0:
-                            print(f"[{self.name}] 📏 当前位置误差: {current_error:.4f}m")
+                            print(f"[{self.name}] 📏 Current position error: {current_error:.4f}m")
                         
                         # Step 2: If error > 0.02m, find closest trajectory point and update trajectory index
                         if current_error > 0.02:
@@ -936,7 +936,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                             
                             # Reduced logging for performance - only log significant changes
                             if self.trajectory_index > old_idx + 5:  # Only log if significant jump
-                                print(f"[{self.name}] ✅ 轨迹索引已更新: {old_idx} -> {self.trajectory_index} (最近距离: {min_dist:.3f}m)")
+                                print(f"[{self.name}] ✅ Trajectory index updated: {old_idx} -> {self.trajectory_index} (closest distance: {min_dist:.3f}m)")
                         # Removed verbose logging for small errors to improve performance
                         
                         # Step 3: Prepare reference trajectory for MPC (from current index)
@@ -1042,10 +1042,10 @@ class PushObject(py_trees.behaviour.Behaviour):
             # Try to get current parcel index from blackboard with proper error handling
             try:
                 current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-                print(f"[{self.name}] 调试: 从黑板检索包裹索引: {current_parcel_index}")
+                print(f"[{self.name}] DEBUG: Retrieved parcel index from blackboard: {current_parcel_index}")
             except Exception as bb_error:
                 # Blackboard key doesn't exist yet - use default value
-                print(f"[{self.name}] 信息: 黑板键尚未就绪，使用默认包裹索引0: {bb_error}")
+                print(f"[{self.name}] INFO: Blackboard keys not ready, using default parcel index 0: {bb_error}")
                 current_parcel_index = 0
             
             # Always update self.current_parcel_index and create subscription
@@ -1056,11 +1056,11 @@ class PushObject(py_trees.behaviour.Behaviour):
             if self.parcel_pose_sub is not None:
                 self.node.destroy_subscription(self.parcel_pose_sub)
                 self.parcel_pose_sub = None
-                print(f"[{self.name}] 调试: 已销毁现有包裹订阅")
+                print(f"[{self.name}] DEBUG: Destroyed existing parcel subscription")
                 
             # 🔧 使用共享回调组管理器 - 不再创建临时回调组
             if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] ❌ 错误: 共享回调组未正确设置，无法创建包裹订阅")
+                print(f"[{self.name}] ❌ ERROR: Shared callback group not properly set up, cannot create parcel subscription")
                 return False
             
             # Create new parcel subscription (使用可靠QoS和共享ReentrantCallbackGroup)
@@ -1073,7 +1073,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 reliable_qos,
                 callback_group=self.pose_callback_group
             )
-            print(f"[{self.name}] ✅ 成功订阅包裹话题: {parcel_topic} (索引变化: {old_index} -> {current_parcel_index}) [使用ReentrantCallbackGroup支持高频并发, 节点: {self.node.get_name()}]")
+            print(f"[{self.name}] ✅ Successfully subscribed to parcel topic: {parcel_topic} (index change: {old_index} -> {current_parcel_index}) [using ReentrantCallbackGroup for high-frequency concurrent access, node: {self.node.get_name()}]")
             return True
             
         except Exception as e:
@@ -1090,7 +1090,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         try:
             # 如果已经有中继点数据，无需重新订阅
             if self.relay_pose is not None:
-                print(f"[{self.name}] ✅ 中继点数据已存在，跳过订阅")
+                print(f"[{self.name}] ✅ Relay point data already exists, skipping subscription")
                 return True
             
             # Clean up existing subscription if it exists
@@ -1100,7 +1100,7 @@ class PushObject(py_trees.behaviour.Behaviour):
             
             # 🔧 使用共享回调组管理器 - 不再创建临时回调组
             if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] ❌ 错误: 共享回调组未正确设置，无法创建中继点订阅")
+                print(f"[{self.name}] ❌ ERROR: Shared callback group not properly set up, cannot create relay point subscription")
                 return False
             
             # Subscribe to relay point pose (一次性读取静态数据，使用可靠QoS)
@@ -1111,7 +1111,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 PoseStamped, relay_topic,
                 self.relay_pose_callback, reliable_qos,
                 callback_group=self.pose_callback_group)
-            print(f"[{self.name}] ✅ 成功订阅中继话题: {relay_topic} (中继点: {relay_number}) [一次性读取，使用ReentrantCallbackGroup, 节点: {self.node.get_name()}]")
+            print(f"[{self.name}] ✅ Successfully subscribed to relay topic: {relay_topic} (relay point: {relay_number}) [one-time read, using ReentrantCallbackGroup, node: {self.node.get_name()}]")
             return True
             
         except Exception as e:
@@ -1132,7 +1132,7 @@ class PushObject(py_trees.behaviour.Behaviour):
             
             # 🔧 使用共享回调组管理器 - 不再创建临时回调组
             if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] ❌ 错误: 共享回调组未正确设置，无法创建机器人订阅")
+                print(f"[{self.name}] ❌ ERROR: Shared callback group not properly set up, cannot create robot subscription")
                 return False
             
             # Subscribe to robot odometry (使用可靠QoS和共享ReentrantCallbackGroup) 
@@ -1143,11 +1143,11 @@ class PushObject(py_trees.behaviour.Behaviour):
                 callback_group=self.pose_callback_group)
             
             # 🔧 关键调试：记录订阅创建信息
-            print(f"[{self.name}] ✅ 成功订阅机器人话题: {robot_odom_topic}")
-            print(f"[{self.name}] 🔧 节点名称: {self.node.get_name()}")
-            print(f"[{self.name}] 🔧 回调组ID: {id(self.pose_callback_group)}")
-            print(f"[{self.name}] 🔧 订阅对象ID: {id(self.robot_pose_sub)}")
-            print(f"[{self.name}] 🔧 机器人命名空间: {self.robot_namespace}")
+            print(f"[{self.name}] ✅ Successfully subscribed to robot topic: {robot_odom_topic}")
+            print(f"[{self.name}] 🔧 Node name: {self.node.get_name()}")
+            print(f"[{self.name}] 🔧 Callback group ID: {id(self.pose_callback_group)}")
+            print(f"[{self.name}] 🔧 Subscription object ID: {id(self.robot_pose_sub)}")
+            print(f"[{self.name}] 🔧 Robot namespace: {self.robot_namespace}")
             
             return True
             
@@ -1158,17 +1158,17 @@ class PushObject(py_trees.behaviour.Behaviour):
             return False
 
     def initialise(self):
-        """初始化行为状态并启动专用控制线程"""
-        print(f"[{self.name}] 开始初始化推送行为...")
+        """Initialize behavior state and start dedicated control thread"""
+        print(f"[{self.name}] Starting pushing behavior initialization...")
         
-        # 初始化数据缓存机制
+        # Initialize data cache mechanism
         try:
             self._init_data_cache()
-            print(f"[{self.name}] ✅ 数据缓存机制已初始化")
+            print(f"[{self.name}] ✅ Data cache mechanism initialized")
         except Exception as e:
-            print(f"[{self.name}] ⚠️ 缓存初始化失败: {e}，继续执行")
+            print(f"[{self.name}] ⚠️ Cache initialization failed: {e}, continuing execution")
         
-        # 重置状态变量 - 使用None而不是zeros来区分"未初始化"和"收到零值"
+        # Reset state variables - use None instead of zeros to distinguish "uninitialized" from "received zero values"
         self.current_state = None
         self.pushing_active = True
         self.start_time = time.time()
@@ -1201,21 +1201,21 @@ class PushObject(py_trees.behaviour.Behaviour):
         # 加载轨迹
         self._load_trajectory()
         
-        # 设置ROS订阅（使用优化的回调组和QoS）
-        print(f"[{self.name}] 设置ROS订阅...")
+        # Setup ROS subscriptions (using optimized callback groups and QoS)
+        print(f"[{self.name}] Setting up ROS subscriptions...")
         robot_sub_ok = self.setup_robot_subscription()
         parcel_sub_ok = self.setup_parcel_subscription()
         relay_sub_ok = self.setup_relay_subscription()
         
-        print(f"[{self.name}] 订阅状态: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_sub_ok}")
+        print(f"[{self.name}] Subscription status: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_sub_ok}")
         
-        # 关键：等待更长时间确保订阅建立和回调开始接收数据
-        print(f"[{self.name}] 等待订阅建立和数据接收...")
+        # Critical: wait longer to ensure subscriptions are established and callbacks start receiving data
+        print(f"[{self.name}] Waiting for subscriptions to establish and data reception...")
         time.sleep(0.8)  # 增加等待时间到800ms以确保gazebo到ros2转换稳定
         self.check_topic_connectivity()
         
         # Non-blocking data availability check (no while loops in timer callbacks)
-        print(f"[{self.name}] 检查关键数据可用性...")
+        print(f"[{self.name}] Checking key data availability...")
         
         # Check if we have sufficient data to start control (non-blocking)
         robot_has_data = (self.current_state is not None and 
@@ -1224,11 +1224,11 @@ class PushObject(py_trees.behaviour.Behaviour):
         parcel_has_data = self.parcel_pose is not None
         
         if robot_has_data and parcel_has_data:
-            print(f"[{self.name}] ✅ 关键数据已就绪")
+            print(f"[{self.name}] ✅ Key data is ready")
         else:
             robot_status = "✓" if robot_has_data else "✗"
             parcel_status = "✓" if parcel_has_data else "✗"
-            print(f"[{self.name}] ⚠️ 等待数据: robot:{robot_status} parcel:{parcel_status} - 控制将在数据到达后自动开始")
+            print(f"[{self.name}] ⚠️ Waiting for data: robot:{robot_status} parcel:{parcel_status} - control will start automatically when data arrives")
         
         # 最终数据检查
         robot_has_data = (self.current_state is not None and 
@@ -1237,9 +1237,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         parcel_has_data = self.parcel_pose is not None
         relay_has_data = self.relay_pose is not None
         
-        print(f"[{self.name}] 初始化数据检查: robot_data={robot_has_data}, parcel_data={parcel_has_data}, relay_data={relay_has_data}")
+        print(f"[{self.name}] Initialization data check: robot_data={robot_has_data}, parcel_data={parcel_has_data}, relay_data={relay_has_data}")
         if not robot_has_data or not parcel_has_data:
-            print(f"[{self.name}] ⚠️ 警告: 初始化后缺少关键姿态数据，将使用缓存机制和容错处理")
+            print(f"[{self.name}] ⚠️ WARNING: Missing key pose data after initialization, will use caching mechanism and fault tolerance")
         
         # 设置初始化完成标志
         self.initialization_complete = True
@@ -1251,15 +1251,15 @@ class PushObject(py_trees.behaviour.Behaviour):
                 self.control_loop,
                 callback_group=self.control_callback_group  # 使用共享回调组
             )
-            print(f"[{self.name}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用共享回调组)")
+            print(f"[{self.name}] ✅ Control timer started (period: {self.dt}s, using shared callback group)")
         else:
             # 回退方案：使用默认回调组
             self.control_timer = self.node.create_timer(
                 self.dt,  # 0.5s 定时器周期
                 self.control_loop
             )
-            print(f"[{self.name}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用默认回调组)")
-        print(f"[{self.name}] 推送行为初始化完成")
+            print(f"[{self.name}] ✅ Control timer started (period: {self.dt}s, using default callback group)")
+        print(f"[{self.name}] Push behavior initialization complete")
         
     def check_topic_connectivity(self):
         """验证话题数据流连通性（使用回调组避免阻塞）"""
@@ -1269,34 +1269,34 @@ class PushObject(py_trees.behaviour.Behaviour):
             f'/Relaypoint{self._extract_namespace_number()+1}/pose'
         ]
         
-        print(f"[{self.name}] 📊 话题连通性检查 (节点: {self.node.get_name() if self.node else 'None'})")
+        print(f"[{self.name}] 📊 Topic connectivity check (node: {self.node.get_name() if self.node else 'None'})")
         
         for topic in topics:
             try:
                 publishers = self.node.count_publishers(topic)
                 subscribers = self.node.count_subscribers(topic)
                 if publishers == 0:
-                    print(f"⚠️ 话题 {topic} 无发布者！")
+                    print(f"⚠️ Topic {topic} has no publishers!")
                 else:
-                    # 特殊处理中继点话题
+                    # Special handling for relay point topics
                     if "Relaypoint" in topic:
                         if self.relay_pose is not None:
-                            print(f"✅ 中继点数据已获取 {topic} (发布者: {publishers}, 订阅者: {subscribers}) [静态数据]")
+                            print(f"✅ Relay point data acquired {topic} (publishers: {publishers}, subscribers: {subscribers}) [static data]")
                         else:
-                            print(f"✅ 已连接 {topic} (发布者: {publishers}, 订阅者: {subscribers}) [等待静态数据]")
+                            print(f"✅ Connected {topic} (publishers: {publishers}, subscribers: {subscribers}) [waiting for static data]")
                     else:
-                        print(f"✅ 已连接 {topic} (发布者: {publishers}, 订阅者: {subscribers}) [回调组模式]")
+                        print(f"✅ Connected {topic} (publishers: {publishers}, subscribers: {subscribers}) [callback group mode]")
             except Exception as e:
-                print(f"❌ 话题检查失败: {topic} - {str(e)}")
+                print(f"❌ Topic check failed: {topic} - {str(e)}")
                 
         # Additional debug: Check if callbacks are actually being triggered
-        print(f"[{self.name}] 📊 回调状态检查:")
-        print(f"   机器人状态: {self.current_state is not None and not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])} (回调次数: {getattr(self, '_robot_callback_count', 0)})")
-        print(f"   包裹姿态: {self.parcel_pose is not None} (回调次数: {getattr(self, '_parcel_callback_count', 0)})")
-        print(f"   中继点姿态: {self.relay_pose is not None}")
+        print(f"[{self.name}] 📊 Callback status check:")
+        print(f"   Robot status: {self.current_state is not None and not np.allclose(self.current_state[:3], [0.0, 0.0, 0.0])} (callback count: {getattr(self, '_robot_callback_count', 0)})")
+        print(f"   Parcel pose: {self.parcel_pose is not None} (callback count: {getattr(self, '_parcel_callback_count', 0)})")
+        print(f"   Relay point pose: {self.relay_pose is not None}")
         
         # Check subscription objects
-        print(f"[{self.name}] 📊 订阅对象状态:")
+        print(f"[{self.name}] 📊 Subscription object status:")
         print(f"   robot_pose_sub: {self.robot_pose_sub is not None}")
         print(f"   parcel_pose_sub: {self.parcel_pose_sub is not None}")
         print(f"   relay_pose_sub: {self.relay_pose_sub is not None}")
@@ -1306,17 +1306,17 @@ class PushObject(py_trees.behaviour.Behaviour):
         try:
             topic_names_and_types = self.node.get_topic_names_and_types()
             available_topics = [name for name, _ in topic_names_and_types]
-            print(f"[{self.name}] 📊 系统可用话题数量: {len(available_topics)}")
+            print(f"[{self.name}] 📊 System available topic count: {len(available_topics)}")
             
             # Check if our expected topics exist
             for topic in topics:
                 if topic in available_topics:
-                    print(f"   ✅ 话题存在: {topic}")
+                    print(f"   ✅ Topic exists: {topic}")
                 else:
-                    print(f"   ❌ 话题不存在: {topic}")
+                    print(f"   ❌ Topic does not exist: {topic}")
                     
         except Exception as e:
-            print(f"[{self.name}] 警告: 无法检查系统话题列表: {e}")
+            print(f"[{self.name}] WARNING: Unable to check system topic list: {e}")
     
     def publish_pushing_estimated_time(self):
         """Publish the pushing estimated time via ROS topic"""
@@ -1443,7 +1443,7 @@ class PushObject(py_trees.behaviour.Behaviour):
     
     def terminate(self, new_status):
         """Clean up when behavior terminates - with thread-safe cleanup"""
-        print(f"[{self.name}] 开始终止推送行为，状态: {new_status}")
+        print(f"[{self.name}] Starting push behavior termination, status: {new_status}")
         
         # Step 1: 设置终止标志（线程安全）
         self.terminating = True
@@ -1464,9 +1464,9 @@ class PushObject(py_trees.behaviour.Behaviour):
                 cmd_msg.linear.x = 0.0
                 cmd_msg.angular.z = 0.0
                 self.cmd_vel_pub.publish(cmd_msg)
-                print(f"[{self.name}] 机器人已停止 [发布停止命令]")
+                print(f"[{self.name}] Robot stopped [published stop command]")
         except Exception as e:
-            print(f"[{self.name}] 警告: 停止机器人时出错: {e}")
+            print(f"[{self.name}] WARNING: Error stopping robot: {e}")
         
         # Step 4: 等待控制线程安全退出
         # Step 4: 等待控制线程安全退出
@@ -1475,9 +1475,9 @@ class PushObject(py_trees.behaviour.Behaviour):
                 # 停止定时器
                 self.node.destroy_timer(self.control_timer)
                 self.control_timer = None
-                print(f"[{self.name}] 控制定时器已销毁")
+                print(f"[{self.name}] Control timer destroyed")
             except Exception as e:
-                print(f"[{self.name}] 警告: 销毁定时器时出错: {e}")
+                print(f"[{self.name}] WARNING: Error destroying timer: {e}")
                 self.control_timer = None
         
         # Step 5: 线程安全的订阅清理
@@ -1500,22 +1500,22 @@ class PushObject(py_trees.behaviour.Behaviour):
                 except Exception as e:
                     subscription_errors.append(f"parcel_pose_sub: {e}")
             
-            # 清理中继点姿态订阅（可能已经被自动销毁）
+            # Clean up relay point pose subscription (may have been auto-destroyed)
             if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub is not None:
                 try:
                     self.node.destroy_subscription(self.relay_pose_sub)
                     self.relay_pose_sub = None
-                    print(f"[{self.name}] 中继点订阅已清理")
+                    print(f"[{self.name}] Relay point subscription cleaned up")
                 except Exception as e:
                     subscription_errors.append(f"relay_pose_sub: {e}")
             else:
-                # 中继点订阅可能已经在读取静态数据后被自动销毁
-                print(f"[{self.name}] 中继点订阅已经销毁（正常情况）")
+                # Relay point subscription may have been automatically destroyed after reading static data
+                print(f"[{self.name}] Relay point subscription already destroyed (normal case)")
             
             if subscription_errors:
-                print(f"[{self.name}] 订阅清理警告: {subscription_errors}")
+                print(f"[{self.name}] Subscription cleanup warnings: {subscription_errors}")
         
-        print(f"[{self.name}] 推送行为终止完成，状态: {new_status}")
+        print(f"[{self.name}] Push behavior termination complete, status: {new_status}")
     
     def _find_closest_reference_point(self, current_error=None, search_range=None):
         """
@@ -1669,7 +1669,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 v_command *= scale_factor
                 omega_command *= scale_factor
             
-            print(f"[{self.name}] PI控制: pos_err={position_error:.3f}m, ang_err={np.degrees(angular_error):.1f}°, v={v_command:.3f}, ω={omega_command:.3f}")
+            print(f"[{self.name}] PI control: pos_err={position_error:.3f}m, ang_err={np.degrees(angular_error):.1f}°, v={v_command:.3f}, ω={omega_command:.3f}")
             
             return np.array([[v_command], [omega_command]])
             
@@ -1683,7 +1683,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         self._pi_integral_linear = 0.0
         self._pi_integral_angular = 0.0
         self._pi_last_time = time.time()
-        print(f"[{self.name}] PI控制器积分项已重置")
+        print(f"[{self.name}] PI controller integral terms reset")
 
     def _advance_trajectory_index(self, best_idx=None):
         """Advance trajectory index with progress tracking - FORWARD ONLY"""
@@ -1729,7 +1729,7 @@ class PushObject(py_trees.behaviour.Behaviour):
             self._trajectory_update_count += 1
             
             # Log trajectory index changes with timing information
-            if time_since_last < 0.2:  # If updates are happening faster than 5Hz
+            if time_since_last < self.dt:  # If updates are happening faster than 5Hz
                 print(f"[{self.name}] ⚠️ FAST trajectory index update: {old_index} -> {new_index} in '{context}' (Δt={time_since_last:.3f}s)")
             else:
                 print(f"[{self.name}] ✅ Normal trajectory index update: {old_index} -> {new_index} in '{context}' (Δt={time_since_last:.3f}s)")
@@ -1747,7 +1747,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         # - MPC success: advance by N_c steps in control_loop()
         # - MPC failure: advance by 1 step in _handle_mpc_failure()
         print(f"[{self.name}] ⚠️ DEPRECATED: _check_and_advance_trajectory_based_on_progress() called")
-        print(f"[{self.name}] 📝 轨迹索引现在由MPC成功/失败逻辑明确管理")
+        print(f"[{self.name}] 📝 Trajectory index now explicitly managed by MPC success/failure logic")
         return
     
     def _has_valid_pose_data(self):
@@ -1785,13 +1785,13 @@ class PushObject(py_trees.behaviour.Behaviour):
             robot_data_age = current_time - self._last_robot_callback_time
             robot_data_fresh = robot_data_age < freshness_timeout
             if not robot_data_fresh and self._validity_check_count % 10 == 0:
-                print(f"   机器人数据过期: {robot_data_age:.2f}s > {freshness_timeout}s")
+                print(f"   Robot data expired: {robot_data_age:.2f}s > {freshness_timeout}s")
         
         if hasattr(self, '_last_parcel_callback_time') and self._last_parcel_callback_time is not None:
             parcel_data_age = current_time - self._last_parcel_callback_time
             parcel_data_fresh = parcel_data_age < freshness_timeout
             if not parcel_data_fresh and self._validity_check_count % 10 == 0:
-                print(f"   包裹数据过期: {parcel_data_age:.2f}s > {freshness_timeout}s")
+                print(f"   Parcel data expired: {parcel_data_age:.2f}s > {freshness_timeout}s")
         
         # 合并基础有效性和时效性检查
         robot_data_valid = robot_data_basic and robot_data_fresh
@@ -1805,9 +1805,9 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # 如果数据应该有效但结果为False，输出详细的失败原因
         if not final_result and (robot_data_basic and parcel_data_basic):
-            print(f"[{self.name}] ❌ 数据有效性检查失败详情:")
-            print(f"   机器人数据问题: 基础OK={robot_data_basic}, 时效OK={robot_data_fresh}")
-            print(f"   包裹数据问题: 基础OK={parcel_data_basic}, 时效OK={parcel_data_fresh}")
+            print(f"[{self.name}] ❌ Data validity check failure details:")
+            print(f"   Robot data issues: basic_OK={robot_data_basic}, fresh_OK={robot_data_fresh}")
+            print(f"   Parcel data issues: basic_OK={parcel_data_basic}, fresh_OK={parcel_data_fresh}")
         
         return final_result
     
@@ -1824,7 +1824,7 @@ class PushObject(py_trees.behaviour.Behaviour):
     def _handle_mpc_failure(self, current_state, ref_array):
         """Handle MPC failure by using PI control fallback and advancing trajectory by 1 step"""
         try:
-            print(f"[{self.name}] 🔄 MPC失败，切换到PI控制...")
+            print(f"[{self.name}] 🔄 MPC failed, switching to PI control...")
             
             # Use PI control for single step
             pi_command = self._simple_pi_control(current_state, ref_array)
@@ -1836,20 +1836,20 @@ class PushObject(py_trees.behaviour.Behaviour):
                 cmd_msg.angular.z = float(pi_command[1, 0])
                 self.cmd_vel_pub.publish(cmd_msg)
                 
-                print(f"[{self.name}] 🎯 PI控制命令已发布: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f}")
+                print(f"[{self.name}] 🎯 PI control command published: v={cmd_msg.linear.x:.3f}, ω={cmd_msg.angular.z:.3f}")
                 
                 # Advance trajectory index by only 1 step on MPC failure
                 old_idx = self.trajectory_index
                 new_idx = min(self.trajectory_index + 1, len(self.ref_trajectory) - 1)
                 self._safe_update_trajectory_index(new_idx, "mpc_failure_pi_advance")
-                print(f"[{self.name}] 📈 MPC失败后轨迹索引前进1步: {old_idx} -> {self.trajectory_index}")
+                print(f"[{self.name}] 📈 Trajectory index advanced 1 step after MPC failure: {old_idx} -> {self.trajectory_index}")
                 
                 # Clear control sequence so MPC will be called again next time
                 self.control_sequence = None
                 self.control_step = 0
                 
             else:
-                print(f"[{self.name}] ❌ PI控制也失败，停止机器人")
+                print(f"[{self.name}] ❌ PI control also failed, stopping robot")
                 # Emergency stop
                 cmd_msg = Twist()
                 cmd_msg.linear.x = 0.0

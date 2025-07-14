@@ -48,16 +48,16 @@ def report_node_failure(node_name, error_info, robot_namespace):
         print(f"[ERROR] Failed to report failure for {node_name}: {e}")
 
 class MobileRobotMPC:
-    def __init__(self):
-        # MPC parameters - 5-state control (x, y, theta, v, omega)
-        self.N = 8           # Prediction horizon for good tracking
-        self.N_c = 3         # Control horizon for smoother control
-        self.dt = 0.5        # Time step (2Hz)
+    def __init__(self, dt=None):
+        # MPC parameters - optimized for real-time performance (2Hz control)
+        self.N = 6           # Reduced prediction horizon from 8 for faster computation
+        self.N_c = 2         # Reduced control horizon from 3 for faster solve
+        self.dt = dt if dt is not None else 0.5  # Use provided dt or default to 0.5s (2Hz)
         
-        # Balanced weights for 5-state formulation
-        self.Q = np.diag([50.0, 50.0, 1.0, 1.0, 1.0])   # State weights (x, y, theta, v, omega)
+        # Weights for 3-state tracking (x, y, theta) with 5-state dynamics
+        self.Q = np.diag([50.0, 50.0, 1.0])             # State weights (x, y, theta only)
         self.R = np.diag([1.0, 1.0])                     # Control input weights (v, omega)
-        self.F = np.diag([100.0, 100.0, 2.0, 2.0, 2.0]) # Terminal cost weights
+        self.F = np.diag([100.0, 100.0, 2.0])           # Terminal cost weights (x, y, theta only)
         
         # Conservative velocity constraints
         self.max_vel = 0.25      # m/s
@@ -90,11 +90,11 @@ class MobileRobotMPC:
         self.x0 = self.opti.parameter(self.nx)          # Initial state
         self.ref = self.opti.parameter(self.nx, self.N+1)  # Reference trajectory
 
-        # Robust cost function with numerical stability
+        # Robust cost function with numerical stability - 3-state tracking only
         cost = 0
         for k in range(self.N):
-            # State tracking cost - robust formulation
-            state_error = self.X[:, k] - self.ref[:, k]
+            # State tracking cost - only track position and orientation (x, y, theta)
+            state_error = self.X[:3, k] - self.ref[:3, k]  # Only use first 3 states
             
             # Position error (x, y) - standard quadratic
             pos_error = state_error[:2]
@@ -106,10 +106,6 @@ class MobileRobotMPC:
             theta_error_wrapped = ca.atan2(ca.sin(theta_error), ca.cos(theta_error))
             cost += self.Q[2,2] * theta_error_wrapped**2
             
-            # Velocity errors - add small regularization for stability
-            vel_error = state_error[3:5]
-            cost += ca.mtimes([vel_error.T, self.Q[3:5,3:5], vel_error])
-            
             # Control cost with regularization
             u_reg = self.U[:, k] + 1e-6  # Small regularization to prevent singularity
             cost += ca.mtimes([u_reg.T, self.R, u_reg])
@@ -118,8 +114,8 @@ class MobileRobotMPC:
             x_next = self.robot_model(self.X[:, k], self.U[:, k])
             self.opti.subject_to(self.X[:, k+1] == x_next)
 
-        # Terminal cost with robust angle handling
-        terminal_error = self.X[:, -1] - self.ref[:, -1]
+        # Terminal cost with robust angle handling - 3-state tracking only
+        terminal_error = self.X[:3, -1] - self.ref[:3, -1]  # Only use first 3 states
         
         # Terminal position cost
         pos_term_error = terminal_error[:2]
@@ -129,10 +125,6 @@ class MobileRobotMPC:
         theta_term_error = terminal_error[2]
         theta_term_wrapped = ca.atan2(ca.sin(theta_term_error), ca.cos(theta_term_error))
         cost += self.F[2,2] * theta_term_wrapped**2
-        
-        # Terminal velocity costs
-        vel_term_error = terminal_error[3:5]
-        cost += ca.mtimes([vel_term_error.T, self.F[3:5,3:5], vel_term_error])
 
         # Constraints
         self.opti.subject_to(self.X[:, 0] == self.x0)  # Initial condition
@@ -145,19 +137,31 @@ class MobileRobotMPC:
         self.opti.subject_to(self.opti.bounded(-2.0, self.X[3, :], 2.0))  # Linear velocity bounds
         self.opti.subject_to(self.opti.bounded(-np.pi, self.X[4, :], np.pi))  # Angular velocity bounds
 
-        # Robust solver settings
+        # Optimized solver settings for real-time performance (target <100ms for 2Hz control)
         self.opti.minimize(cost)
+        
+        # 🔧 CRITICAL: Set environment variables to control BLAS/LAPACK threading for consistent timing
+        import os
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['OPENBLAS_NUM_THREADS'] = '1' 
+        os.environ['MKL_NUM_THREADS'] = '1'
+        os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+        os.environ['NUMEXPR_NUM_THREADS'] = '1'
+        
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
-            'ipopt.max_iter': 100,
-            'ipopt.max_cpu_time': 0.15,
-            'ipopt.tol': 1e-3,
+            'ipopt.max_iter': 100,              
+            'ipopt.max_cpu_time': 0.4,        
+            'ipopt.tol': 5e-3,                
             'ipopt.acceptable_tol': 1e-2,
-            'ipopt.acceptable_iter': 10,
+            'ipopt.acceptable_iter': 5,        
             'ipopt.mu_strategy': 'monotone',
             'ipopt.linear_solver': 'mumps',
-            'ipopt.hessian_approximation': 'limited-memory'
+            'ipopt.hessian_approximation': 'limited-memory',
+            'ipopt.warm_start_init_point': 'yes',  # Enable warm starting for speed
+            'ipopt.nlp_scaling_method': 'none',    # Disable scaling for speed
+            'ipopt.constr_viol_tol': 1e-2,        # Relaxed constraint tolerance
         }
         
         self.opti.solver('ipopt', opts)
@@ -358,11 +362,22 @@ class PickObject(py_trees.behaviour.Behaviour):
                     
     def control_step(self):
         """Single control step - now called directly by ROS timer"""
+        import time  # Import time for timing diagnostics
+        
+        # Start timing for entire control step
+        control_step_start_time = time.time()
+        
         # Enhanced debugging for second launch issues
         if not hasattr(self, '_control_step_call_count'):
             self._control_step_call_count = 0
             print(f"[{self.name}] 🚀 First control step called!")
         self._control_step_call_count += 1
+        
+        # Track control step timing
+        if not hasattr(self, '_last_control_step_time'):
+            self._last_control_step_time = control_step_start_time
+        
+        time_since_last_control = control_step_start_time - self._last_control_step_time
         
         # Skip debug print for control step initialization
         
@@ -384,10 +399,14 @@ class PickObject(py_trees.behaviour.Behaviour):
             return
             
         # Try to acquire state lock non-blocking
+        lock_start_time = time.time()
         state_acquired = self.state_lock.acquire(blocking=False)
         if not state_acquired:
             print(f"[{self.name}] Could not acquire state lock, skipping control step")
             return
+        
+        lock_acquired_time = time.time()
+        lock_wait_duration = lock_acquired_time - lock_start_time
 
         try:
             # Check if we have valid robot pose data
@@ -411,15 +430,41 @@ class PickObject(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] Initial trajectory index set: {self.trajectory_index}")
             
             # Execute MPC control if trajectory following is active
+            mpc_start_time = time.time()
             if not self.picking_complete:
                 success = self._follow_trajectory_with_mpc()
                 # print(f"[{self.name}] MPC control step result: {'success' if success else 'failed'}")
+            mpc_end_time = time.time()
+            mpc_duration = mpc_end_time - mpc_start_time
                 
         except Exception as e:
             print(f"[{self.name}] Error in control step: {str(e)}")
             print(f"[{self.name}] Traceback: {traceback.format_exc()}")
         finally:
             self.state_lock.release()
+            
+        # Calculate total control step duration
+        control_step_end_time = time.time()
+        control_step_duration = control_step_end_time - control_step_start_time
+        
+        # Update timing tracking
+        self._last_control_step_time = control_step_start_time
+        
+        # Print timing diagnostics when control step duration > target dt or periodically
+        if (control_step_duration > 0.6 or  # Alert if > 120% of target dt (0.5s)
+            time_since_last_control > 1.0 or  # Alert if gap > 2x target dt
+            self._control_step_call_count % 20 == 0):  # Periodic status
+            
+            print(f"[{self.name}] 🕒 Control Step Timing (Call #{self._control_step_call_count}):")
+            print(f"   ⏰ Gap since last: {time_since_last_control:.3f}s (target: 0.5s)")
+            print(f"   🔒 Lock wait: {lock_wait_duration:.3f}s")
+            print(f"   🧮 MPC exec: {mpc_duration:.3f}s")
+            print(f"   📊 Total duration: {control_step_duration:.3f}s")
+            if time_since_last_control > 1.0:
+                print(f"   ⚠️ WARNING: Control gap {time_since_last_control:.3f}s > 1.0s (should be ~0.5s)")
+            if control_step_duration > 0.6:
+                print(f"   ⚠️ WARNING: Control step {control_step_duration:.3f}s > 0.6s (should be <0.5s)")
+        
         
     def setup(self, **kwargs):
         """Setup ROS connections and load trajectory data"""
@@ -523,7 +568,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             return False
             
         try:
-            # 如果已经有中继点数据，无需重新订阅
+            # If already have relay point data, no need to resubscribe
             if self.relay_pose is not None:
                 return True
             
@@ -532,7 +577,7 @@ class PickObject(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.relay_pose_sub)
                 self.relay_pose_sub = None
             
-            # Subscribe to relay point pose (一次性读取静态数据)
+            # Subscribe to relay point pose (one-time static data reading)
             self.relay_pose_sub = self.node.create_subscription(
                 PoseStamped, 
                 f'/Relaypoint{self.number}/pose',
@@ -562,7 +607,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Publish the estimated time immediately upon setup
             self._publish_estimated_time()
                 
-            print(f"[{self.name}] 发布器已建立，估计时间已发布: {self.estimated_time}s")
+            print(f"[{self.name}] Publishers established, estimated time published: {self.estimated_time}s")
             return True
             
         except Exception as e:
@@ -571,7 +616,7 @@ class PickObject(py_trees.behaviour.Behaviour):
     
     def _relay_pose_callback(self, msg):
         """Update relay point pose - optimized for non-blocking and static data reading"""
-        # 快速更新姿态数据（最小化锁持有时间）
+        # Fast update of pose data (minimize lock holding time)
         try:
             with self.state_lock:
                 self.relay_pose = np.array([
@@ -579,7 +624,7 @@ class PickObject(py_trees.behaviour.Behaviour):
                     msg.pose.position.y
                 ])
             
-            # 静态数据已读取，销毁订阅 (Static relay data read, destroy subscription)
+            # Static data read, destroy subscription
             if self.relay_pose_sub is not None:
                 try:
                     self.node.destroy_subscription(self.relay_pose_sub)
@@ -649,7 +694,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             msg = Float64()
             msg.data = float(self.estimated_time)
             self.estimated_time_pub.publish(msg)
-            print(f"[{self.name}] 发布推送估计时间: {self.estimated_time}秒 到 /{self.robot_namespace}/pushing_estimated_time")
+            print(f"[{self.name}] Published pushing estimated time: {self.estimated_time}s to /{self.robot_namespace}/pushing_estimated_time")
     
     def _load_trajectory_data(self):
         """Load trajectory data with support for replanned trajectories"""
@@ -679,10 +724,9 @@ class PickObject(py_trees.behaviour.Behaviour):
             self.target_pose[1] = self.goal[1] - 0.4 * np.sin(self.goal[2])
             self.target_pose[2] = self.goal[2]
             
-            # Add interpolation points for smoother approach
+            # Add interpolation points for smoother approach (3-state only)
             num_interp_points = 5
             interp_points = []
-            dt = 0.5  # Time interval in seconds (2Hz)
             
             for i in range(num_interp_points):
                 alpha = i / (num_interp_points - 1)  # Interpolation factor (0 to 1)
@@ -690,25 +734,8 @@ class PickObject(py_trees.behaviour.Behaviour):
                 interp_y = self.target_pose[1] * alpha + self.goal[1] * (1 - alpha)
                 interp_theta = self.target_pose[2]  # Keep orientation constant
                 
-                # Estimate velocity based on distance to next point (delta x, delta y)
-                if i < num_interp_points - 1:
-                    # Calculate next point for velocity estimation
-                    next_alpha = (i + 1) / (num_interp_points - 1)
-                    next_x = self.target_pose[0] * next_alpha + self.goal[0] * (1 - next_alpha)
-                    next_y = self.target_pose[1] * next_alpha + self.goal[1] * (1 - next_alpha)
-                    
-                    # Calculate velocity as distance / time
-                    delta_x = next_x - interp_x
-                    delta_y = next_y - interp_y
-                    distance = np.sqrt(delta_x**2 + delta_y**2)
-                    estimated_v = distance / dt
-                else:
-                    # For the last point, use zero velocity (stationary)
-                    estimated_v = 0.0
-                
-                # Add trajectory point with 5 elements (x, y, theta, v, omega)
-                # omega = 0 for straight line interpolation
-                interp_points.append([interp_x, interp_y, interp_theta, estimated_v, 0.0])
+                # Add trajectory point with 3 elements (x, y, theta) - velocities not needed
+                interp_points.append([interp_x, interp_y, interp_theta])
             
             # Add interpolation points to the trajectory (executed last in reverse)
             self.trajectory_data = self.trajectory_data + interp_points
@@ -723,8 +750,11 @@ class PickObject(py_trees.behaviour.Behaviour):
     def _setup_simple_mpc(self):
         """Setup full MobileRobotMPC controller for trajectory following"""
         try:
-            # Create the full MPC controller from manipulation_behaviors.py
-            self.mpc = MobileRobotMPC()
+            # Create the full MPC controller and pass the dt parameter from PickObject
+            self.mpc = MobileRobotMPC(dt=self.dt)
+            
+            print(f"[{self.name}] MPC initialized with dt={self.dt}s (control frequency: {1/self.dt:.1f}Hz)")
+            print(f"[{self.name}] MPC tracking 3 states (x, y, theta) with 5-state dynamics model")
             
             self.prediction_horizon = self.mpc.N
             
@@ -737,9 +767,9 @@ class PickObject(py_trees.behaviour.Behaviour):
             self.control_step_index = 0
             
         except Exception as e:
-            print(f"[{self.name}] MPC 设置失败: {e}")
+            print(f"[{self.name}] MPC setup failed: {e}")
             import traceback
-            print(f"[{self.name}] MPC 设置异常详情: {traceback.format_exc()}")
+            print(f"[{self.name}] MPC setup exception details: {traceback.format_exc()}")
             raise e
     
     def _find_closest_trajectory_index(self, set_as_initial=False, wait_for_pose=False):
@@ -779,7 +809,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             
             # Set as initial index if requested
             if set_as_initial:
-                self.trajectory_index = closest_idx
+                self._safe_update_trajectory_index(closest_idx, "initial_closest_point_search")
                 self.closest_idx = closest_idx
                 self._initial_index_set = True
             
@@ -788,7 +818,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         except Exception as e:
             print(f"[{self.name}] Error finding closest trajectory index: {e}")
             if set_as_initial:
-                self.trajectory_index = 0
+                self._safe_update_trajectory_index(0, "error_fallback")
                 self.closest_idx = 0
                 self._initial_index_set = True
             return 0
@@ -820,7 +850,7 @@ class PickObject(py_trees.behaviour.Behaviour):
         self.goal = None
         self.target_pose = np.zeros(3)
         self._initial_index_set = False
-        self.trajectory_index = 0
+        self._safe_update_trajectory_index(0, "initialization_reset")
         self.closest_idx = 0
         
         # CRITICAL: Reset current_state to ensure fresh pose acquisition on second launch
@@ -1049,7 +1079,12 @@ class PickObject(py_trees.behaviour.Behaviour):
     
     def _follow_trajectory_with_mpc(self):
         """Follow trajectory using MPC controller with control sequence management (similar to PushObject)"""
+        import time  # Import time for timing diagnostics
+        
         try:
+            # Start timing for entire function
+            function_start_time = time.time()
+            
             # Ensure initial closest trajectory index is set before first controller calculation
             if not getattr(self, '_initial_index_set', False):
                 print(f"[{self.name}] Initial trajectory index not set, finding closest point before first controller calculation...")
@@ -1060,11 +1095,18 @@ class PickObject(py_trees.behaviour.Behaviour):
                 # Use the stored control sequence if available
                 if self._apply_stored_control():
                     self._advance_control_step()
+                    function_end_time = time.time()
+                    function_duration = function_end_time - function_start_time
+                    if function_duration > 0.1:  # Only print if > 100ms
+                        print(f"[{self.name}] ⏱️ _follow_trajectory_with_mpc (stored): {function_duration:.3f}s")
                     return True
            
             # If no valid control sequence or need replanning, run MPC
             # NOTE: State lock is already held by control_step(), so we don't need to acquire it again
             current_state = self.current_state.copy()
+            
+            # Timing: Closest point search
+            search_start_time = time.time()
             
             # Always find the closest trajectory point to ensure accurate reference
             curr_pos = np.array([current_state[0], current_state[1]])
@@ -1094,33 +1136,36 @@ class PickObject(py_trees.behaviour.Behaviour):
                         min_dist = dist
                         closest_idx = idx
             
-            # Update trajectory index to closest point
-            self.trajectory_index = closest_idx
+            search_end_time = time.time()
+            search_duration = search_end_time - search_start_time
             
-            # Prepare reference trajectory for MPC horizon
+            # Update trajectory index to closest point with timing logging
+            self._safe_update_trajectory_index(closest_idx, "MPC_trajectory_following")
+            
+            # Timing: Reference trajectory preparation
+            ref_prep_start_time = time.time()
+            
+            # Prepare reference trajectory for MPC horizon - only position and orientation
             ref_traj = np.zeros((5, self.prediction_horizon + 1))  # 5 states: x, y, theta, v, omega
             for i in range(self.prediction_horizon + 1):
                 idx = min(closest_idx + i, len(self.trajectory_data) - 1)
-                ref_traj[:3, i] = self.trajectory_data[idx][:3]  # x, y, theta
-                if i < len(self.trajectory_data) - 1:
-                    # Use provided velocities if available, otherwise estimate
-                    if len(self.trajectory_data[idx]) >= 5:
-                        ref_traj[3:5, i] = self.trajectory_data[idx][3:5]  # v, omega
-                    else:
-                        # Estimate velocities from position differences
-                        next_idx = min(idx + 1, len(self.trajectory_data) - 1)
-                        dt = 0.5  # Time step (2Hz)
-                        dx = (self.trajectory_data[next_idx][0] - self.trajectory_data[idx][0]) / dt
-                        dy = (self.trajectory_data[next_idx][1] - self.trajectory_data[idx][1]) / dt
-                        dtheta = (self.trajectory_data[next_idx][2] - self.trajectory_data[idx][2]) / dt
-                        ref_traj[3, i] = np.sqrt(dx**2 + dy**2)  # Linear velocity
-                        ref_traj[4, i] = dtheta  # Angular velocity
+                ref_traj[:3, i] = self.trajectory_data[idx][:3]  # x, y, theta only
+                # Leave velocity states (ref_traj[3:5, i]) as zeros since we don't track them in cost
+            
+            ref_prep_end_time = time.time()
+            ref_prep_duration = ref_prep_end_time - ref_prep_start_time
             
             # Set reference trajectory in MPC
             self.mpc.set_reference_trajectory(ref_traj)
             
+            # Timing: MPC optimization (this is likely the bottleneck)
+            mpc_start_time = time.time()
+            
             # Run MPC optimization
             control_sequence = self.mpc.update(current_state)
+            
+            mpc_end_time = time.time()
+            mpc_duration = mpc_end_time - mpc_start_time
             
             if control_sequence is None or np.any(np.isnan(control_sequence)):
                 print(f"[{self.name}] ERROR: MPC optimization failed")
@@ -1129,6 +1174,9 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Store new control sequence
             self.control_sequence = control_sequence
             self.control_step_index = 0
+            
+            # Timing: Command preparation and publishing
+            cmd_start_time = time.time()
             
             # Apply first control input
             v_cmd = float(control_sequence[0, 0])  # Linear velocity
@@ -1139,21 +1187,38 @@ class PickObject(py_trees.behaviour.Behaviour):
             cmd_vel.linear.x = v_cmd
             cmd_vel.angular.z = omega_cmd
             
-            # Only print commands periodically to reduce output
+            self.cmd_vel_pub.publish(cmd_vel)
+            
+            cmd_end_time = time.time()
+            cmd_duration = cmd_end_time - cmd_start_time
+            
+            # Calculate total function duration
+            function_end_time = time.time()
+            function_duration = function_end_time - function_start_time
+            
+            # Only print commands and timing periodically to reduce output
             if not hasattr(self, '_cmd_print_count'):
                 self._cmd_print_count = 0
             self._cmd_print_count += 1
+            
             # Calculate distance to target for printing
             dist_to_target = np.sqrt(
                 (current_state[0] - self.target_pose[0])**2 + 
                 (current_state[1] - self.target_pose[1])**2
             )
             
-            if self._cmd_print_count % 10 == 0:
+            # Print timing diagnostics when total time > 0.1s or every 10 calls
+            if function_duration > 0.1 or self._cmd_print_count % 10 == 0:
+                print(f"[{self.name}] ⏱️ MPC Timing Breakdown:")
+                print(f"   🔍 Search: {search_duration:.3f}s")
+                print(f"   📝 Ref prep: {ref_prep_duration:.3f}s") 
+                print(f"   🧮 MPC opt: {mpc_duration:.3f}s ← BOTTLENECK")
+                print(f"   📤 Cmd pub: {cmd_duration:.3f}s")
+                print(f"   ⏰ TOTAL: {function_duration:.3f}s (target: <0.5s for 2Hz)")
+                print(f"   🎯 CMD: v={v_cmd:.3f} m/s, ω={omega_cmd:.3f} rad/s | dist={dist_to_target:.3f}m | idx={self.trajectory_index}")
+            elif self._cmd_print_count % 10 == 0:
                 print(f"[{self.name}] CMD: v={v_cmd:.3f} m/s, ω={omega_cmd:.3f} rad/s | "
-                      f"dist={dist_to_target:.3f}m | idx={self.trajectory_index}")
-            
-            self.cmd_vel_pub.publish(cmd_vel)
+                      f"dist={dist_to_target:.3f}m | idx={self.trajectory_index} | t={function_duration:.3f}s")
             
             return True
             
@@ -1269,3 +1334,40 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Don't let freshness checking crash the control loop
             if self._freshness_check_count % 100 == 0:  # Limit error reporting
                 print(f"[{self.name}] Error checking topic freshness: {str(e)}")
+    
+    def _safe_update_trajectory_index(self, new_index, context="unknown"):
+        """Safely update trajectory index with timing logging (similar to PushObject)"""
+        import time  # Import time for timing calculations
+        
+        old_index = self.trajectory_index
+        
+        # Validate new index bounds
+        if new_index < 0:
+            new_index = 0
+        elif new_index >= len(self.trajectory_data) if self.trajectory_data else 0:
+            new_index = len(self.trajectory_data) - 1 if self.trajectory_data else 0
+        
+        # Update trajectory index
+        self.trajectory_index = new_index
+        
+        # Log all trajectory index changes with timing information
+        if new_index != old_index:
+            current_time = time.time()
+            if not hasattr(self, '_last_trajectory_update_time'):
+                self._last_trajectory_update_time = current_time
+                self._trajectory_update_count = 0
+            
+            time_since_last = current_time - self._last_trajectory_update_time
+            self._trajectory_update_count += 1
+            
+            # Log trajectory index changes with timing information
+            if time_since_last < self.dt:  # If updates are happening faster than 5Hz
+                print(f"[{self.name}] ⚠️ FAST trajectory index update: {old_index} -> {new_index} in '{context}' (Δt={time_since_last:.3f}s)")
+            else:
+                print(f"[{self.name}] ✅ Normal trajectory index update: {old_index} -> {new_index} in '{context}' (Δt={time_since_last:.3f}s)")
+            
+            self._last_trajectory_update_time = current_time
+            
+            return True  # Index updated
+        else:
+            return False  # Index unchanged

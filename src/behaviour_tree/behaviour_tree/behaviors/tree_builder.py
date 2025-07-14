@@ -161,8 +161,12 @@ class GlobalExceptionHandler(py_trees.behaviour.Behaviour):
 
 
 
-def create_root(robot_namespace="turtlebot0", case="simple_maze"):
+def create_root(robot_namespace="turtlebot0", case="simple_maze", control_dt=None):
     """Create behavior tree root node with optimized Selector+LoopCondition control and parallel blackboard init"""
+    # Use provided control_dt or fall back to global default
+    if control_dt is None:
+        control_dt = CONTROL_DT
+    
     root = py_trees.composites.Sequence(name="MainSequence", memory=True)
     
     # OPTIMIZATION: Parallel blackboard initialization for faster startup
@@ -216,14 +220,14 @@ def create_root(robot_namespace="turtlebot0", case="simple_maze"):
     )
     parallel_move_replan.add_children([
         MoveBackward("BackwardToSafeDistance", distance=0.2),
-        ReplanPath("Replanning", 20.0, robot_namespace, case, dt=CONTROL_DT)
+        ReplanPath("Replanning", 20.0, robot_namespace, case, dt=control_dt)
     ])
     
     # Picking sequence
     picking_up_sequence = py_trees.composites.Sequence(name="PickingUpSequence", memory=True)
     picking_up_sequence.add_children([
         WaitForPick("WaitingPick", 2.0, robot_namespace),
-        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=CONTROL_DT, case=case),
+        PickObject("PickingUp", robot_namespace, timeout=100.0, dt=control_dt, case=case),
         StopSystem("Stop", 1.5)
     ])
     
