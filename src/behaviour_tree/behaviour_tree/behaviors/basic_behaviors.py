@@ -1484,4 +1484,3 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             report_node_failure(self.name, error_msg, self.robot_namespace)
             print(f"[{self.name}] Error incrementing index: {e}")
             return py_trees.common.Status.FAILURE
-

@@ -4,14 +4,6 @@ Main behavior tree module using modular behavior structure.
 Simplified version that imports behaviors from the behaviors package.
 """
 
-# 🔧 CRITICAL: Set environment variables BEFORE any imports that might use BLAS/LAPACK
-# import os
-# os.environ['OMP_NUM_THREADS'] = '1'
-# os.environ['OPENBLAS_NUM_THREADS'] = '1' 
-# os.environ['MKL_NUM_THREADS'] = '1'
-# os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
-# os.environ['NUMEXPR_NUM_THREADS'] = '1'
-
 import py_trees
 import py_trees.console as console
 import rclpy
@@ -241,14 +233,17 @@ def main():
             temp_node.declare_parameter('robot_id', 0)
             temp_node.declare_parameter('robot_namespace', 'turtlebot0')
             temp_node.declare_parameter('case', 'simple_maze')
+            temp_node.declare_parameter('CONTROL_DT', 0.5)
             robot_id = temp_node.get_parameter('robot_id').get_parameter_value().integer_value
             robot_namespace = temp_node.get_parameter('robot_namespace').get_parameter_value().string_value
             case = temp_node.get_parameter('case').get_parameter_value().string_value
+            control_dt = temp_node.get_parameter('CONTROL_DT').get_parameter_value().double_value
         except Exception as e:
             print(f"Warning: Could not get robot parameters: {e}")
             robot_id = 0
             robot_namespace = "turtlebot0"
             case = "simple_maze"
+            control_dt = 0.5
         
         # Destroy temporary node
         temp_node.destroy_node()
@@ -299,16 +294,18 @@ def main():
         ros_node.declare_parameter('robot_id', robot_id)
         ros_node.declare_parameter('robot_namespace', robot_namespace)
         ros_node.declare_parameter('case', case)
+        ros_node.declare_parameter('CONTROL_DT', control_dt)
         
         print(f"="*80)
         print(f"BEHAVIOR TREE FOR ROBOT {robot_id} ({robot_namespace})")
         print(f"CASE: {case}")
+        print(f"CONTROL_DT: {control_dt}")
         print(f"="*80)
         
         # Create behavior tree
         # Use robot_namespace directly since we now use "turtlebot{i}" format throughout
-        # Use case parameter from launch file
-        root = create_root(robot_namespace, case=case)
+        # Use case parameter from launch file and control_dt parameter
+        root = create_root(robot_namespace, case=case, control_dt=control_dt)
         
         # CRITICAL FIX: Initialize blackboard variables BEFORE setup phase
         # This ensures behaviors can access blackboard keys during their setup() calls
@@ -368,30 +365,21 @@ def main():
         robot_id = ros_node.get_parameter('robot_id').value
         robot_namespace = ros_node.get_parameter('robot_namespace').value
         
-        # 为每个机器人分配独立的线程池，避免线程竞争 - FURTHER OPTIMIZED
-        threads_per_robot = 2  # 🔧 FURTHER REDUCED from 4 to 2 threads to fix proliferation issue
-        
-        # 🔧 EXPERIMENTAL: Use SingleThreadedExecutor for simpler robots to minimize threads
-        if robot_id == 0:
-            # Robot 0 uses single threaded executor
-            executor = rclpy.executors.SingleThreadedExecutor()
-            threads_per_robot = 1
-            print(f"🧵 [{robot_namespace}] Using SingleThreadedExecutor for minimal thread usage")
-        else:
-            # Other robots use multi-threaded with minimal threads
-            executor = rclpy.executors.MultiThreadedExecutor(num_threads=threads_per_robot)
-            print(f"🧵 [{robot_namespace}] Using MultiThreadedExecutor with {threads_per_robot} threads")
+        # Use SingleThreadedExecutor for all robots to minimize thread usage
+        executor = rclpy.executors.SingleThreadedExecutor()
         executor.add_node(ros_node)
         
-        # 🔧 重要：将MultiThreadedExecutor赋值给节点，供behaviors使用
-        ros_node.robot_dedicated_threadpool = executor  # 复用executor替代单独的ThreadPoolExecutor
+        print(f"🧵 [{robot_namespace}] Using SingleThreadedExecutor for minimal thread usage")
         
-        print(f"🔧 [{robot_namespace}] 创建优化的MultiThreadedExecutor: {threads_per_robot}线程专用")
-        print(f"   • 优化说明: 移除重复ThreadPoolExecutor, 统一使用MultiThreadedExecutor")
-        print(f"   • 线程数从4个进一步减少至2个，彻底修复线程增殖问题")
-        print(f"   🎯 目标总系统线程数: {threads_per_robot * 3} (替代之前的97个)")
-        print(f"🎯 [{robot_namespace}] 执行器ID: {id(executor)}")
-        print(f"🧵 [{robot_namespace}] 线程池独立隔离，避免与其他机器人竞争")
+        # Set executor reference for behaviors compatibility
+        ros_node.robot_dedicated_threadpool = executor
+        
+        print(f"🔧 [{robot_namespace}] Using unified SingleThreadedExecutor for all robots")
+        print(f"   • Optimization: Simplified thread model eliminates executor thread complexity")
+        print(f"   • Benefits: Reduced resource usage, easier debugging, no thread competition")
+        print(f"   🎯 Thread count per robot: 2 (1 main + 1 background ROS)")
+        print(f"🎯 [{robot_namespace}] Executor ID: {id(executor)}")
+        print(f"🧵 [{robot_namespace}] Single-threaded execution for consistent behavior")
         
         # Use manual ticking loop to ensure ROS topic processing
         iteration_count = 0
@@ -457,9 +445,9 @@ def main():
         # Signal shutdown to background thread
         shutdown_requested = True
         
-        # 关闭ROS executor（已整合专用线程池功能）
+        # Close ROS executor
         if 'executor' in locals():
-            print(f"🛑 [{robot_namespace}] 关闭MultiThreadedExecutor...")
+            print(f"🛑 [{robot_namespace}] Shutting down SingleThreadedExecutor...")
             executor.shutdown(timeout_sec=2.0)
         
         # 🔧 新增：清理所有管理的订阅，避免资源泄漏

@@ -37,8 +37,8 @@ def generate_launch_description():
     from launch.actions import TimerAction
     
     # Default to 3 robots, can be adjusted by changing this value
-    num_robots = 3
-    
+    num_robots = 5
+    case='simulation'
     for i in range(num_robots):
         robot_namespace = f'turtlebot{i}'
         tree_node_name = f'tree_{i}'
@@ -57,7 +57,9 @@ def generate_launch_description():
                     'use_sim_time': use_sim_time,
                     'robot_id': i,
                     'robot_namespace': robot_namespace,
-                    'tree_name': f'BehaviorTree_{i}'
+                    'tree_name': f'BehaviorTree_{i}',
+                    'case': case,
+                    'CONTROL_DT': 0.5
                 }],
                 remappings=[
                     # Robot-specific topic remappings
