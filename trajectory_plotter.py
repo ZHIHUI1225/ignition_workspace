@@ -345,7 +345,7 @@ def main():
     # Default file paths if not provided
     if not args.original and not args.replanned:
         # Try to find default files in the workspace
-        workspace_data = "/root/workspace/data/simple_maze"
+        workspace_data = "/root/workspace/data/maze_5"
         
         default_original = os.path.join(workspace_data, f"tb{robot_id}_Trajectory.json")
         default_replanned = os.path.join(workspace_data, f"tb{robot_id}_Trajectory_replanned.json")

@@ -147,7 +147,7 @@ def generate_launch_description():
         ],
         output="screen",
     )
-    ld.add_action(spawn_turtlebot3)
+    # ld.add_action(spawn_turtlebot3)
 
     # ROS-Ignition bridge for robot topics
     config_file = os.path.join(

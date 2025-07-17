@@ -38,7 +38,8 @@ def generate_launch_description():
     
     # Default to 3 robots, can be adjusted by changing this value
     num_robots = 5
-    case='simulation'
+    # case='simulation'
+    case='maze_5'
     for i in range(num_robots):
         robot_namespace = f'turtlebot{i}'
         tree_node_name = f'tree_{i}'
