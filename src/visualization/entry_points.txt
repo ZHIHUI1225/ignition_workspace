@@ -1,0 +1,2 @@
+[console_scripts]
+pose_plotter = visualization.pose_plotter:main
