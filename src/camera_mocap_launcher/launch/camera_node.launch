@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="camera_mocap_launcher" type="camera_node.py" name="camera_node" output="screen" />
+</launch>
