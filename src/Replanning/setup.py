@@ -1,8 +1,6 @@
-from setuptools import setup, find_packages
-import os
-from glob import glob
+from setuptools import find_packages, setup
 
-package_name = 'camera_mocap_launcher'
+package_name = 'Replanning'
 
 setup(
     name=package_name,
@@ -12,19 +10,18 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', glob('launch/*.py')),
+        ('share/' + package_name + '/launch', ['launch/planning.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='ZHIHUI1225',
+    maintainer='root',
     maintainer_email='hui1225.zhi@connect.polyu.hk',
-    description='Package for launching camera and VRPN mocap client',
-    license='Apache-2.0',
+    description='TODO: Package description',
+    license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'camera_node = camera_mocap_launcher.camera_node:main',
-            'rectangle_detector = camera_mocap_launcher.rectangle_detector:main',
+            'planning = Replanning.Planning:main',
         ],
     },
 )

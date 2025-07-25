@@ -17,7 +17,7 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='camera_mocap_launcher',
-            executable='camera_node.py',
+            executable='camera_node',
             name='camera_node',
             output='screen',
         ),
