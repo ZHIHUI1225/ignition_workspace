@@ -1,0 +1,18 @@
+{
+  "organization_summary": {
+    "moved_files": [
+      "Optimization_GA_3_IG_normaexperi.png",
+      "Optimization_winthSC_path3experi.png",
+      "InitialGuess3experi.png",
+      "Assignment_Result3.png",
+      "trajectory0_analysis.png",
+      "trajectory1_analysis.png",
+      "trajectory2_analysis.png",
+      "trajectory_tb0_comparison.png",
+      "trajectory_tb1_comparison.png"
+    ],
+    "existing_files": [],
+    "data_folder": "/root/workspace/data/",
+    "timestamp": "2025-07-28"
+  }
+}

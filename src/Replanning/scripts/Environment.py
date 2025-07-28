@@ -81,7 +81,18 @@ class Environment:
     def from_dict(cls, data):
         """Create an environment from a dictionary."""
         polygons = [Polygon(vertices=poly['vertices']) for poly in data['polygons']]
-        return cls(polygons)
+        env = cls(polygons)
+        
+        # If coord_bounds, width, and height are provided in the data, use them
+        # This preserves the original workspace bounds instead of recalculating from polygons
+        if 'coord_bounds' in data:
+            env.coord_bounds = tuple(data['coord_bounds'])
+        if 'width' in data:
+            env.width = data['width']
+        if 'height' in data:
+            env.height = data['height']
+            
+        return env
 
     def save_to_file(self, file_path):
         """Save the environment to a JSON file."""

@@ -1,0 +1,69 @@
+# Configuration file for GA Planning System
+# This YAML file contains all settings for the planning system
+
+# Current Active Case
+case_name: "experi"  # Change this to switch between cases
+
+# Robot Configuration
+robots:
+  count: 3  # N - number of agents/robots
+  radius_limit: 0.3
+  min_length: 0.1  # Minimum length for path segments in meters
+
+# Planning Parameters
+planning:
+  phi0: 1.2566370614359172  # Initial angle (0.4 * pi)
+
+# Arc Range Configuration
+arc_range: [50, 700]  # [min, max] range for arc calculations
+
+# Paths Configuration
+paths:
+  base_path: "/root/workspace/src/Replanning/scripts"
+  data_path: "/root/workspace/data"
+  config_path: "/root/workspace/config"
+
+# Start and Goal Poses
+poses:
+  start_pose: [200.0, 50.0, 1.2560000000000002]  # [x, y, theta]
+  goal_pose: [1050.0, 80.0, 3.14159265]   # [x, y, theta]
+
+# Genetic Algorithm Parameters
+genetic_algorithm:
+  num_generations: 5000
+  population_size: 80
+  num_parents_mating: 40
+  mutation_probability: 0.02
+  crossover_probability: 0.95
+  keep_elitism: 5
+  parent_selection_type: "tournament"
+  crossover_type: "uniform"
+  mutation_type: "random"
+
+# Optimization Constraints
+constraints:
+  angle_bounds:
+    lower: -3.14159  # -pi
+    upper: 3.14159   # pi
+  first_waypoint:
+    lower_factor: 0.2  # 0.2 * pi
+    upper_factor: 0.6  # 0.6 * pi
+  penalties:
+    cos_constraint: 1000000
+    direction_constraint: 500000
+    radius_constraint: 1000000
+    length_constraint: 1000000
+    corridor_constraint: 100000
+
+# Visualization Settings
+visualization:
+  waypoint_color: "go"
+  relay_point_color: "ro"
+  path_color: "b"
+  environment_color: "black"
+  save_plots: true
+
+# Monitoring Settings
+monitoring:
+  print_progress_every: 100
+  early_stopping: true
