@@ -10,9 +10,36 @@ robots:
   radius_limit: 0.3
   min_length: 0.1  # Minimum length for path segments in meters
 
+# Robot Physical Parameters
+robot_physical:
+  # Angular motion limits
+  angular_acceleration_max: 0.6283185307179587  # 0.2*pi rad/s² - maximum angular acceleration
+  angular_velocity_max: 1.5707963267948966     # 0.5*pi rad/s - maximum angular velocity
+  
+  # Physical dimensions
+  wheel_radius: 0.033      # m - radius of the wheel
+  wheelbase: 0.14          # m - distance between wheels (l_r)
+  turning_radius_limit: 0.75  # m - maximum turning radius
+  
+  # Derived motion limits
+  linear_velocity_max: 0.0518362  # v_max = w_max * r_w (calculated: 1.5708 * 0.033)
+  linear_acceleration_max: 0.0207345  # a_max = aw_max * r_w (calculated: 0.6283 * 0.033)
+  
+  # Friction and safety parameters
+  friction_coefficient: 0.7    # μ - coefficient of friction (rubber on concrete)
+  safety_factor: 0.8          # μ_f - safety factor
+  gravity: 9.81               # g - gravitational acceleration (m/s²)
+  friction_limit: 5.4936      # μ * μ_f * g (calculated: 0.7 * 0.8 * 9.81)
+
+# Coordinate System Conversion
+coordinate_conversion:
+  pixel_to_meter_scale: 0.0023  # Scale factor to convert pixels to meters
+  meter_to_pixel_scale: 434.78  # Scale factor to convert meters to pixels (1/0.0023)
+
 # Planning Parameters
 planning:
   phi0: 1.2566370614359172  # Initial angle (0.4 * pi)
+  deltal: 0.02              # Small segment length for discretization (m)
 
 # Arc Range Configuration
 arc_range: [50, 700]  # [min, max] range for arc calculations

@@ -56,7 +56,7 @@ def generate_launch_description():
     num_robots = 3
     
     for i in range(num_robots):
-        robot_namespace = f'turtlebot{i}'
+        robot_namespace = f'robot{i}'
         tree_node_name = f'tree_{i}'
         
         # Create robot group with timer delay for sequential startup

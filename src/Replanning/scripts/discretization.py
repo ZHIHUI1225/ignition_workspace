@@ -1,6 +1,9 @@
 import numpy as np
 from scipy.interpolate import CubicSpline
 import matplotlib.pyplot as plt
+import sys
+sys.path.append('/root/workspace/config')
+from config_loader import config
 
 def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segments, Flagb, reeb_graph):
     """
@@ -25,7 +28,9 @@ def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segment
     # Extract segment info
     i = segment_idx
     seg_times = time_segments[i]
-    pos = reeb_graph.nodes[waypoints[i]].configuration/100.0
+    # Convert from pixels to meters using config utility
+    pos_pixels = reeb_graph.nodes[waypoints[i]].configuration
+    pos = config.pixels_to_meters(pos_pixels)
     angle = phi[i] + Flagb[i]*np.pi/2
     
     # Separate arc and line parts
@@ -94,7 +99,9 @@ def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segment
     # Make sure position matches the endpoint of the trajectory
     if i == len(waypoints) - 2 and l[i] < 1e-3 and not line_times:
         # Get the final waypoint position
-        final_pos = reeb_graph.nodes[waypoints[i+1]].configuration/100.0
+        # Convert from pixels to meters
+        final_pos_pixels = reeb_graph.nodes[waypoints[i+1]].configuration
+        final_pos = config.pixels_to_meters(final_pos_pixels)
         
         # If the final position is not close enough to our last point, add it
         if len(x_discrete) > 0:
@@ -141,7 +148,9 @@ def visualize_segment_parts(waypoints, phi, r0, l, phi_new, time_segments, Flagb
     for i in range(N):
         # Get the segment info
         seg_times = time_segments[i]
-        start_pos = reeb_graph.nodes[waypoints[i]].configuration/100.0
+        # Convert from pixels to meters
+        start_pos_pixels = reeb_graph.nodes[waypoints[i]].configuration
+        start_pos = config.pixels_to_meters(start_pos_pixels)
         angle = phi[i] + Flagb[i]*np.pi/2
         
         # Separate arc and line parts
@@ -223,6 +232,44 @@ def visualize_segment_parts(waypoints, phi, r0, l, phi_new, time_segments, Flagb
         if line_times:
             total_time += sum(line_times)
             line_end_times.append(total_time)
+    
+    # Define a function to discretize the full trajectory for this visualization
+    def discretize_trajectory(waypoints, phi, r0, l, phi_new, time_segments, Flagb, reeb_graph, dt):
+        # Similar to discretize_segment but for the entire trajectory
+        all_times, all_xs, all_ys = [], [], []
+        total_time = 0.0
+        
+        # Process each segment
+        for i in range(len(waypoints) - 1):
+            # Discretize this segment
+            x_seg, y_seg, t_seg = discretize_segment(
+                i, waypoints, phi, r0, l, phi_new, time_segments, Flagb, reeb_graph
+            )
+            
+            # Adjust time values
+            t_seg = [t + total_time for t in t_seg]
+            
+            # Add to the collections
+            all_times.extend(t_seg)
+            all_xs.extend(x_seg)
+            all_ys.extend(y_seg)
+            
+            # Update total time
+            if t_seg:
+                total_time = t_seg[-1]
+                
+        # Create uniform time samples
+        t_uniform = np.arange(0, total_time, dt)
+        
+        # Interpolate positions at uniform times
+        from scipy.interpolate import interp1d
+        x_interp = interp1d(all_times, all_xs, kind='linear', bounds_error=False, fill_value="extrapolate")
+        y_interp = interp1d(all_times, all_ys, kind='linear', bounds_error=False, fill_value="extrapolate")
+        
+        x_uniform = x_interp(t_uniform)
+        y_uniform = y_interp(t_uniform)
+        
+        return t_uniform, x_uniform, y_uniform
     
     # Get time-position data
     times, xs, ys = discretize_trajectory(
@@ -476,8 +523,11 @@ def compare_discretization_with_spline(waypoints, phi, r0, l, phi_new, time_segm
         
         # Find corresponding segment in the trajectory
         # We'll use the waypoint positions to find the nearest points in the trajectory
-        start_pos = reeb_graph.nodes[waypoints[start_idx]].configuration/100.0
-        end_pos = reeb_graph.nodes[waypoints[end_idx]].configuration/100.0
+        # Convert from pixels to meters
+        start_pos_pixels = reeb_graph.nodes[waypoints[start_idx]].configuration
+        start_pos = config.pixels_to_meters(start_pos_pixels)
+        end_pos_pixels = reeb_graph.nodes[waypoints[end_idx]].configuration
+        end_pos = config.pixels_to_meters(end_pos_pixels)
         
         # Find closest trajectory points to these waypoints
         start_dists = [(x-start_pos[0])**2 + (y-start_pos[1])**2 for x, y in zip(x_uniform, y_uniform)]
@@ -541,7 +591,9 @@ def compare_discretization_with_spline(waypoints, phi, r0, l, phi_new, time_segm
     
     # Plot waypoints
     for i, wp_idx in enumerate(waypoints):
-        pos = reeb_graph.nodes[wp_idx].configuration/100.0
+        # Convert from pixels to meters
+        pos_pixels = reeb_graph.nodes[wp_idx].configuration
+        pos = config.pixels_to_meters(pos_pixels)
         plt.plot(pos[0], pos[1], 'ko', markersize=8)
         plt.text(pos[0], pos[1], f'W{wp_idx}', fontsize=12)
     

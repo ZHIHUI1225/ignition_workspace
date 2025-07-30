@@ -226,10 +226,10 @@ def Initial_Guess(reeb_graph,phi0,waypoints_file_path,environment_file,safe_corr
     from config_loader import config
     
     # Convert radius limit from meters to pixels
-    r_min_pixels = config.r_lim / 0.0023
+    r_min_pixels = config.meters_to_pixels(config.r_lim)
     
     # Convert minimum length from meters to pixels
-    l_min_pixels = config.min_length / 0.0023
+    l_min_pixels = config.meters_to_pixels(config.min_length)
     
     Waypoints, Flags, Flagb = load_WayPointFlag_from_file(waypoints_file_path)
     
@@ -412,7 +412,7 @@ def Planning_normalization(waypoints_file_path,Normalization_path,environment_fi
     from config_loader import config
     
     # Convert radius limit from meters to pixels
-    r_min_pixels = config.r_lim / 0.0023
+    r_min_pixels = config.meters_to_pixels(config.r_lim)
 
     Waypoints, Flags, Flagb = load_WayPointFlag_from_file(waypoints_file_path)
     Initial_Guess=np.array(load_initial_guess_from_file(Initial_Guess_file_path))
@@ -631,7 +631,7 @@ def Planning_error_withinSC(waypoints_file_path,Normalization_path,environment_f
     from config_loader import config
     
     # Convert radius limit from meters to pixels
-    r_min_pixels = config.r_lim / 0.0023
+    r_min_pixels = config.meters_to_pixels(config.r_lim)
 
     Waypoints, Flags, Flagb = load_WayPointFlag_from_file(waypoints_file_path)
     Initial_Guess=np.array(load_initial_guess_from_file(Initial_Guess_file_path))
@@ -685,19 +685,23 @@ def Planning_error_withinSC(waypoints_file_path,Normalization_path,environment_f
         ubg.append(0)
 
         g.append(ca.fabs(r0[i]))
-        lbg.append(r_min_pixels * 0.8)  # Slightly more relaxed radius constraint
+        lbg.append(r_min_pixels)  # Slightly more relaxed radius constraint
         ubg.append(10000)  # Much more reasonable radius maximum
         g.append(l[i])
         lbg.append(0)  # Minimum length matches GA_planning constraint
         ubg.append(np.pi*Distance[i][0]/2)  # Maximum length matches GA_planning constraint
         center=(r0[i]*ca.cos(phi_new[i]+np.pi/2),r0[i]*ca.sin(phi_new[i]+np.pi/2))
-        # for k in range(3):
-        #     theta=phi_new[i]+ca.pi/2+(phi[i+1]-phi_new[i])/3*(k+1)    
-        #     x_k = r0[i] * ca.cos(theta)-center[0]
-        #     y_k = r0[i] * ca.sin(theta)-center[1]
-        #     g.append(-x_k*ca.sin(Angle[i][0])+y_k*ca.cos(Angle[i][0]))
-        #     lbg.append(safe_corridor[i][1])
-        #     ubg.append(safe_corridor[i][2])
+        
+        # Simplified safe corridor constraints - check fewer key points to avoid over-constraining
+        # Check start point, middle point, and end point of the arc
+        for k in [0.25, 0.5, 0.75]:  # Check 3 strategic points along the arc
+            theta=phi_new[i]+ca.pi/2+(phi[i+1]-phi_new[i])*k    
+            x_k = r0[i] * ca.cos(theta)-center[0]
+            y_k = r0[i] * ca.sin(theta)-center[1]
+            # Transform to corridor coordinate system and check bounds with larger safety margin
+            g.append(-x_k*ca.sin(Angle[i][0])+y_k*ca.cos(Angle[i][0]))
+            lbg.append(safe_corridor[i][1] + 5)  # Larger safety margin for better convergence
+            ubg.append(safe_corridor[i][2] - 5)  # Larger safety margin for better convergence
 
     lb_phi = -np.pi * np.ones(N)
     ub_phi = np.pi * np.ones(N)
@@ -722,30 +726,12 @@ def Planning_error_withinSC(waypoints_file_path,Normalization_path,environment_f
     # al=np.ones(N-1)
     # length_min=np.zeros(N-1)
     
-    # Improved objective function with better scaling
-    scale_factor = 1e-6  # Scale down objective to avoid large numbers
+    # Objective function similar to GA_planning for easier comparison
     for i in range(N-1):
-        # Scale down the objective terms
-        arc_length = ca.fabs((phi[i+1]- phi[i]-Flagb[i]*np.pi/2)*r0[i])
+        arc_length = ca.fabs((phi[i+1] - phi[i] - Flagb[i]*np.pi/2) * r0[i])
         straight_length = l[i]
-        curvature_term = ca.if_else(phi[i+1]!=phi_new[i],1/ca.fabs(r0[i]),0)
-        
-        objective = objective + scale_factor * (al[i]*arc_length + al[i]*straight_length + ac*curvature_term)
-    
-    # Safe corridor penalty terms (also scaled)
-    for i in range(N-1):
-        center=(r0[i]*ca.cos(phi_new[i]+np.pi/2),r0[i]*ca.sin(phi_new[i]+np.pi/2))
-        for k in range(3):
-            theta=phi_new[i]+ca.pi/2+(phi[i+1]-phi_new[i])/3*(k+1)    
-            x_k = r0[i] * ca.cos(theta)-center[0]
-            y_k = r0[i] * ca.sin(theta)-center[1]
-            y_new=-x_k*ca.sin(Angle[i][0])+y_k*ca.cos(Angle[i][0])
-            
-            # Scale down penalty terms
-            penalty_scale = 1e-4
-            lower_penalty = ca.if_else((y_new-safe_corridor[i][1])>0,0,(y_new-safe_corridor[i][1])**2)
-            upper_penalty = ca.if_else((safe_corridor[i][2]-y_new)>0,0,(safe_corridor[i][2]-y_new)**2)
-            objective = objective - penalty_scale * (lower_penalty + upper_penalty)
+        curvature = ca.fabs(Distance[i][0] * ca.sin(Angle[i][0] - phi[i+1]))
+        objective = objective + al[i] * (arc_length + straight_length - length_min[i]) + ac * curvature
         #     lbg.append(safe_corridor[i][1])
         #     ubg.append(safe_corridor[i][2])
         # objective = objective + al*theta_l*(ca.fabs((phi[i+1]- phi[i]-Flagb[i]*np.pi/2)*r0[i])+l[i]-length_min)+ac*theta_c*(1/ca.fabs(r0[i])-curvature_min)
@@ -756,19 +742,19 @@ def Planning_error_withinSC(waypoints_file_path,Normalization_path,environment_f
     # Create an NLP problem
     nlp = {'x': ca.vertcat(phi), 'f': objective, 'g': ca.vertcat(*g)}
 
-    # Improved solver settings for better convergence
+    # Improved solver settings for better convergence with safe corridor constraints
     opts_setting = {
-        'ipopt.max_iter': 2000,           # Reduced from 5000
-        'ipopt.print_level': 3,
-        'print_time': 1,
-        'ipopt.acceptable_tol': 1e-2,     # More relaxed tolerance
-        'ipopt.acceptable_obj_change_tol': 1e-3,
-        'ipopt.tol': 1e-3,                # More relaxed tolerance
-        'ipopt.acceptable_iter': 15,      # Accept solution after 15 iterations at acceptable tolerance
-        'ipopt.mu_strategy': 'adaptive',  # Adaptive barrier parameter strategy
-        'ipopt.warm_start_init_point': 'yes',  # Use warm start
-        'ipopt.nlp_scaling_method': 'gradient-based',  # Better scaling
-        'ipopt.linear_solver': 'mumps'    # Often more robust than default
+        'ipopt.max_iter': 3000,           # Increase iterations for complex constraints
+        'ipopt.print_level': 2,           # Reduce print level to avoid clutter
+        'print_time': 0,
+        'ipopt.acceptable_tol': 1e-1,     # Much more relaxed tolerance for feasibility
+        'ipopt.acceptable_obj_change_tol': 1e-2,
+        'ipopt.tol': 1e-2,                # More relaxed tolerance
+        'ipopt.constr_viol_tol': 1e-1,    # Allow larger constraint violations
+        'ipopt.acceptable_iter': 10,      # Accept solution after 10 iterations at acceptable tolerance
+        'ipopt.mu_init': 1e-1,           # Start with larger barrier parameter
+        'ipopt.barrier_tol_factor': 10,  # More relaxed barrier tolerance
+        'ipopt.bound_relax_factor': 1e-6  # Relax bounds slightly
     }
     solver = ca.nlpsol('solver', 'ipopt', nlp, opts_setting)
 
@@ -908,7 +894,7 @@ def Planning(waypoints_file_path,al,ac,Max0Min,reeb_graph,Initial_Guess_file_pat
     from config_loader import config
     
     # Convert radius limit from meters to pixels
-    r_min_pixels = config.r_lim / 0.0023
+    r_min_pixels = config.meters_to_pixels(config.r_lim)
 
     Waypoints, Flags, Flagb = load_WayPointFlag_from_file(waypoints_file_path)
 
@@ -1051,7 +1037,7 @@ def get_normalization_prams(waypoints_file_path,Normalization_path,reeb_graph,In
     length_max=[]
     
     # Convert radius limit from meters to pixels
-    r_min = config.r_lim / 0.0023  # Convert from meters to pixels
+    r_min = config.meters_to_pixels(config.r_lim)  # Convert from meters to pixels
     print(f"Using radius limit: {r_min:.2f} pixels (converted from {config.r_lim} meters)")
     
     al=[]

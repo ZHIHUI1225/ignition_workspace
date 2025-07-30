@@ -1,0 +1,19 @@
+# Configuration for robot0 with namespace support
+
+robot0:
+  epuck_driver_robot0:
+    ros__parameters:
+      epuck_address: "192.168.0.182:1000"
+      epuck_name: "robot0"
+      xpos: 0.0
+      ypos: 0.0
+      theta: 0.0
+      accelerometer: true
+      proximity: true
+      motor_position: true
+      camera: false
+      light: false
+      floor: false
+      selector: false
+      motor_speed: false
+      microphone: false

@@ -27,6 +27,26 @@ class PlanningConfig:
         
         # Planning parameters
         self.phi0 = config['planning']['phi0']
+        self.deltal = config['planning']['deltal']  # Small segment length for discretization
+        
+        # Robot physical parameters
+        robot_phys = config['robot_physical']
+        self.aw_max = robot_phys['angular_acceleration_max']
+        self.w_max = robot_phys['angular_velocity_max']
+        self.r_w = robot_phys['wheel_radius']
+        self.l_r = robot_phys['wheelbase']
+        self.r_limit = robot_phys['turning_radius_limit']
+        self.v_max = robot_phys['linear_velocity_max']
+        self.a_max = robot_phys['linear_acceleration_max']
+        self.mu = robot_phys['friction_coefficient']
+        self.mu_f = robot_phys['safety_factor']
+        self.g = robot_phys['gravity']
+        self.mu_mu_f = robot_phys['friction_limit']
+        
+        # Coordinate conversion parameters
+        coord_conv = config['coordinate_conversion']
+        self.pixel_to_meter_scale = coord_conv['pixel_to_meter_scale']
+        self.meter_to_pixel_scale = coord_conv['meter_to_pixel_scale']
         
         # Arc range configuration
         self.arc_range = config['arc_range']
@@ -72,15 +92,23 @@ class PlanningConfig:
     
     def _generate_file_paths(self):
         """Generate file paths based on case and robot count"""
-        self.file_path = f"Graph_new_{self.case}.json"
-        self.environment_file = f"environment_{self.case}.json"
-        self.assignment_result_file = f"AssignmentResult{self.N}{self.case}.json"
-        self.waypoints_file_path = f"WayPointFlag{self.N}{self.case}.json"
+        # Generate full paths to data directory for most files
+        self.file_path = os.path.join(self.data_path, f"Graph_new_{self.case}.json")
+        self.environment_file = os.path.join(self.data_path, f"environment_{self.case}.json")
+        self.assignment_result_file = os.path.join(self.data_path, f"AssignmentResult{self.N}{self.case}.json")
+        self.waypoints_file_path = os.path.join(self.data_path, f"WayPointFlag{self.N}{self.case}.json")
         # Two different normalization files
-        self.Normalization_path = f"Normalization{self.N}_{self.case}.json"  # For assignment
-        self.Normalization_planning_path = f"Normalization_planning{self.N}_{self.case}.json"  # For GA planning
-        self.Result_file = f"Optimization_GA_{self.N}_IG_norma{self.case}.json"
-        self.figure_file = f"Optimization_GA_{self.N}_IG_norma{self.case}.png"
+        self.Normalization_path = os.path.join(self.data_path, f"Normalization{self.N}_{self.case}.json")  # For assignment
+        self.Normalization_planning_path = os.path.join(self.data_path, f"Normalization_planning{self.N}_{self.case}.json")  # For GA planning
+        self.Result_file = os.path.join(self.data_path, f"Optimization_GA_{self.N}_IG_norma{self.case}.json")
+        self.figure_file = os.path.join(self.data_path, f"Optimization_GA_{self.N}_IG_norma{self.case}.png")
+        
+        # Planning deltaT specific file paths
+        self.ga_initial_guess_file = os.path.join(self.data_path, f"Optimization_GA_{self.N}_IG_norma{self.case}.json")  # True initial guess from GA
+        self.ga_initial_guess_figure = os.path.join(self.data_path, f"InitialGuess{self.N}{self.case}.png")
+        self.planning_path_result_file = os.path.join(self.data_path, f"Optimization_withSC_path{self.N}{self.case}.json")  # Result from Planning_path with safe corridors
+        self.deltaT_result_file = os.path.join(self.data_path, f"Optimization_deltaT_{self.N}{self.case}.json")
+        self.deltaT_figure_file = os.path.join(self.data_path, f"Optimization_deltaT_{self.N}{self.case}.png")
     
     def update_case(self, new_case):
         """Update case name and regenerate file paths"""
@@ -96,6 +124,41 @@ class PlanningConfig:
         """Get full path for a file"""
         base = self.data_path if use_data_path else self.base_path
         return os.path.join(base, filename)
+    
+    def pixels_to_meters(self, pixel_value):
+        """Convert pixel values to meters"""
+        if isinstance(pixel_value, (list, tuple)):
+            return [p * self.pixel_to_meter_scale for p in pixel_value]
+        else:
+            return pixel_value * self.pixel_to_meter_scale
+    
+    def meters_to_pixels(self, meter_value):
+        """Convert meter values to pixels"""
+        if isinstance(meter_value, (list, tuple)):
+            return [m * self.meter_to_pixel_scale for m in meter_value]
+        else:
+            return meter_value * self.meter_to_pixel_scale
+    
+    def get_robot_physical_params(self):
+        """Get all robot physical parameters as a dictionary"""
+        return {
+            'aw_max': self.aw_max,
+            'w_max': self.w_max,
+            'r_w': self.r_w,
+            'l_r': self.l_r,
+            'r_limit': self.r_limit,
+            'v_max': self.v_max,
+            'a_max': self.a_max,
+            'mu': self.mu,
+            'mu_f': self.mu_f,
+            'g': self.g,
+            'mu_mu_f': self.mu_mu_f
+        }
+    
+    def get_case_data_dir(self, case_name=None):
+        """Get the full path to the data directory for a specific case"""
+        case = case_name if case_name else self.case
+        return os.path.join(self.data_path, case)
 
 # Global config instance
 config = PlanningConfig()

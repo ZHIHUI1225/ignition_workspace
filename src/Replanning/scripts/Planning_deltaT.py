@@ -21,17 +21,49 @@ from save_spline_trajectory import save_spline_trajectory
 # Import trajectory parameter functions
 from trajectory_parameters import save_trajectory_parameters, load_trajectory_parameters, plot_from_saved_trajectory, generate_spline_from_saved_trajectory
 
-aw_max=0.2*np.pi# the maximum angular acceleration
-w_max=0.5*np.pi # the maximum angular velocity
-r_limit=0.75 # m
-r_w=0.033 # the radius of the wheel
-v_max=w_max*r_w# m/s
-a_max=aw_max*r_w
-l_r=0.14 # the wheel base
-mu = 0.7  # Coefficient of friction (typical for rubber on concrete)
-mu_f = 0.8  # Safety factor
-g = 9.81  # Gravitational acceleration (m/s²)
-mu_mu_f = mu * mu_f * g  
+# Add config path to sys.path and load configuration
+import sys
+sys.path.append('/root/workspace/config')
+from config_loader import config
+
+# Get robot physical parameters from config
+robot_params = config.get_robot_physical_params()
+aw_max = robot_params['aw_max']  # the maximum angular acceleration
+w_max = robot_params['w_max']   # the maximum angular velocity
+r_limit = robot_params['r_limit']  # m
+r_w = robot_params['r_w']       # the radius of the wheel
+v_max = robot_params['v_max']   # m/s (pre-calculated in config)
+a_max = robot_params['a_max']   # (pre-calculated in config)
+l_r = robot_params['l_r']       # the wheel base
+mu = robot_params['mu']         # Coefficient of friction (typical for rubber on concrete)
+mu_f = robot_params['mu_f']     # Safety factor
+g = robot_params['g']           # Gravitational acceleration (m/s²)
+mu_mu_f = robot_params['mu_mu_f']  # pre-calculated in config
+
+
+def convert_pixel_data_to_meters(phi, l, r):
+    """
+    Convert planning data from pixels to meters where needed.
+    
+    Args:
+        phi: Angular data (already in radians, no conversion needed)
+        l: Length data in pixels (converted to meters)
+        r: Radius data in pixels (converted to meters)
+    
+    Returns:
+        Tuple (phi, l_meters, r_meters) with converted units
+    """
+    # Convert lengths and radii from pixels to meters
+    l_meters = config.pixels_to_meters(l) if isinstance(l, (list, tuple, np.ndarray)) else [config.pixels_to_meters(val) for val in l]
+    r_meters = config.pixels_to_meters(r) if isinstance(r, (list, tuple, np.ndarray)) else [config.pixels_to_meters(val) for val in r]
+    
+    # Convert numpy arrays if necessary
+    if isinstance(l, np.ndarray):
+        l_meters = np.array(l_meters)
+    if isinstance(r, np.ndarray):
+        r_meters = np.array(r_meters)
+        
+    return phi, l_meters, r_meters  
 
 
 def load_WayPointFlag_from_file(file_path):
@@ -183,13 +215,34 @@ def Get_index(r0, l, delta_phi, Deltal):
     return N_arc, N_line
     
 
-def Planning_deltaT(waypoints_file_path,reeb_graph,Initial_Guess_file_path,Result_file,figure_file):
-    Deltal=0.02 #m 
+def Planning_deltaT(waypoints_file_path,reeb_graph,planning_path_result_file,Result_file,figure_file):
+    """
+    Optimize trajectory timing for a path with given geometry.
+    
+    This function takes the output from Planning_path (which includes safe corridor constraints)
+    and optimizes the time distribution along the trajectory to minimize total time while
+    respecting robot dynamics constraints.
+    
+    Args:
+        waypoints_file_path: Path to waypoints and flags file
+        reeb_graph: The Reeb graph structure
+        planning_path_result_file: Result file from Planning_path with safe corridor optimization
+        Result_file: Output file for timing optimization results
+        figure_file: Output figure file
+    
+    Returns:
+        time_segments: Optimized time segments for each arc and line
+        total_time: Total trajectory time
+    """
+    Deltal = config.deltal  # Get small segment length from config (m)
     Waypoints, Flags, Flagb = load_WayPointFlag_from_file(waypoints_file_path)
 
-    phi_data=np.array(load_phi_from_file(Initial_Guess_file_path))
-    r_guess=np.array(load_r_from_file(Initial_Guess_file_path))/100 #cm to m 
-    l_guess=np.array(load_l_from_file(Initial_Guess_file_path))/100
+    phi_data = np.array(load_phi_from_file(planning_path_result_file))
+    r_guess_pixels = np.array(load_r_from_file(planning_path_result_file))
+    l_guess_pixels = np.array(load_l_from_file(planning_path_result_file))
+    
+    # Convert pixel data to meters using config conversion
+    phi_data, l_guess, r_guess = convert_pixel_data_to_meters(phi_data, l_guess_pixels, r_guess_pixels)
     
     # Number of variables
     N = len(Waypoints)
@@ -671,8 +724,14 @@ def Planning_deltaT(waypoints_file_path,reeb_graph,Initial_Guess_file_path,Resul
         return [], 0.0
 
 def save_waypoints(case,N,data_file=None):
-    nodes, in_neighbors, out_neighbors = load_reeb_graph('Graph_new_'+case+'.json')
-    Waypoints, Flags, FlagB = load_WayPointFlag_from_file(f'WayPointFlag{N}'+case+'.json')
+    import os # Add explicit import here to avoid reference error
+    graph_file = os.path.join(config.data_path, f'Graph_new_{case}.json')
+    waypoints_file = os.path.join(config.data_path, f'WayPointFlag{N}{case}.json')
+    print(f"Loading graph from: {graph_file}")
+    print(f"Loading waypoints from: {waypoints_file}")
+    
+    nodes, in_neighbors, out_neighbors = load_reeb_graph(graph_file)
+    Waypoints, Flags, FlagB = load_WayPointFlag_from_file(waypoints_file)
     
     # Load only phi, l, r from the file (no v, a needed)
     with open(data_file, 'r') as file:
@@ -683,7 +742,8 @@ def save_waypoints(case,N,data_file=None):
 
     # Load environment obstacles
     try:
-        with open(f'environment_{case}.json', 'r') as file:
+        env_file = os.path.join(config.data_path, f'environment_{case}.json')
+        with open(env_file, 'r') as file:
             env_data = json.load(file)
         obstacles = env_data.get('obstacles', [])
         print(f"Loaded {len(obstacles)} obstacles from environment file")
@@ -710,9 +770,10 @@ def save_waypoints(case,N,data_file=None):
     
     # Ensure directory exists
     import os
-    os.makedirs('/home/zhihui/data/'+case, exist_ok=True)
+    data_dir = os.path.join(config.data_path, case)
+    os.makedirs(data_dir, exist_ok=True)
     
-    save_file='/home/zhihui/data/'+case+'/Waypoints.json'
+    save_file = os.path.join(data_dir, 'Waypoints.json')
     with open(save_file, 'w') as file:
         json.dump(data, file)
     
@@ -720,41 +781,42 @@ def save_waypoints(case,N,data_file=None):
 
 
 if __name__ == '__main__':
-    # Example usage
-    # case="simple_maze"
-    # case="simulation"
-    case="maze_5"
-    N=5
-    # file_path = "Graph_"+case+".json"
-    file_path = "Graph_new_"+case+".json"
+    # Load configuration for case, N, and file paths
+    case = config.case
+    N = config.N
+    
+    # Get file paths from config
+    file_path = config.file_path
     reeb_graph = load_reeb_graph_from_file(file_path)
     NumNodes=len(reeb_graph.nodes)
-    environment_file= "environment_"+case+".json"
+    environment_file = config.environment_file
     Start_node=reeb_graph.nodes[NumNodes-2].configuration
     End_node=reeb_graph.nodes[NumNodes-1].configuration
     Distances=np.linalg.norm(End_node-Start_node)
     
-    # Output files
-    assignment_result_file = f"AssignmentResult{N}"+case+".json"
-    Initial_Guess_file_path=f"Optimization_GA_{N}_IG_norma"+case+".json"
-    Initial_Guess_figure_file=f"InitialGuess{N}"+case+".png"
-    waypoints_file_path=f"WayPointFlag{N}"+case+".json"
-    Initial_Guess_file=f"Optimization_withSC_path{N}"+case+".json"
-    result_file=f"Optimization_deltaT_{N}"+case+".json"
-    figure_file=f"Optimization_deltaT_{N}"+case+".png"
+    # Output files from config
+    assignment_result_file = config.assignment_result_file
+    ga_initial_guess_file = config.ga_initial_guess_file  # True initial guess from GA optimization
+    ga_initial_guess_figure = config.ga_initial_guess_figure
+    waypoints_file_path = config.waypoints_file_path
+    planning_path_result_file = config.planning_path_result_file  # Result from Planning_path with safe corridor constraints
+    result_file = config.deltaT_result_file  # Final result from Planning_deltaT (time optimization)
+    figure_file = config.deltaT_figure_file
     
-    # Save waypoints for visualization (with simplified structure)
+    # Save waypoints for visualization using the Planning_path result (not the original GA guess)
     try:
-        print(f"Saving waypoints from {Initial_Guess_file}...")
-        save_waypoints(case, N, Initial_Guess_file)
+        print(f"Saving waypoints from Planning_path result: {planning_path_result_file}...")
+        save_waypoints(case, N, planning_path_result_file)
     except Exception as e:
         print(f"Warning: Could not save waypoints: {e}")
         print("Continuing with optimization...")
-    # Run the optimization
+    
+    # Run the time optimization (Planning_deltaT)
+    print(f"Starting time optimization using path from: {planning_path_result_file}")
     time_segments, total_time = Planning_deltaT(
         waypoints_file_path=waypoints_file_path,
         reeb_graph=reeb_graph,
-        Initial_Guess_file_path=Initial_Guess_file,
+        planning_path_result_file=planning_path_result_file,
         Result_file=result_file,
         figure_file=figure_file
     )
@@ -765,11 +827,15 @@ if __name__ == '__main__':
     # Generate visualization of differential drive constraints
     # plot_differential_drive_limits()
     
-    # Load waypoints to visualize trajectory with time information
+    # Load the optimized path geometry from Planning_path for visualization
+    # (This is the same file used as input to the time optimization)
     Waypoints, Flags, Flagb = load_WayPointFlag_from_file(waypoints_file_path)
-    phi_data = np.array(load_phi_from_file(Initial_Guess_file))
-    r_guess = np.array(load_r_from_file(Initial_Guess_file))/100 #cm to m 
-    l_guess = np.array(load_l_from_file(Initial_Guess_file))/100
+    phi_data_pixels = np.array(load_phi_from_file(planning_path_result_file))
+    r_guess_pixels = np.array(load_r_from_file(planning_path_result_file))
+    l_guess_pixels = np.array(load_l_from_file(planning_path_result_file))
+    
+    # Convert pixel data to meters using config conversion
+    phi_data, l_guess, r_guess = convert_pixel_data_to_meters(phi_data_pixels, l_guess_pixels, r_guess_pixels)
     phi_new = np.zeros(np.shape(phi_data))
     
     # Calculate phi_new for visualization
@@ -817,7 +883,7 @@ if __name__ == '__main__':
         Flagb=Flagb,
         reeb_graph=reeb_graph,
         dt=0.5,  # For comparison
-        save_dir='/home/zhihui/data/'+case+'/'
+        save_dir=os.path.join(config.data_path, case) + '/'
     )
     
     print(f"\nTrajectory parameters saved for {len(trajectory_files) - 1} robots")

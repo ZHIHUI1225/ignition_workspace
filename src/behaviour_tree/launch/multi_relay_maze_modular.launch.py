@@ -18,6 +18,7 @@ def generate_launch_description():
     # Launch Arguments
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
     num_robots_config = LaunchConfiguration('num_robots', default='3')
+    case_config = LaunchConfiguration('case', default='simulation')
     
     # Launch description
     ld = LaunchDescription()
@@ -32,15 +33,22 @@ def generate_launch_description():
         'num_robots',
         default_value='3',
         description='Number of robots to launch behavior trees for'))
+        
+    ld.add_action(DeclareLaunchArgument(
+        'case',
+        default_value='simulation',
+        description='Case name for trajectory data and configuration'))
      # Direct robot node creation to avoid OpaqueFunction issues
     # Create behavior tree nodes for each robot with staggered startup
     from launch.actions import TimerAction
+    from launch.substitutions import LaunchConfiguration
+    import launch.substitutions
     
-    # Default to 3 robots, can be adjusted by changing this value
-    num_robots = 5
-    case='simulation'
+    # Use the launch configuration parameters
+    num_robots = int(launch.substitutions.TextSubstitution(text=num_robots_config.perform(context=None)).text)
+    case = launch.substitutions.TextSubstitution(text=LaunchConfiguration('case', default='simulation').perform(context=None)).text
     for i in range(num_robots):
-        robot_namespace = f'turtlebot{i}'
+        robot_namespace = f'robot{i}'
         tree_node_name = f'tree_{i}'
         
         # Create robot group with timer delay for sequential startup
