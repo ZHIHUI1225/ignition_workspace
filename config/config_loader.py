@@ -31,17 +31,27 @@ class PlanningConfig:
         
         # Robot physical parameters
         robot_phys = config['robot_physical']
-        self.aw_max = robot_phys['angular_acceleration_max']
-        self.w_max = robot_phys['angular_velocity_max']
-        self.r_w = robot_phys['wheel_radius']
-        self.l_r = robot_phys['wheelbase']
-        self.r_limit = robot_phys['turning_radius_limit']
-        self.v_max = robot_phys['linear_velocity_max']
-        self.a_max = robot_phys['linear_acceleration_max']
-        self.mu = robot_phys['friction_coefficient']
-        self.mu_f = robot_phys['safety_factor']
-        self.g = robot_phys['gravity']
-        self.mu_mu_f = robot_phys['friction_limit']
+        
+        # Hardware limits (reference values)
+        hardware_limits = robot_phys['hardware_limits']
+        self.r_w = hardware_limits['wheel_radius']
+        self.l_r = hardware_limits['wheelbase']
+        
+        # Operational limits (actual values used in planning)
+        operational_limits = robot_phys['operational_limits']
+        self.aw_max = operational_limits['angular_acceleration_max']
+        self.w_max = operational_limits['angular_velocity_max']
+        self.r_limit = operational_limits['turning_radius_limit']
+        self.v_max = operational_limits['linear_velocity_max']
+        self.a_max = operational_limits['linear_acceleration_max']
+        self.mu = operational_limits['friction_coefficient']
+        self.mu_f = operational_limits['safety_factor']
+        self.g = operational_limits['gravity']
+        self.mu_mu_f = operational_limits['friction_limit']
+        
+        # Additional operational parameters
+        self.wheel_w_max = operational_limits['wheel_angular_velocity_max']
+        self.wheel_aw_max = operational_limits['wheel_angular_acceleration_max']
         
         # Coordinate conversion parameters
         coord_conv = config['coordinate_conversion']
@@ -142,17 +152,42 @@ class PlanningConfig:
     def get_robot_physical_params(self):
         """Get all robot physical parameters as a dictionary"""
         return {
+            # Operational limits (used in planning)
             'aw_max': self.aw_max,
             'w_max': self.w_max,
-            'r_w': self.r_w,
-            'l_r': self.l_r,
-            'r_limit': self.r_limit,
             'v_max': self.v_max,
             'a_max': self.a_max,
+            'wheel_w_max': self.wheel_w_max,
+            'wheel_aw_max': self.wheel_aw_max,
+            'r_limit': self.r_limit,
+            
+            # Physical dimensions
+            'r_w': self.r_w,
+            'l_r': self.l_r,
+            
+            # Environmental parameters
             'mu': self.mu,
             'mu_f': self.mu_f,
             'g': self.g,
             'mu_mu_f': self.mu_mu_f
+        }
+    
+    def get_hardware_limits(self):
+        """Get hardware limitation parameters"""
+        with open(self.config_path, 'r') as file:
+            config = yaml.safe_load(file)
+        
+        hardware_limits = config['robot_physical']['hardware_limits']
+        return {
+            'linear_velocity_max_hw': hardware_limits['linear_velocity_max_hw'],
+            'angular_velocity_max_hw': hardware_limits['angular_velocity_max_hw'],
+            'wheel_angular_velocity_max': hardware_limits['wheel_angular_velocity_max'],
+            'wheel_angular_acceleration_max': hardware_limits['wheel_angular_acceleration_max'],
+            'linear_acceleration_max_hw': hardware_limits['linear_acceleration_max_hw'],
+            'angular_acceleration_max_hw': hardware_limits['angular_acceleration_max_hw'],
+            'max_steps_per_second': hardware_limits['max_steps_per_second'],
+            'gear_reduction_ratio': hardware_limits['gear_reduction_ratio'],
+            'steps_per_revolution': hardware_limits['steps_per_revolution']
         }
     
     def get_case_data_dir(self, case_name=None):

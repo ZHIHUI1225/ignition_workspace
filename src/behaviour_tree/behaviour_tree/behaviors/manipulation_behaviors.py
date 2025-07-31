@@ -320,7 +320,7 @@ class MobileRobotMPC:
 class PushObject(py_trees.behaviour.Behaviour):
     """Push object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name="PushObject", robot_namespace="turtlebot0", distance_threshold=0.08, case="simple_maze"):
+    def __init__(self, name="PushObject", robot_namespace="robot0", distance_threshold=0.08, case="simple_maze"):
         super().__init__(name)
         self.robot_namespace = robot_namespace  # Use provided namespace
         self.case = case  # Use provided case instead of hardcoded default
@@ -406,7 +406,7 @@ class PushObject(py_trees.behaviour.Behaviour):
             try:
                 self.robot_namespace = self.node.get_parameter('robot_namespace').value
             except:
-                self.robot_namespace = "turtlebot0"
+                self.robot_namespace = "robot0"
             
             # Create publishers (no callback group)
             self.cmd_vel_pub = self.node.create_publisher(

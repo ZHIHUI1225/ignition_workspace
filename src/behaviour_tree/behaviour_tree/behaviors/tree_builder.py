@@ -47,7 +47,7 @@ def report_node_failure(node_name, error_info, robot_namespace, blackboard_clien
 class LoopCondition(py_trees.behaviour.Behaviour):
     """强化循环条件检查器 - 精确失败检测与快速响应"""
     
-    def __init__(self, name, robot_namespace="turtlebot0"):
+    def __init__(self, name, robot_namespace="robot0"):
         super().__init__(name)
         self.robot_namespace = robot_namespace
         self.blackboard = py_trees.blackboard.Client(name=self.name)
@@ -108,7 +108,7 @@ class LoopCondition(py_trees.behaviour.Behaviour):
 class GlobalExceptionHandler(py_trees.behaviour.Behaviour):
     """强化全局异常处理器 - 统一失败传播与资源清理"""
     
-    def __init__(self, name, robot_namespace="turtlebot0"):
+    def __init__(self, name, robot_namespace="robot0"):
         super().__init__(name)
         self.robot_namespace = robot_namespace
         self.blackboard = py_trees.blackboard.Client(name=self.name)
@@ -161,7 +161,7 @@ class GlobalExceptionHandler(py_trees.behaviour.Behaviour):
 
 
 
-def create_root(robot_namespace="turtlebot0", case="simple_maze", control_dt=None):
+def create_root(robot_namespace="robot0", case="simple_maze", control_dt=None):
     """Create behavior tree root node with optimized Selector+LoopCondition control and parallel blackboard init"""
     # Use provided control_dt or fall back to global default
     if control_dt is None:

@@ -185,13 +185,13 @@ class EventDrivenApproachObject(py_trees.behaviour.Behaviour):
     Uses event queue for pose updates to eliminate lock contention.
     """
 
-    def __init__(self, name="EventDrivenApproachObject", robot_namespace="turtlebot0", approach_distance=0.14):
+    def __init__(self, name="EventDrivenApproachObject", robot_namespace="robot0", approach_distance=0.14):
         """
         Initialize the EventDrivenApproachObject behavior.
         
         Args:
             name: Name of the behavior node
-            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
+            robot_namespace: The robot namespace (e.g., 'robot0', 'turtlebot1')
             approach_distance: Distance to maintain from the parcel
         """
         super(EventDrivenApproachObject, self).__init__(name)
@@ -338,13 +338,13 @@ class ApproachObject(EventDrivenApproachObject):
     This class now inherits from EventDrivenApproachObject for backward compatibility.
     """
 
-    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.14):
+    def __init__(self, name="ApproachObject", robot_namespace="robot0", approach_distance=0.14):
         """
         Initialize the ApproachObject behavior.
         
         Args:
             name: Name of the behavior node
-            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
+            robot_namespace: The robot namespace (e.g., 'robot0', 'turtlebot1')
             approach_distance: Distance to maintain from the parcel
         """
         super(ApproachObject, self).__init__(name=name, robot_namespace=robot_namespace, approach_distance=approach_distance)
@@ -372,7 +372,7 @@ class ApproachObject(EventDrivenApproachObject):
             print(f"[{self.name}][{self.robot_namespace}] 警告: 停止机器人时出错: {e}")
 
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
         
@@ -735,7 +735,7 @@ class ApproachObject(EventDrivenApproachObject):
         """Publish the pushing estimated time via ROS topic"""
         if self.pushing_estimated_time_pub:
             # Get the current pushing_estimated_time from blackboard, default to 45.0
-            estimated_time = 50.0 # Default estimated time for turtlebot0
+            estimated_time = 50.0 # Default estimated time for robot0
             msg = Float64()
             msg.data = estimated_time
             self.pushing_estimated_time_pub.publish(msg)
@@ -1112,7 +1112,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
         self.start_pose = None
         self.current_pose = None
         self.move_speed = -0.1  # negative for backward movement
-        self.robot_namespace = "turtlebot0"  # Default, will be updated from parameters
+        self.robot_namespace = "robot0"  # Default, will be updated from parameters
         
         # Event queue for thread-safe pose updates
         self._event_queue = Queue()
@@ -1149,7 +1149,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
             try:
                 self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
             except:
-                self.robot_namespace = "turtlebot0"
+                self.robot_namespace = "robot0"
             
             # Publisher for cmd_vel
             self.cmd_vel_pub = self.ros_node.create_publisher(
@@ -1265,7 +1265,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
                 self.cmd_vel_pub.publish(stop_cmd)
             from .tree_builder import report_node_failure
             error_msg = f"MoveBackward timeout after {elapsed:.1f}s - failed to reach target distance"
-            report_node_failure(self.name, error_msg, "turtlebot0")  # MoveBackward doesn't have robot_namespace
+            report_node_failure(self.name, error_msg, "robot0")  # MoveBackward doesn't have robot_namespace
             print(f"[{self.name}] Move backward timed out")
             return py_trees.common.Status.FAILURE
         

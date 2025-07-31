@@ -26,6 +26,9 @@ import sys
 sys.path.append('/root/workspace/config')
 from config_loader import config
 
+# Import coordinate transformation utilities
+from coordinate_transform import convert_pixel_positions_to_world_meters, convert_pixel_data_to_meters
+
 # Get robot physical parameters from config
 robot_params = config.get_robot_physical_params()
 aw_max = robot_params['aw_max']  # the maximum angular acceleration
@@ -39,31 +42,6 @@ mu = robot_params['mu']         # Coefficient of friction (typical for rubber on
 mu_f = robot_params['mu_f']     # Safety factor
 g = robot_params['g']           # Gravitational acceleration (m/s²)
 mu_mu_f = robot_params['mu_mu_f']  # pre-calculated in config
-
-
-def convert_pixel_data_to_meters(phi, l, r):
-    """
-    Convert planning data from pixels to meters where needed.
-    
-    Args:
-        phi: Angular data (already in radians, no conversion needed)
-        l: Length data in pixels (converted to meters)
-        r: Radius data in pixels (converted to meters)
-    
-    Returns:
-        Tuple (phi, l_meters, r_meters) with converted units
-    """
-    # Convert lengths and radii from pixels to meters
-    l_meters = config.pixels_to_meters(l) if isinstance(l, (list, tuple, np.ndarray)) else [config.pixels_to_meters(val) for val in l]
-    r_meters = config.pixels_to_meters(r) if isinstance(r, (list, tuple, np.ndarray)) else [config.pixels_to_meters(val) for val in r]
-    
-    # Convert numpy arrays if necessary
-    if isinstance(l, np.ndarray):
-        l_meters = np.array(l_meters)
-    if isinstance(r, np.ndarray):
-        r_meters = np.array(r_meters)
-        
-    return phi, l_meters, r_meters  
 
 
 def load_WayPointFlag_from_file(file_path):
@@ -260,6 +238,8 @@ def Planning_deltaT(waypoints_file_path,reeb_graph,planning_path_result_file,Res
     
     # Calculate the number of arc and line segments
     for i in range(N-1):
+        # Note: phi_new calculation needs to account for coordinate frame transformation
+        # In world coordinates, the phi angles have been transformed, so we use them directly
         phi_new[i]=phi[i]+Flagb[i]*np.pi/2
         delta_phi=(phi[i+1] - phi_new[i])
         Index=Get_index(r0[i],l[i],delta_phi,Deltal)
@@ -736,9 +716,16 @@ def save_waypoints(case,N,data_file=None):
     # Load only phi, l, r from the file (no v, a needed)
     with open(data_file, 'r') as file:
         data = json.load(file)
-    phi = data["Optimization_phi"]
-    l = data["Optimization_l"]
-    r = data["Optimization_r"]
+    phi_pixels = data["Optimization_phi"]
+    l_pixels = data["Optimization_l"]
+    r_pixels = data["Optimization_r"]
+    
+    # Convert pixel data to meters using proper coordinate transformation
+    phi, l, r = convert_pixel_data_to_meters(phi_pixels, l_pixels, r_pixels)
+    
+    # Extract node positions in pixel coordinates and convert to world meters
+    node_positions_pixels = [nodes[Waypoints[i]][1] for i in range(len(Waypoints))]
+    node_positions_world = convert_pixel_positions_to_world_meters(node_positions_pixels)
 
     # Load environment obstacles
     try:
@@ -754,17 +741,19 @@ def save_waypoints(case,N,data_file=None):
     WP=[]
     RP=[]
     for i in range(len(Waypoints)-1):
-        # Simplified node structure without velocity and acceleration information
-        Node={'Node':i,'Position':nodes[Waypoints[i]][1],'Orientation':phi[i],
+        # Use converted world coordinates in meters instead of pixel coordinates
+        # phi angles are already transformed to world coordinates
+        Node={'Node':i,'Position':node_positions_world[i],'Orientation':phi[i],
                 'Radius':r[i],
                 'Length':l[i]}
         WP.append(Node)
         if Flags[i]==1 or i==0:
+            # Use transformed world coordinate angles for relay point orientation
             Theta=phi[i]+FlagB[i]*np.pi/2
-            RP_Ini={'Node':i,'Position':nodes[Waypoints[i]][1],'Orientation':Theta}
+            RP_Ini={'Node':i,'Position':node_positions_world[i],'Orientation':Theta}
             RP.append(RP_Ini)
     
-    Node={'Node':len(Waypoints)-1,'Position':nodes[Waypoints[len(Waypoints)-1]][1]}
+    Node={'Node':len(Waypoints)-1,'Position':node_positions_world[len(Waypoints)-1]}
     WP.append(Node)
     data={'Waypoints':WP,'RelayPoints':RP}
     
@@ -836,10 +825,17 @@ if __name__ == '__main__':
     
     # Convert pixel data to meters using config conversion
     phi_data, l_guess, r_guess = convert_pixel_data_to_meters(phi_data_pixels, l_guess_pixels, r_guess_pixels)
+    
+    # Convert waypoint positions from pixels to world meters for trajectory functions
+    nodes, _, _ = load_reeb_graph(file_path)
+    node_positions_pixels = [nodes[Waypoints[i]][1] for i in range(len(Waypoints))]
+    node_positions_world = convert_pixel_positions_to_world_meters(node_positions_pixels)
+    
     phi_new = np.zeros(np.shape(phi_data))
     
-    # Calculate phi_new for visualization
+    # Calculate phi_new for visualization - angles are already in world coordinates
     for i in range(len(Waypoints)-1):
+        # phi_data is already transformed to world coordinates, so use directly
         phi_new[i] = phi_data[i] + Flagb[i]*np.pi/2
     
     # NEW: Save trajectory parameters for later use

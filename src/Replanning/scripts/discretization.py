@@ -5,6 +5,9 @@ import sys
 sys.path.append('/root/workspace/config')
 from config_loader import config
 
+# Import coordinate transformation utilities
+from coordinate_transform import convert_pixel_to_world_coordinates
+
 def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segments, Flagb, reeb_graph):
     """
     Discretize a single major segment (arc+line) independently using just the endpoints of each subsegment.
@@ -28,9 +31,9 @@ def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segment
     # Extract segment info
     i = segment_idx
     seg_times = time_segments[i]
-    # Convert from pixels to meters using config utility
+    # Convert from pixels to world coordinates using shared coordinate transformation
     pos_pixels = reeb_graph.nodes[waypoints[i]].configuration
-    pos = config.pixels_to_meters(pos_pixels)
+    pos = convert_pixel_to_world_coordinates(pos_pixels)
     angle = phi[i] + Flagb[i]*np.pi/2
     
     # Separate arc and line parts
@@ -99,9 +102,9 @@ def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segment
     # Make sure position matches the endpoint of the trajectory
     if i == len(waypoints) - 2 and l[i] < 1e-3 and not line_times:
         # Get the final waypoint position
-        # Convert from pixels to meters
+        # Convert from pixels to world coordinates using shared coordinate transformation
         final_pos_pixels = reeb_graph.nodes[waypoints[i+1]].configuration
-        final_pos = config.pixels_to_meters(final_pos_pixels)
+        final_pos = convert_pixel_to_world_coordinates(final_pos_pixels)
         
         # If the final position is not close enough to our last point, add it
         if len(x_discrete) > 0:
@@ -148,9 +151,23 @@ def visualize_segment_parts(waypoints, phi, r0, l, phi_new, time_segments, Flagb
     for i in range(N):
         # Get the segment info
         seg_times = time_segments[i]
-        # Convert from pixels to meters
+        # Convert from pixels to world coordinates with proper coordinate transformation
         start_pos_pixels = reeb_graph.nodes[waypoints[i]].configuration
-        start_pos = config.pixels_to_meters(start_pos_pixels)
+        
+        # Transform from camera pixel coordinates to world coordinates
+        img_height = 600  # Cropped image height (665-65=600)
+        pixel_x = start_pos_pixels[0]
+        pixel_y = start_pos_pixels[1]
+        
+        # World coordinates in pixels (relative to left-lower corner)
+        world_x_px = pixel_x  # X direction is the same
+        world_y_px = img_height - pixel_y  # Flip Y axis for world coordinates
+        
+        # Convert to world coordinates in meters
+        world_x = world_x_px * 0.0023  # Convert pixels to meters
+        world_y = world_y_px * 0.0023  # Convert pixels to meters
+        start_pos = [world_x, world_y]
+        
         angle = phi[i] + Flagb[i]*np.pi/2
         
         # Separate arc and line parts

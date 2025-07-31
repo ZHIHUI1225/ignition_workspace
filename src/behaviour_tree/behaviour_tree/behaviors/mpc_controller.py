@@ -22,7 +22,7 @@ class GeneralMPCController:
     to follow reference trajectories with cmd_vel publishing.
     """
     
-    def __init__(self, namespace="turtlebot0", case="simple_maze", controller_type="push"):
+    def __init__(self, namespace="robot0", case="simple_maze", controller_type="push"):
         self.namespace = namespace
         self.case = case
         self.controller_type = controller_type  # "push" or "pick"
@@ -406,7 +406,7 @@ class MPCControllerNode(Node):
     Can be used by behavior tree actions.
     """
     
-    def __init__(self, namespace="turtlebot0", case="simple_maze", controller_type="push"):
+    def __init__(self, namespace="robot0", case="simple_maze", controller_type="push"):
         super().__init__(f'mpc_controller_{controller_type}_{namespace}')
         
         self.namespace = namespace

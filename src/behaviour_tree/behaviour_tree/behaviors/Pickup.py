@@ -250,7 +250,7 @@ class MobileRobotMPC:
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name, robot_namespace="turtlebot0", timeout=100.0, estimated_time=55.0, dt=0.5, case="simple_maze"):
+    def __init__(self, name, robot_namespace="robot0", timeout=100.0, estimated_time=55.0, dt=0.5, case="simple_maze"):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
@@ -486,7 +486,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             try:
                 self.robot_namespace = self.node.get_parameter('robot_namespace').get_parameter_value().string_value
             except:
-                self.robot_namespace = "turtlebot0"
+                self.robot_namespace = "robot0"
             
             try:
                 self.case = self.node.get_parameter('case').get_parameter_value().string_value

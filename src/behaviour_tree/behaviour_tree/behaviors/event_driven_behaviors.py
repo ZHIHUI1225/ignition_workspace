@@ -23,13 +23,13 @@ class EventDrivenWaitForPush(WaitForPush):
     1. The distance between parcel and relay point changes relative to the threshold
        (crosses the threshold boundary in either direction)
     2. The pushing_finished status of the previous robot changes
-    3. For non-turtlebot0 robots: Last robot's position relative to relay point changes
+    3. For non-robot0 robots: Last robot's position relative to relay point changes
     
     Instead of checking on every behavior tree tick (2Hz polling),
     it only updates when these critical conditions change.
     """
     
-    def __init__(self, name, duration=60.0, robot_namespace="turtlebot0", 
+    def __init__(self, name, duration=60.0, robot_namespace="robot0", 
                  distance_threshold=0.14):
         # Initialize the parent class
         super().__init__(name, duration, robot_namespace, distance_threshold)
@@ -55,7 +55,7 @@ class EventDrivenWaitForPush(WaitForPush):
         
         # Cached condition checks to avoid recalculation when nothing changed
         self.cached_parcel_in_range = False
-        self.cached_last_robot_out = True  # Default to True for turtlebot0
+        self.cached_last_robot_out = True  # Default to True for robot0
         self.cached_previous_finished = True if self.is_first_robot else False
         
         # Track last check time for rate limiting
@@ -106,7 +106,7 @@ class EventDrivenWaitForPush(WaitForPush):
     def last_robot_pose_callback(self, msg):
         """Override callback to detect if last robot has moved far enough from parcel"""
         with self.state_lock:
-            # Skip if this is turtlebot0 (no previous robot)
+            # Skip if this is robot0 (no previous robot)
             if self.is_first_robot:
                 return
                 
@@ -257,11 +257,11 @@ class EventDrivenWaitForPush(WaitForPush):
             return py_trees.common.Status.RUNNING
         
         if self.is_first_robot:
-            # For first robot (turtlebot0), just check if parcel is within range of relay point
+            # For first robot (robot0), just check if parcel is within range of relay point
             if not self._check_parcel_position():
                 return py_trees.common.Status.RUNNING
         else:
-            # For non-turtlebot0 robots, only check these positions AFTER previous robot has finished pushing
+            # For non-robot0 robots, only check these positions AFTER previous robot has finished pushing
             # This avoids unnecessary calculations when waiting for previous robot
             
             # Check if last robot is far enough from parcel
@@ -349,7 +349,7 @@ class EventDrivenWaitForPush(WaitForPush):
     
     def check_last_robot_far_from_parcel(self):
         """Check if last robot is far enough from parcel"""
-        # For turtlebot0 (first robot), this condition is always satisfied
+        # For robot0 (first robot), this condition is always satisfied
         if self.is_first_robot:
             return True
         
@@ -446,7 +446,7 @@ class EventDrivenWaitForPush(WaitForPush):
         print(f"[{self.name}] 🔍 END DEBUG INFO\n")
     
 
-def create_event_driven_wait_for_push(name, duration=60.0, robot_namespace="turtlebot0", 
+def create_event_driven_wait_for_push(name, duration=60.0, robot_namespace="robot0", 
                                      distance_threshold=0.14):
     """
     Factory function to create an EventDrivenWaitForPush node.
@@ -454,7 +454,7 @@ def create_event_driven_wait_for_push(name, duration=60.0, robot_namespace="turt
     Args:
         name (str): Name of the behavior node
         duration (float): Maximum duration to wait before timing out
-        robot_namespace (str): Robot namespace (e.g., 'turtlebot0')
+        robot_namespace (str): Robot namespace (e.g., 'robot0')
         distance_threshold (float): Distance threshold for success condition
         
     Returns:

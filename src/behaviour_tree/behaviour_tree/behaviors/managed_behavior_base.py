@@ -22,7 +22,7 @@ class ManagedBehavior(py_trees.behaviour.Behaviour):
     - Non-blocking lock issues
     """
     
-    def __init__(self, name, robot_namespace="turtlebot0", **kwargs):
+    def __init__(self, name, robot_namespace="robot0", **kwargs):
         super().__init__(name)
         self.robot_namespace = robot_namespace
         self.node = None

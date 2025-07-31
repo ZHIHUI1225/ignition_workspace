@@ -20,6 +20,9 @@ import os
 import sys
 sys.path.append('/root/workspace/config')
 
+# Import coordinate transformation utilities
+from coordinate_transform import convert_pixel_to_world_coordinates
+
 try:
     from config_loader import config
     # Get robot physical parameters from config
@@ -170,11 +173,12 @@ def plot_trajectory_with_time(waypoints, phi, r0, l, phi_new, time_segments, fig
             Flagb = [0] * len(waypoints)
     
     for wp_idx in waypoints:
-        # Convert from pixels to meters using config utility
+        # Convert from pixels to world coordinates using shared coordinate transformation
         node_pos_pixels = reeb_graph.nodes[wp_idx].configuration
-        node_pos = config.pixels_to_meters(node_pos_pixels)  # Convert from pixels to m
-        wp_x.append(node_pos[0])
-        wp_y.append(node_pos[1])
+        world_pos = convert_pixel_to_world_coordinates(node_pos_pixels)
+        
+        wp_x.append(world_pos[0])
+        wp_y.append(world_pos[1])
     
     # Initialize variables for calculating cumulative time
     cumulative_time = 0.0

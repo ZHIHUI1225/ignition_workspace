@@ -11,25 +11,72 @@ robots:
   min_length: 0.1  # Minimum length for path segments in meters
 
 # Robot Physical Parameters
+# Based on official e-puck2 specifications from GCtronic documentation:
+# - Wheels: diameter = 41mm (radius = 20.5mm)
+# - Wheelbase: 53mm distance between wheels
+# - Motors: 2 stepper motors with 50:1 reduction gear, 20 steps/revolution
+# - Max speed: 1200 steps/s ≈ 15.4 cm/s (compared to e-puck1: 1000 steps/s ≈ 12.9 cm/s)
+# - Resolution: ~0.13mm per step
 robot_physical:
-  # Angular motion limits
-  angular_acceleration_max: 0.6283185307179587  # 0.2*pi rad/s² - maximum angular acceleration
-  angular_velocity_max: 1.5707963267948966     # 0.5*pi rad/s - maximum angular velocity
+  # ===== OFFICIAL HARDWARE LIMITATIONS (from e-puck2 documentation) =====
+  hardware_limits:
+    # Physical dimensions (fixed by hardware)
+    wheel_radius: 0.0205     # m - wheel diameter = 41mm, so radius = 20.5mm = 0.0205m
+    wheelbase: 0.053         # m - distance between wheels = 53mm = 0.053m
+    
+    # Motor specifications (fixed by hardware)
+    steps_per_revolution: 20
+    gear_reduction_ratio: 50
+    max_steps_per_second: 1200    # Maximum motor speed
+    
+    # Maximum theoretical speeds (calculated from motor specs)
+    # e-puck2: Max 1200 steps/s with 50:1 reduction = 24 steps/s at wheel
+    # 24 steps/s / 20 steps/rev = 1.2 rev/s → 0.1546 m/s linear speed
+    linear_velocity_max_hw: 0.1546    # m/s - absolute hardware maximum (15.5 cm/s)
+    angular_velocity_max_hw: 5.8327   # rad/s - absolute hardware maximum (334.2 deg/s)
+    
+    # Wheel acceleration calculations:
+    # Max wheel angular velocity: 1.2 rev/s × 2π = 7.54 rad/s
+    # Assuming 0.5s acceleration time: 7.54/0.5 = 15.08 rad/s²
+    # Linear acceleration = wheel_accel × wheel_radius = 15.08 × 0.0205 = 0.309 m/s²
+    wheel_angular_velocity_max: 7.5398   # rad/s - maximum wheel rotation speed
+    wheel_angular_acceleration_max: 15.08 # rad/s² - wheel acceleration (0.5s to max speed)
+    linear_acceleration_max_hw: 0.309    # m/s² - from wheel acceleration × radius
+    angular_acceleration_max_hw: 11.67   # rad/s² - robot angular acceleration (0.5s to max speed)
   
-  # Physical dimensions
-  wheel_radius: 0.033      # m - radius of the wheel
-  wheelbase: 0.14          # m - distance between wheels (l_r)
-  turning_radius_limit: 0.75  # m - maximum turning radius
-  
-  # Derived motion limits
-  linear_velocity_max: 0.0518362  # v_max = w_max * r_w (calculated: 1.5708 * 0.033)
-  linear_acceleration_max: 0.0207345  # a_max = aw_max * r_w (calculated: 0.6283 * 0.033)
-  
-  # Friction and safety parameters
-  friction_coefficient: 0.7    # μ - coefficient of friction (rubber on concrete)
-  safety_factor: 0.8          # μ_f - safety factor
-  gravity: 9.81               # g - gravitational acceleration (m/s²)
-  friction_limit: 5.4936      # μ * μ_f * g (calculated: 0.7 * 0.8 * 9.81)
+  # ===== USER-DEFINED OPERATIONAL LIMITATIONS (set by you for safety/control) =====
+  operational_limits:
+    # Wheel speed limits (your chosen operational values)
+    wheel_angular_velocity_max: 1.5708   # rad/s - your chosen limit (0.5π rad/s)
+    
+    # Speed limits (calculated from your wheel limit)
+    # Linear velocity = wheel_angular_velocity × wheel_radius = 1.5708 × 0.0205 = 0.0322 m/s (3.2 cm/s)
+    # Angular velocity = 2 × linear_velocity / wheelbase = 2 × 0.0322 / 0.053 = 1.215 rad/s (69.6°/s)
+    linear_velocity_max: 0.0322      # m/s - from wheel limit × radius (3.2 cm/s)
+    angular_velocity_max: 1.215      # rad/s - differential drive calculation (69.6°/s)
+    
+    # Acceleration limits (your chosen operational values)
+    # Angular acceleration set to 0.2π rad/s² = 0.6283 rad/s²
+    # Corresponding linear acceleration calculated from wheel dynamics
+    angular_acceleration_max: 0.6283    # rad/s² - your chosen limit (0.2π rad/s²)
+    
+    # Calculate linear acceleration from angular acceleration:
+    # For differential drive: α_linear = α_angular × wheelbase / 2
+    # Linear acceleration = 0.6283 × 0.053 / 2 = 0.0166 m/s²
+    linear_acceleration_max: 0.0166     # m/s² - calculated from angular acceleration
+    
+    # Calculate wheel angular acceleration:
+    # α_wheel = α_linear / wheel_radius = 0.0166 / 0.0205 = 0.81 rad/s²
+    wheel_angular_acceleration_max: 0.81 # rad/s² - calculated from linear acceleration
+    
+    # Geometric constraints (your safety margins)
+    turning_radius_limit: 0.75       # m - minimum turning radius you allow
+    
+    # Environmental parameters (your assumptions)
+    friction_coefficient: 0.7    # μ - coefficient of friction (rubber on concrete)
+    safety_factor: 0.8          # μ_f - safety factor
+    gravity: 9.81               # g - gravitational acceleration (m/s²)
+    friction_limit: 5.4936      # μ * μ_f * g (calculated: 0.7 * 0.8 * 9.81)
 
 # Coordinate System Conversion
 coordinate_conversion:
@@ -42,7 +89,7 @@ planning:
   deltal: 0.02              # Small segment length for discretization (m)
 
 # Arc Range Configuration
-arc_range: [50, 700]  # [min, max] range for arc calculations
+arc_range: [50, 700]  # [min, max] range for arc calculations pixel
 
 # Paths Configuration
 paths:

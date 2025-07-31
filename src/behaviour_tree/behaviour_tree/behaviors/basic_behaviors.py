@@ -37,10 +37,10 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     Wait behavior for pushing phase - waits for parcel to be near relay point.
     Success condition: 
     1. Parcel is within distance threshold of relay point AND
-    2. For non-turtlebot0 robots: last robot is OUT of relay point range
+    2. For non-robot0 robots: last robot is OUT of relay point range
     """
     
-    def __init__(self, name, duration=60.0, robot_namespace="turtlebot0", distance_threshold=0.14):
+    def __init__(self, name, duration=60.0, robot_namespace="robot0", distance_threshold=0.14):
         super().__init__(name)
         self.duration = duration
         self.start_time = 0
@@ -56,7 +56,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         # Determine last robot (previous robot in sequence)
         self.last_robot_number = self.namespace_number - 1 if self.namespace_number > 0 else None
-        self.is_first_robot = (self.robot_namespace == "turtlebot0")
+        self.is_first_robot = (self.robot_namespace == "robot0")
         
         # ROS2 components (will be initialized in setup)
         self.node = None
@@ -90,7 +90,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.pushing_estimated_time = 45.0
         
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
         import re
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
@@ -99,7 +99,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         """Get the namespace of the previous robot in sequence"""
         current_number = self.extract_namespace_number(current_namespace)
         if current_number <= 0:
-            return None  # turtlebot0 has no previous robot
+            return None  # robot0 has no previous robot
         previous_number = current_number - 1
         return f"turtlebot{previous_number}"
 
@@ -107,7 +107,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         """Check if the previous robot has finished pushing via ROS topic"""
         previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
         
-        # For turtlebot0, default to True (no previous robot)
+        # For robot0, default to True (no previous robot)
         if previous_robot_namespace is None:
             # Avoid excessive logging
             return True
@@ -217,7 +217,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             callback_group=self.callback_group
         )
         
-        # Last robot pose subscription (only for non-turtlebot0 robots) - 使用专属线程池处理
+        # Last robot pose subscription (only for non-robot0 robots) - 使用专属线程池处理
         self.last_robot_pose_sub = None
         if not self.is_first_robot and self.last_robot_number is not None:
             self.last_robot_pose_sub = self.node.create_subscription(
@@ -340,7 +340,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     
     def check_last_robot_out_of_relay_range(self):
         """Check if last robot is OUT of relay point range"""
-        # For turtlebot0 (first robot), this condition is always satisfied
+        # For robot0 (first robot), this condition is always satisfied
         if self.is_first_robot:
             return True
         
@@ -410,7 +410,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             self.feedback_message = f"[{self.robot_namespace}] Waiting for {previous_robot_namespace} to finish pushing..."
             return py_trees.common.Status.RUNNING
         
-        # For non-turtlebot0 robots, also check if last robot is out of relay range
+        # For non-robot0 robots, also check if last robot is out of relay range
         if not self.is_first_robot:
             last_robot_out = self.check_last_robot_out_of_relay_range()
             
@@ -423,7 +423,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
                 self.feedback_message = f"[{self.robot_namespace}] Waiting for tb{self.last_robot_number} to move out of relay range..."
                 return py_trees.common.Status.RUNNING
         
-        # Both conditions met (previous robot finished AND last robot out of range for non-turtlebot0)
+        # Both conditions met (previous robot finished AND last robot out of range for non-robot0)
         print(f"[{self.name}] DEBUG: All conditions satisfied, returning SUCCESS")
         print(f"[{self.name}] SUCCESS: Ready to proceed with pushing!")
         return py_trees.common.Status.SUCCESS
@@ -539,11 +539,11 @@ class WaitForPick(py_trees.behaviour.Behaviour):
     """
     Wait behavior for picking phase using inotify for file system monitoring.
     Success condition: 
-    - For turtlebot0 (first robot): Always succeed immediately
-    - For non-turtlebot0 robots: Success only if replanned trajectory file exists from last robot
+    - For robot0 (first robot): Always succeed immediately
+    - For non-robot0 robots: Success only if replanned trajectory file exists from last robot
     """
     
-    def __init__(self, name, duration=2.0, robot_namespace="turtlebot0"):
+    def __init__(self, name, duration=2.0, robot_namespace="robot0"):
         super().__init__(name)
         self.duration = duration
         self.start_time = 0
@@ -576,7 +576,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         return self._file_exists
     
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
@@ -701,7 +701,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] Starting PICK wait for {self.duration}s...")
         
         if self.is_first_robot:
-            print(f"[{self.name}] turtlebot0: Always ready for PICK")
+            print(f"[{self.name}] robot0: Always ready for PICK")
         else:
             # Set up the file watcher using inotify
             if not self.setup_file_watcher():
@@ -718,7 +718,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         # Check success conditions - file existence flag is updated by inotify events in background
         if self.check_success_conditions():
             if self.is_first_robot:
-                print(f"[{self.name}] SUCCESS: turtlebot0 ready for PICK!")
+                print(f"[{self.name}] SUCCESS: robot0 ready for PICK!")
             else:
                 print(f"[{self.name}] SUCCESS: Replanned file found from tb{self.last_robot_number}, ready for PICK!")
             return py_trees.common.Status.SUCCESS
@@ -745,8 +745,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         # Timeout condition - FAILURE if conditions not met
         if elapsed >= self.duration:
             if self.is_first_robot:
-                # This should never happen for turtlebot0, but just in case
-                print(f"[{self.name}] WARNING: turtlebot0 timeout (should not happen)")
+                # This should never happen for robot0, but just in case
+                print(f"[{self.name}] WARNING: robot0 timeout (should not happen)")
                 return py_trees.common.Status.SUCCESS
             else:
                 from .tree_builder import report_node_failure
@@ -758,7 +758,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         # Status update every second
         if elapsed % 1.0 < 0.1:  # Print every second
             if self.is_first_robot:
-                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | turtlebot0 ready")
+                print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | robot0 ready")
             else:
                 print(f"[{self.name}] PICK wait... {elapsed:.1f}/{self.duration}s | Replanned file exists: {self.replanned_file_exists}")
         
@@ -799,7 +799,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
 class WaitAction(py_trees.behaviour.Behaviour):
     """Wait action behavior - improved version with pose monitoring and proximity checking"""
     
-    def __init__(self, name, duration, robot_namespace="turtlebot0", distance_threshold=0.08):
+    def __init__(self, name, duration, robot_namespace="robot0", distance_threshold=0.08):
         super().__init__(name)
         self.duration = duration
         self.start_time = 0
@@ -848,7 +848,7 @@ class WaitAction(py_trees.behaviour.Behaviour):
         # Parcel subscription will be created in initialise() when behavior starts
         
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
@@ -1063,7 +1063,7 @@ class StopSystem(py_trees.behaviour.Behaviour):
 class CheckPairComplete(py_trees.behaviour.Behaviour):
     """Check if a pair operation is complete behavior - both robot and parcel out of relay range"""
     
-    def __init__(self, name, robot_namespace="turtlebot0", distance_threshold=0.25):
+    def __init__(self, name, robot_namespace="robot0", distance_threshold=0.25):
         super().__init__(name)
         self.robot_namespace = robot_namespace
         self.distance_threshold = distance_threshold
@@ -1095,7 +1095,7 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         )
     
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
@@ -1297,9 +1297,9 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
 
 
 class IncrementIndex(py_trees.behaviour.Behaviour):
-    """Increment index behavior - increments the current parcel index and spawns new parcel via service for turtlebot0"""
+    """Increment index behavior - increments the current parcel index and spawns new parcel via service for robot0"""
     
-    def __init__(self, name, robot_namespace="turtlebot0"):
+    def __init__(self, name, robot_namespace="robot0"):
         super().__init__(name)
         self.robot_namespace = robot_namespace
         
@@ -1313,8 +1313,8 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
         # ROS2 topic for pushing coordination instead of blackboard
         self.pushing_finished_pub = None
         
-        # ROS setup for service client (only for turtlebot0)
-        self.is_first_robot = (robot_namespace == "turtlebot0")
+        # ROS setup for service client (only for robot0)
+        self.is_first_robot = (robot_namespace == "robot0")
         self.node = None
         self.spawn_service_client = None
         
@@ -1341,7 +1341,7 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
                 Bool, f'/{self.robot_namespace}/pushing_finished', 10)
             print(f"[{self.name}] DEBUG: Created pushing_finished topic publisher")
             
-            # Only setup service client for turtlebot0
+            # Only setup service client for robot0
             if self.is_first_robot:
                 # Create service client for spawning parcels
                 self.spawn_service_client = self.node.create_client(
@@ -1433,7 +1433,7 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             current_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
             new_index = current_index + 1
             
-            # For turtlebot0, check if we need to spawn a new parcel
+            # For robot0, check if we need to spawn a new parcel
             if self.is_first_robot:
                 if self._should_spawn_new_parcel(new_index):
                     spawn_success = self._spawn_new_parcel(new_index)

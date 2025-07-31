@@ -5,6 +5,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 class CameraNode(Node):
@@ -17,14 +18,14 @@ class CameraNode(Node):
         
         # Create publishers for ArUco marker poses
         # Robot publishers (IDs 0, 1, 2)
-        self.robot0_publisher = self.create_publisher(PoseStamped, '/robot0/pose', 10)
-        self.robot1_publisher = self.create_publisher(PoseStamped, '/robot1/pose', 10)
-        self.robot2_publisher = self.create_publisher(PoseStamped, '/robot2/pose', 10)
+        self.robot0_publisher = self.create_publisher(Odometry, '/robot0/odom', 10)
+        self.robot1_publisher = self.create_publisher(Odometry, '/robot1/odom', 10)
+        self.robot2_publisher = self.create_publisher(Odometry, '/robot2/odom', 10)
         
         # Parcel publishers (IDs 5, 6, 7)
-        self.parcel0_publisher = self.create_publisher(PoseStamped, '/parcel0/pose', 10)
-        self.parcel1_publisher = self.create_publisher(PoseStamped, '/parcel1/pose', 10)
-        self.parcel2_publisher = self.create_publisher(PoseStamped, '/parcel2/pose', 10)
+        self.parcel0_publisher = self.create_publisher(Odometry, '/parcel0/odom', 10)
+        self.parcel1_publisher = self.create_publisher(Odometry, '/parcel1/odom', 10)
+        self.parcel2_publisher = self.create_publisher(Odometry, '/parcel2/odom', 10)
         
         # Camera setup
         self.cap = cv2.VideoCapture('/dev/video0')
@@ -94,8 +95,8 @@ class CameraNode(Node):
         self.detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
         
         # 定义不同大小的ArUco标记的3D坐标（单位：米）
-        # Robot markers (IDs 0, 1, 2): 3.6cm × 3.6cm
-        robot_marker_size = 0.036  # 3.6cm
+        # Robot markers (IDs 0, 1, 2): 5cm × 5cm
+        robot_marker_size = 0.05 # 5cm
         robot_half_size = robot_marker_size / 2
         self.robot_marker_points_3d = np.array([
             [-robot_half_size, robot_half_size, 0],   # 左上角
@@ -161,7 +162,7 @@ class CameraNode(Node):
         self.get_logger().info("=== End Configuration ===")
 
     def create_pose_message(self, rvec, tvec, frame_id="camera_frame"):
-        """Convert rotation and translation vectors to PoseStamped message with validation"""
+        """Convert rotation and translation vectors to Odometry message with validation"""
         try:
             # Input validation
             if rvec is None or tvec is None:
@@ -187,14 +188,53 @@ class CameraNode(Node):
                 self.get_logger().warn(f"Invalid translation magnitude: {translation_magnitude:.3f}m")
                 return None
                 
-            pose_msg = PoseStamped()
-            pose_msg.header.stamp = self.get_clock().now().to_msg()
-            pose_msg.header.frame_id = frame_id
+            odom_msg = Odometry()
+            odom_msg.header.stamp = self.get_clock().now().to_msg()
+            odom_msg.header.frame_id = "world"  # Use world frame instead of camera frame
+            odom_msg.child_frame_id = "base_link"
             
-            # Set position (translation vector is already in meters)
-            pose_msg.pose.position.x = float(tvec[0][0])
-            pose_msg.pose.position.y = float(tvec[1][0])
-            pose_msg.pose.position.z = float(tvec[2][0])
+            # Transform from camera coordinates to world coordinates
+            # Camera coordinate system: Origin at left-upper corner, X-right, Y-down (pixels)
+            # World coordinate system: Origin at left-lower corner, X-right, Y-up (meters)
+            # Conversion factor: pixels to meters = multiply by 0.0023
+            
+            # Get camera pose in meters (solvePnP returns in meters based on marker size)
+            camera_x_m = float(tvec[0][0])  # Camera X in meters (right from camera center)
+            camera_y_m = float(tvec[1][0])  # Camera Y in meters (down from camera center) 
+            camera_z_m = float(tvec[2][0])  # Camera Z in meters (distance from camera)
+            
+            # Convert camera pose to pixel coordinates first
+            # Since camera is overhead, we need to project the 3D position to 2D pixel coordinates
+            # This is a simplified projection assuming camera is directly above
+            camera_x_px = camera_x_m / 0.0023  # Convert meters to pixels
+            camera_y_px = camera_y_m / 0.0023  # Convert meters to pixels
+            
+            # Get image dimensions for coordinate transformation
+            img_height = 600  # Cropped image height (665-65=600)
+            img_width = 1100   # Cropped image width (1150-50=1100)
+            
+            # Transform from camera pixel coordinates to world coordinates
+            # Camera origin: left-upper corner, World origin: left-lower corner
+            # Camera X-right → World X-right (same direction)
+            # Camera Y-down → World Y-up (flip and offset)
+            
+            # Add image center offset since camera pose is relative to camera center
+            center_x_px = img_width / 2
+            center_y_px = img_height / 2
+            
+            # World coordinates in pixels (relative to left-lower corner)
+            world_x_px = center_x_px + camera_x_px  # Add camera center offset
+            world_y_px = img_height - (center_y_px + camera_y_px)  # Flip Y axis and add offset
+            
+            # Convert to world coordinates in meters
+            world_x = world_x_px * 0.0023  # Convert pixels to meters
+            world_y = world_y_px * 0.0023  # Convert pixels to meters
+            world_z = 0.0  # Robots are on the ground plane
+            
+            # Set transformed position
+            odom_msg.pose.pose.position.x = world_x
+            odom_msg.pose.pose.position.y = world_y
+            odom_msg.pose.pose.position.z = world_z
             
             # Convert rotation vector to rotation matrix, then to quaternion
             try:
@@ -209,55 +249,48 @@ class CameraNode(Node):
                 self.get_logger().warn(f"Invalid rotation matrix determinant: {det}")
                 return None
             
-            # Convert rotation matrix to quaternion using cv2
-            # Calculate quaternion from rotation matrix
-            trace = rotation_matrix[0,0] + rotation_matrix[1,1] + rotation_matrix[2,2]
+            # Transform rotation from camera frame to world frame
+            # Camera frame: X-right, Y-down, Z-forward
+            # World frame: X-right, Y-forward, Z-up
+            # For overhead camera looking down: need to transform the rotation
             
-            if trace > 0:
-                s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
-                qw = 0.25 * s
-                qx = (rotation_matrix[2,1] - rotation_matrix[1,2]) / s
-                qy = (rotation_matrix[0,2] - rotation_matrix[2,0]) / s
-                qz = (rotation_matrix[1,0] - rotation_matrix[0,1]) / s
-            else:
-                if rotation_matrix[0,0] > rotation_matrix[1,1] and rotation_matrix[0,0] > rotation_matrix[2,2]:
-                    s = np.sqrt(1.0 + rotation_matrix[0,0] - rotation_matrix[1,1] - rotation_matrix[2,2]) * 2
-                    qw = (rotation_matrix[2,1] - rotation_matrix[1,2]) / s
-                    qx = 0.25 * s
-                    qy = (rotation_matrix[0,1] + rotation_matrix[1,0]) / s
-                    qz = (rotation_matrix[0,2] + rotation_matrix[2,0]) / s
-                elif rotation_matrix[1,1] > rotation_matrix[2,2]:
-                    s = np.sqrt(1.0 + rotation_matrix[1,1] - rotation_matrix[0,0] - rotation_matrix[2,2]) * 2
-                    qw = (rotation_matrix[0,2] - rotation_matrix[2,0]) / s
-                    qx = (rotation_matrix[0,1] + rotation_matrix[1,0]) / s
-                    qy = 0.25 * s
-                    qz = (rotation_matrix[1,2] + rotation_matrix[2,1]) / s
-                else:
-                    s = np.sqrt(1.0 + rotation_matrix[2,2] - rotation_matrix[0,0] - rotation_matrix[1,1]) * 2
-                    qw = (rotation_matrix[1,0] - rotation_matrix[0,1]) / s
-                    qx = (rotation_matrix[0,2] + rotation_matrix[2,0]) / s
-                    qy = (rotation_matrix[1,2] + rotation_matrix[2,1]) / s
-                    qz = 0.25 * s
+            # Create transformation matrix from camera frame to world frame
+            # Rotation around X-axis by 180 degrees to flip Y and Z axes
+            camera_to_world_rot = np.array([
+                [1,  0,  0],
+                [0, -1,  0],  # Flip Y axis
+                [0,  0, -1]   # Flip Z axis
+            ], dtype=np.float32)
             
-            # Validate quaternion
-            quat_magnitude = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
-            if abs(quat_magnitude - 1.0) > 0.1:
-                self.get_logger().warn(f"Invalid quaternion magnitude: {quat_magnitude}")
-                return None
+            # Transform the marker's rotation matrix to world coordinates
+            world_rotation_matrix = camera_to_world_rot @ rotation_matrix
             
-            # Normalize quaternion
-            qx /= quat_magnitude
-            qy /= quat_magnitude
-            qz /= quat_magnitude
-            qw /= quat_magnitude
+            # Extract only the Z-axis rotation (yaw) for ground robots
+            # This assumes robots move in 2D plane with only yaw rotation
+            # Extract yaw angle from rotation matrix
+            yaw = np.arctan2(world_rotation_matrix[1, 0], world_rotation_matrix[0, 0])
+            
+            # Create quaternion for pure Z-axis rotation (yaw only)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(yaw / 2.0)
+            qw = np.cos(yaw / 2.0)
             
             # Set orientation (quaternion)
-            pose_msg.pose.orientation.x = float(qx)
-            pose_msg.pose.orientation.y = float(qy)
-            pose_msg.pose.orientation.z = float(qz)
-            pose_msg.pose.orientation.w = float(qw)
+            odom_msg.pose.pose.orientation.x = float(qx)
+            odom_msg.pose.pose.orientation.y = float(qy)
+            odom_msg.pose.pose.orientation.z = float(qz)
+            odom_msg.pose.pose.orientation.w = float(qw)
             
-            return pose_msg
+            # Set twist (velocities) to zero since we don't have velocity information from ArUco
+            odom_msg.twist.twist.linear.x = 0.0
+            odom_msg.twist.twist.linear.y = 0.0
+            odom_msg.twist.twist.linear.z = 0.0
+            odom_msg.twist.twist.angular.x = 0.0
+            odom_msg.twist.twist.angular.y = 0.0
+            odom_msg.twist.twist.angular.z = 0.0
+            
+            return odom_msg
             
         except Exception as e:
             self.get_logger().error(f"Unexpected error in create_pose_message: {e}")
@@ -423,9 +456,9 @@ class CameraNode(Node):
             smoothed_rvec, smoothed_tvec = self.smooth_pose(marker_id, rvec, tvec)
             
             # Create pose message with validation
-            pose_msg = self.create_pose_message(smoothed_rvec, smoothed_tvec)
+            odom_msg = self.create_pose_message(smoothed_rvec, smoothed_tvec)
             
-            if pose_msg is None:
+            if odom_msg is None:
                 # Failed to create valid pose message
                 self.pose_publish_failures[marker_id] = self.pose_publish_failures.get(marker_id, 0) + 1
                 if self.pose_publish_failures[marker_id] <= self.max_publish_failures:
@@ -439,22 +472,22 @@ class CameraNode(Node):
             success = False
             try:
                 if marker_id == 0:
-                    self.robot0_publisher.publish(pose_msg)
+                    self.robot0_publisher.publish(odom_msg)
                     success = True
                 elif marker_id == 1:
-                    self.robot1_publisher.publish(pose_msg)
+                    self.robot1_publisher.publish(odom_msg)
                     success = True
                 elif marker_id == 2:
-                    self.robot2_publisher.publish(pose_msg)
+                    self.robot2_publisher.publish(odom_msg)
                     success = True
                 elif marker_id == 5:
-                    self.parcel0_publisher.publish(pose_msg)
+                    self.parcel0_publisher.publish(odom_msg)
                     success = True
                 elif marker_id == 6:
-                    self.parcel1_publisher.publish(pose_msg)
+                    self.parcel1_publisher.publish(odom_msg)
                     success = True
                 elif marker_id == 7:
-                    self.parcel2_publisher.publish(pose_msg)
+                    self.parcel2_publisher.publish(odom_msg)
                     success = True
                 else:
                     self.get_logger().warn(f"Unknown marker ID for pose publishing: {marker_id}")

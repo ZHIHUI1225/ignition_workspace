@@ -7,6 +7,9 @@ import sys
 sys.path.append('/root/workspace/config')
 from config_loader import config
 
+# Import coordinate transformation utilities
+from coordinate_transform import convert_pixel_to_world_coordinates
+
 def save_trajectory_parameters(waypoints, phi, r0, l, phi_new, time_segments, Flagb, 
                              reeb_graph=None, save_file_path=None, case=None, N=None):
     """
@@ -31,7 +34,13 @@ def save_trajectory_parameters(waypoints, phi, r0, l, phi_new, time_segments, Fl
     # Get waypoint positions from reeb_graph if available
     waypoint_positions = None
     if reeb_graph is not None:
-        waypoint_positions = [reeb_graph.nodes[waypoints[i]].configuration.tolist() for i in range(len(waypoints))]
+        # Convert pixel coordinates to world coordinates using shared coordinate transformation
+        waypoint_positions = []
+        
+        for i in range(len(waypoints)):
+            pixel_pos = reeb_graph.nodes[waypoints[i]].configuration
+            world_pos = convert_pixel_to_world_coordinates(pixel_pos)
+            waypoint_positions.append(world_pos.tolist())
     
     # If case is specified, use it for file naming and directory structure
     if save_file_path is None and case is not None:

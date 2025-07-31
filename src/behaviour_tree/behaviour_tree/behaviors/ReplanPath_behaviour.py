@@ -20,7 +20,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
     and uses the optimization functions to replan the robot's trajectory accordingly.
     """
     
-    def __init__(self, name, duration=20.0, robot_namespace="turtlebot0", case="simple_maze", dt=0.5):
+    def __init__(self, name, duration=20.0, robot_namespace="robot0", case="simple_maze", dt=0.5):
         """
         Initialize the ReplanPath behavior.
         
@@ -61,9 +61,9 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         
         # Get target time from previous robot's pushing_estimated_time via ROS topic
         if self.namespace_number == 0:
-            # turtlebot0 uses default 45s
+            # robot0 uses default 45s
             raw_target_time = 45.0
-            print(f"[{self.name}] Using default target time for turtlebot0: {raw_target_time:.2f}s")
+            print(f"[{self.name}] Using default target time for robot0: {raw_target_time:.2f}s")
         else:
             # turtlebotN gets pushing_estimated_time from turtlebot(N-1) via ROS topic
             raw_target_time = self.previous_robot_pushing_estimated_time-7# 7 seconds earlier than previous robot's estimate
@@ -271,7 +271,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                 )
                 # print(f"[{self.name}] DEBUG: Subscribed to {self.previous_robot_namespace}/pushing_estimated_time topic")
             else:
-                print(f"[{self.name}] DEBUG: No previous robot (this is turtlebot0)")
+                print(f"[{self.name}] DEBUG: No previous robot (this is robot0)")
             
             return True
             
