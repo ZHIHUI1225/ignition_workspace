@@ -3,10 +3,12 @@
 Coordinate Transformation Utilities
 
 This module provides coordinate transformation functions for converting between
-camera pixel coordinates and world meter coordinates.
+three coordinate frames:
 
-Camera coordinate system: Origin at left-upper corner, X-right, Y-down (pixels)
-World coordinate system: Origin at left-lower corner, X-right, Y-up (meters)
+1. Camera Pixel Frame: Origin at left-upper corner, X-right, Y-down (pixels)
+2. World Pixel Frame: Origin at left-lower corner, X-right, Y-up (pixels)  
+3. World Frame: Origin at left-lower corner, X-right, Y-up (meters)
+
 Conversion factor: 0.0023 (pixels to meters)
 Image dimensions: 600x1100 (cropped from 665-65=600 height, 1150-50=1100 width)
 """
@@ -17,6 +19,160 @@ import numpy as np
 IMG_HEIGHT = 600  # Cropped image height (665-65=600)
 IMG_WIDTH = 1100   # Cropped image width (1150-50=1100)
 PIXEL_TO_METER_SCALE = 0.0023  # Conversion factor from pixels to meters
+
+def convert_camera_pixel_to_world_pixel(camera_pixel_pos):
+    """
+    Convert from camera pixel frame to world pixel frame.
+    
+    Camera Pixel Frame: Origin at left-upper corner, X-right, Y-down (pixels)
+    World Pixel Frame: Origin at left-lower corner, X-right, Y-up (pixels)
+    
+    Args:
+        camera_pixel_pos: [x, y] position in camera pixel coordinates
+    
+    Returns:
+        numpy array: [x, y] position in world pixel coordinates
+    """
+    if isinstance(camera_pixel_pos, (list, tuple)) and len(camera_pixel_pos) >= 2:
+        camera_x = camera_pixel_pos[0]
+        camera_y = camera_pixel_pos[1]
+    elif isinstance(camera_pixel_pos, np.ndarray) and camera_pixel_pos.size >= 2:
+        camera_x = camera_pixel_pos[0]
+        camera_y = camera_pixel_pos[1]
+    else:
+        # Handle malformed position data
+        return np.array([0.0, 0.0])
+    
+    # Transform from camera pixel coordinates to world pixel coordinates
+    # Camera origin: left-upper corner, World pixel origin: left-lower corner
+    # Camera X-right → World X-right (same direction)
+    # Camera Y-down → World Y-up (flip and offset)
+    
+    world_pixel_x = camera_x  # X direction is the same
+    world_pixel_y = IMG_HEIGHT - camera_y  # Flip Y axis for world pixel coordinates
+    
+    return np.array([world_pixel_x, world_pixel_y])
+
+def convert_world_pixel_to_camera_pixel(world_pixel_pos):
+    """
+    Convert from world pixel frame to camera pixel frame.
+    
+    World Pixel Frame: Origin at left-lower corner, X-right, Y-up (pixels)
+    Camera Pixel Frame: Origin at left-upper corner, X-right, Y-down (pixels)
+    
+    Args:
+        world_pixel_pos: [x, y] position in world pixel coordinates
+    
+    Returns:
+        numpy array: [x, y] position in camera pixel coordinates
+    """
+    if isinstance(world_pixel_pos, (list, tuple)) and len(world_pixel_pos) >= 2:
+        world_pixel_x = world_pixel_pos[0]
+        world_pixel_y = world_pixel_pos[1]
+    elif isinstance(world_pixel_pos, np.ndarray) and world_pixel_pos.size >= 2:
+        world_pixel_x = world_pixel_pos[0]
+        world_pixel_y = world_pixel_pos[1]
+    else:
+        # Handle malformed position data
+        return np.array([0.0, 0.0])
+    
+    # Transform from world pixel coordinates to camera pixel coordinates
+    # World pixel origin: left-lower corner, Camera origin: left-upper corner
+    # World X-right → Camera X-right (same direction)
+    # World Y-up → Camera Y-down (flip and offset)
+    
+    camera_x = world_pixel_x  # X direction is the same
+    camera_y = IMG_HEIGHT - world_pixel_y  # Flip Y axis back to camera coordinates
+    
+    return np.array([camera_x, camera_y])
+
+def convert_world_pixel_to_world_meter(world_pixel_pos):
+    """
+    Convert from world pixel frame to world meter frame.
+    
+    World Pixel Frame: Origin at left-lower corner, X-right, Y-up (pixels)
+    World Frame: Origin at left-lower corner, X-right, Y-up (meters)
+    
+    Args:
+        world_pixel_pos: [x, y] position in world pixel coordinates
+    
+    Returns:
+        numpy array: [x, y] position in world meter coordinates
+    """
+    if isinstance(world_pixel_pos, (list, tuple)) and len(world_pixel_pos) >= 2:
+        world_pixel_x = world_pixel_pos[0]
+        world_pixel_y = world_pixel_pos[1]
+    elif isinstance(world_pixel_pos, np.ndarray) and world_pixel_pos.size >= 2:
+        world_pixel_x = world_pixel_pos[0]
+        world_pixel_y = world_pixel_pos[1]
+    else:
+        # Handle malformed position data
+        return np.array([0.0, 0.0])
+    
+    # Convert from pixels to meters (same coordinate frame, just different units)
+    world_meter_x = world_pixel_x * PIXEL_TO_METER_SCALE
+    world_meter_y = world_pixel_y * PIXEL_TO_METER_SCALE
+    
+    return np.array([world_meter_x, world_meter_y])
+
+def convert_world_meter_to_world_pixel(world_meter_pos):
+    """
+    Convert from world meter frame to world pixel frame.
+    
+    World Frame: Origin at left-lower corner, X-right, Y-up (meters)
+    World Pixel Frame: Origin at left-lower corner, X-right, Y-up (pixels)
+    
+    Args:
+        world_meter_pos: [x, y] position in world meter coordinates
+    
+    Returns:
+        numpy array: [x, y] position in world pixel coordinates
+    """
+    if isinstance(world_meter_pos, (list, tuple)) and len(world_meter_pos) >= 2:
+        world_meter_x = world_meter_pos[0]
+        world_meter_y = world_meter_pos[1]
+    elif isinstance(world_meter_pos, np.ndarray) and world_meter_pos.size >= 2:
+        world_meter_x = world_meter_pos[0]
+        world_meter_y = world_meter_pos[1]
+    else:
+        # Handle malformed position data
+        return np.array([0.0, 0.0])
+    
+    # Convert from meters to pixels (same coordinate frame, just different units)
+    world_pixel_x = world_meter_x / PIXEL_TO_METER_SCALE
+    world_pixel_y = world_meter_y / PIXEL_TO_METER_SCALE
+    
+    return np.array([world_pixel_x, world_pixel_y])
+
+def convert_camera_pixel_to_world_meter(camera_pixel_pos):
+    """
+    Convert directly from camera pixel frame to world meter frame.
+    
+    Args:
+        camera_pixel_pos: [x, y] position in camera pixel coordinates
+    
+    Returns:
+        numpy array: [x, y] position in world meter coordinates
+    """
+    # First convert to world pixel frame
+    world_pixel_pos = convert_camera_pixel_to_world_pixel(camera_pixel_pos)
+    # Then convert to world meter frame
+    return convert_world_pixel_to_world_meter(world_pixel_pos)
+
+def convert_world_meter_to_camera_pixel(world_meter_pos):
+    """
+    Convert directly from world meter frame to camera pixel frame.
+    
+    Args:
+        world_meter_pos: [x, y] position in world meter coordinates
+    
+    Returns:
+        numpy array: [x, y] position in camera pixel coordinates
+    """
+    # First convert to world pixel frame
+    world_pixel_pos = convert_world_meter_to_world_pixel(world_meter_pos)
+    # Then convert to camera pixel frame
+    return convert_world_pixel_to_camera_pixel(world_pixel_pos)
 
 def convert_pixel_to_world_coordinates(pixel_pos):
     """
@@ -161,6 +317,41 @@ def convert_world_to_pixel_coordinates(world_pos):
     
     return np.array([pixel_x, pixel_y])
 
+def convert_world_pixel_data_to_meters(phi, l, r):
+    """
+    Convert planning data from world-pixel frame to world-meter frame.
+    Only performs unit conversion (pixels to meters) for lengths and radii.
+    Angles remain unchanged since they are dimensionless.
+    
+    Args:
+        phi: Angular data in world frame (radians) - unchanged
+        l: Length data in pixels (converted to meters)
+        r: Radius data in pixels (converted to meters)
+    
+    Returns:
+        Tuple (phi, l_meters, r_meters) with lengths and radii converted to meters
+    """
+    # Angles remain completely unchanged - no coordinate transformation needed
+    phi_unchanged = phi
+    
+    # Convert lengths from pixels to meters
+    if isinstance(l, (list, tuple)):
+        l_meters = [length * PIXEL_TO_METER_SCALE for length in l]
+    elif isinstance(l, np.ndarray):
+        l_meters = l * PIXEL_TO_METER_SCALE
+    else:
+        l_meters = l * PIXEL_TO_METER_SCALE
+    
+    # Convert radii from pixels to meters
+    if isinstance(r, (list, tuple)):
+        r_meters = [radius * PIXEL_TO_METER_SCALE for radius in r]
+    elif isinstance(r, np.ndarray):
+        r_meters = r * PIXEL_TO_METER_SCALE
+    else:
+        r_meters = r * PIXEL_TO_METER_SCALE
+    
+    return phi_unchanged, l_meters, r_meters
+
 def convert_pixel_data_to_meters(phi, l, r):
     """
     Convert planning data from pixels to meters where needed and transform angles to world frame.
@@ -223,3 +414,64 @@ def convert_pixel_positions_to_world_meters_legacy(pixel_positions):
     Use convert_pixel_positions_to_world_meters instead.
     """
     return convert_pixel_positions_to_world_meters(pixel_positions)
+
+def convert_pixel_data_to_meters_dict(data):
+    """
+    Convert a data structure containing pixel coordinates and angles to world coordinates.
+    
+    Args:
+        data: Dictionary or list containing position and orientation data in camera pixel frame
+    
+    Returns:
+        Converted data structure with positions in world meter coordinates and angles in world frame
+    """
+    if isinstance(data, dict):
+        converted_data = {}
+        for key, value in data.items():
+            if key in ['position', 'pos', 'center', 'waypoint']:
+                # Convert position from camera pixel to world meter
+                converted_data[key] = convert_camera_pixel_to_world_meter(value)
+            elif key in ['angle', 'orientation', 'phi', 'theta', 'yaw']:
+                # Convert angle from camera frame to world frame
+                if isinstance(value, (list, tuple, np.ndarray)):
+                    converted_data[key] = [convert_camera_angle_to_world_angle(angle) for angle in value]
+                else:
+                    converted_data[key] = convert_camera_angle_to_world_angle(value)
+            elif isinstance(value, (list, tuple)):
+                # Recursively convert list/tuple elements
+                converted_data[key] = [convert_pixel_data_to_meters_dict(item) if isinstance(item, dict) else item for item in value]
+            elif isinstance(value, dict):
+                # Recursively convert nested dictionaries
+                converted_data[key] = convert_pixel_data_to_meters_dict(value)
+            else:
+                # Keep other data unchanged
+                converted_data[key] = value
+        return converted_data
+    elif isinstance(data, (list, tuple)):
+        # Convert list/tuple of items
+        return [convert_pixel_data_to_meters_dict(item) if isinstance(item, dict) else item for item in data]
+    else:
+        # Return unchanged if not a dict or list
+        return data
+
+def get_frame_info():
+    """
+    Get information about the coordinate frames used in the system.
+    
+    Returns:
+        dict: Information about the three coordinate frames
+    """
+    return {
+        "camera_pixel_frame": {
+            "name": "Camera Pixel Frame",
+            "units": "pixels"
+        },
+        "world_pixel_frame": {
+            "name": "World Pixel Frame", 
+            "units": "pixels"
+        },
+        "world_frame": {
+            "name": "World Frame",
+            "units": "meters"
+        }
+    }

@@ -20,11 +20,7 @@ def generate_launch_description():
         name='epuck_driver_robot0',
         namespace='robot0',
         output='screen',
-        parameters=[os.path.join(pkg_dir, 'config', 'robot0_ns.yaml')],
-        remappings=[
-            ('cmd_vel', '/robot0/cmd_vel'),
-            ('odom', '/robot0/odom'),
-        ]
+        parameters=[os.path.join(pkg_dir, 'config', 'robot0_ns.yaml')]
     )
     
     # Robot 1 - Backward movement  
@@ -34,11 +30,7 @@ def generate_launch_description():
         name='epuck_driver_robot1',
         namespace='robot1', 
         output='screen',
-        parameters=[os.path.join(pkg_dir, 'config', 'robot1_ns.yaml')],
-        remappings=[
-            ('cmd_vel', '/robot1/cmd_vel'),
-            ('odom', '/robot1/odom'),
-        ]
+        parameters=[os.path.join(pkg_dir, 'config', 'robot1_ns.yaml')]
     )
     
     # Robot 2 - Rotation movement
@@ -48,11 +40,7 @@ def generate_launch_description():
         name='epuck_driver_robot2',
         namespace='robot2',
         output='screen', 
-        parameters=[os.path.join(pkg_dir, 'config', 'robot2_ns.yaml')],
-        remappings=[
-            ('cmd_vel', '/robot2/cmd_vel'),
-            ('odom', '/robot2/odom'),
-        ]
+        parameters=[os.path.join(pkg_dir, 'config', 'robot2_ns.yaml')]
     )
     
     # Movement command publishers using Simple CMD Publisher nodes with keyboard control

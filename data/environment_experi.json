@@ -3,60 +3,76 @@
         {
             "vertices": [
                 [
-                    494,
-                    0
+                    493,
+                    600
                 ],
                 [
-                    900,
-                    0
+                    894,
+                    600
                 ],
                 [
-                    900,
-                    355
+                    894,
+                    256
                 ],
                 [
-                    494,
-                    355
+                    493,
+                    256
                 ]
             ]
         },
         {
             "vertices": [
                 [
-                    0,
-                    184
+                    3,
+                    445
                 ],
                 [
                     266,
-                    184
+                    445
                 ],
                 [
                     266,
-                    467
+                    170
                 ],
                 [
-                    0,
-                    467
+                    3,
+                    170
                 ]
             ]
         }
     ],
     "coord_bounds": [
-        10,
+        0,
         1100,
-        10,
+        0,
         600
     ],
     "width": 1100,
     "height": 600,
     "start_pose": [
-        200.0,
-        50.0,
+        150.0,
+        550.0,
         1.2560000000000002
     ],
     "goal_pose": [
         1050.0,
-        80.0,
+        580.0,
         3.14159265
-    ]
+    ],
+    "coordinate_frames": {
+        "camera_pixel_frame": {
+            "name": "Camera Pixel Frame",
+            "units": "pixels"
+        },
+        "world_pixel_frame": {
+            "name": "World Pixel Frame",
+            "units": "pixels"
+        },
+        "world_frame": {
+            "name": "World Frame",
+            "units": "meters"
+        }
+    },
+    "coordinate_frame": "world_pixel",
+    "data_coordinate_frame": "world_pixel"
 }

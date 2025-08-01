@@ -1,9 +1,24 @@
 {
-  "timestamp": 1753688763.149274,
-  "date_time": "2025-07-28 07:46:03",
+  "timestamp": 1754040170.628251,
+  "date_time": "2025-08-01 09:22:50",
   "tracking_duration_seconds": 5.0,
-  "coordinate_system": {
-    "note": "All coordinates are relative to the cropped image from camera_node",
+  "coordinate_frames": {
+    "camera_pixel_frame": {
+      "name": "Camera Pixel Frame",
+      "units": "pixels"
+    },
+    "world_pixel_frame": {
+      "name": "World Pixel Frame",
+      "units": "pixels"
+    },
+    "world_frame": {
+      "name": "World Frame",
+      "units": "meters"
+    }
+  },
+  "data_coordinate_frame": "world_pixel",
+  "coordinate_system_legacy": {
+    "note": "Legacy note - All coordinates are now in world_pixel frame",
     "original_camera_resolution": "1280x720",
     "crop_applied": "img[65:665, 50:1150]",
     "cropped_dimensions": "1100x600",
@@ -15,73 +30,75 @@
   "rectangles": {
     "rect_0": {
       "center": [
-        697.5333333333333,
-        177.3
+        693.9333333333333,
+        428.0
       ],
-      "width": 406.2,
-      "height": 355.5,
-      "area": 144405.43333333332,
+      "width": 400.6666666666667,
+      "height": 344.0,
+      "area": 137829.33333333334,
       "corners": [
         [
-          494.4333333333333,
-          -0.44999999999998863
+          493.9,
+          600.0
         ],
         [
-          900.6333333333332,
-          -0.44999999999998863
+          894.5666666666667,
+          600.0
         ],
         [
-          900.6333333333332,
-          355.05
+          894.5666666666667,
+          256.0
         ],
         [
-          494.4333333333333,
-          355.05
+          493.9,
+          256.0
         ]
       ],
       "bounding_box": [
-        494.73333333333335,
-        0.0,
-        406.2,
-        355.5
+        493.9,
+        256.0,
+        400.6666666666667,
+        344.0
       ],
       "sample_count": 30,
-      "type": "axis_aligned_rectangle"
+      "type": "axis_aligned_rectangle",
+      "coordinate_frame": "world_pixel"
     },
     "rect_1": {
       "center": [
-        132.93333333333334,
-        326.0
+        134.43333333333334,
+        308.1
       ],
-      "width": 266.5,
-      "height": 283.6333333333333,
-      "area": 75588.36666666667,
+      "width": 263.2,
+      "height": 275.7,
+      "area": 72563.96666666666,
       "corners": [
         [
-          -0.3166666666666629,
-          184.18333333333334
+          3.0,
+          445.76666666666665
         ],
         [
-          266.18333333333334,
-          184.18333333333334
+          266.2,
+          445.76666666666665
         ],
         [
-          266.18333333333334,
-          467.81666666666666
+          266.2,
+          170.06666666666666
         ],
         [
-          -0.3166666666666629,
-          467.81666666666666
+          3.0,
+          170.06666666666666
         ]
       ],
       "bounding_box": [
-        0.0,
-        184.43333333333334,
-        266.5,
-        283.6333333333333
+        3.0,
+        170.06666666666666,
+        263.2,
+        275.7
       ],
       "sample_count": 30,
-      "type": "axis_aligned_rectangle"
+      "type": "axis_aligned_rectangle",
+      "coordinate_frame": "world_pixel"
     }
   }
 }

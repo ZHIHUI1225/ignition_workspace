@@ -27,7 +27,7 @@ sys.path.append('/root/workspace/config')
 from config_loader import config
 
 # Import coordinate transformation utilities
-from coordinate_transform import convert_pixel_positions_to_world_meters, convert_pixel_data_to_meters
+from coordinate_transform import convert_pixel_positions_to_world_meters, convert_world_pixel_data_to_meters
 
 # Get robot physical parameters from config
 robot_params = config.get_robot_physical_params()
@@ -219,8 +219,8 @@ def Planning_deltaT(waypoints_file_path,reeb_graph,planning_path_result_file,Res
     r_guess_pixels = np.array(load_r_from_file(planning_path_result_file))
     l_guess_pixels = np.array(load_l_from_file(planning_path_result_file))
     
-    # Convert pixel data to meters using config conversion
-    phi_data, l_guess, r_guess = convert_pixel_data_to_meters(phi_data, l_guess_pixels, r_guess_pixels)
+    # Convert only length and radius from pixels to meters (angles unchanged)
+    phi_data, l_guess, r_guess = convert_world_pixel_data_to_meters(phi_data, l_guess_pixels, r_guess_pixels)
     
     # Number of variables
     N = len(Waypoints)
@@ -238,8 +238,7 @@ def Planning_deltaT(waypoints_file_path,reeb_graph,planning_path_result_file,Res
     
     # Calculate the number of arc and line segments
     for i in range(N-1):
-        # Note: phi_new calculation needs to account for coordinate frame transformation
-        # In world coordinates, the phi angles have been transformed, so we use them directly
+        # phi angles are already in world coordinates from the JSON data
         phi_new[i]=phi[i]+Flagb[i]*np.pi/2
         delta_phi=(phi[i+1] - phi_new[i])
         Index=Get_index(r0[i],l[i],delta_phi,Deltal)
@@ -278,8 +277,10 @@ def Planning_deltaT(waypoints_file_path,reeb_graph,planning_path_result_file,Res
                     # Convert from line to arc velocity continuity
                     # v_end_prev = line_segment_length / delta_t_prev
                     prev_line_subsegment_length = l[i-1] / LineIndex[i-1]
+                    # Find the correct index in delta_t_lines for segment i-1
+                    prev_line_idx = sum(1 for k in range(i-1) if LineIndex[k] > 0) - 1
                     # Velocity at the end of the last subsegment of the previous line (i-1)
-                    v_end_prev_line = prev_line_subsegment_length / delta_t_lines[i-1][-1] # Corrected: use last element of the last line segment times
+                    v_end_prev_line = prev_line_subsegment_length / delta_t_lines[prev_line_idx][-1]
                     
                     # Tangential velocity at the start of the first subsegment of the current arc (i)
                     current_arc_subsegment_length = abs(r0[i] * (phi[i+1] - phi_new[i])) / ArcIndex[i]
@@ -289,7 +290,7 @@ def Planning_deltaT(waypoints_file_path,reeb_graph,planning_path_result_file,Res
                     # For acceleration-based continuity: (v_start_curr_arc - v_end_prev_line)/t_avg_transition ∈ [-a_max, a_max]
                     # Note: This is a transition from linear to tangential velocity.
                     # The acceleration limit should be a_max (linear equivalent for the robot chassis)
-                    t_avg_transition = (delta_t_lines[i-1][-1] + delta_t_arcs[current_arc_idx][0])/2 # Corrected
+                    t_avg_transition = (delta_t_lines[prev_line_idx][-1] + delta_t_arcs[current_arc_idx][0])/2
                     a_transition = (v_start_curr_arc - v_end_prev_line) / t_avg_transition
                     all_accelerations.append(a_transition) # NEW: Add to list
                     
@@ -720,8 +721,8 @@ def save_waypoints(case,N,data_file=None):
     l_pixels = data["Optimization_l"]
     r_pixels = data["Optimization_r"]
     
-    # Convert pixel data to meters using proper coordinate transformation
-    phi, l, r = convert_pixel_data_to_meters(phi_pixels, l_pixels, r_pixels)
+    # Convert only length and radius from pixels to meters (angles unchanged)
+    phi, l, r = convert_world_pixel_data_to_meters(phi_pixels, l_pixels, r_pixels)
     
     # Extract node positions in pixel coordinates and convert to world meters
     node_positions_pixels = [nodes[Waypoints[i]][1] for i in range(len(Waypoints))]
@@ -823,8 +824,8 @@ if __name__ == '__main__':
     r_guess_pixels = np.array(load_r_from_file(planning_path_result_file))
     l_guess_pixels = np.array(load_l_from_file(planning_path_result_file))
     
-    # Convert pixel data to meters using config conversion
-    phi_data, l_guess, r_guess = convert_pixel_data_to_meters(phi_data_pixels, l_guess_pixels, r_guess_pixels)
+    # Convert only length and radius from pixels to meters (angles unchanged)
+    phi_data, l_guess, r_guess = convert_world_pixel_data_to_meters(phi_data_pixels, l_guess_pixels, r_guess_pixels)
     
     # Convert waypoint positions from pixels to world meters for trajectory functions
     nodes, _, _ = load_reeb_graph(file_path)
@@ -835,7 +836,7 @@ if __name__ == '__main__':
     
     # Calculate phi_new for visualization - angles are already in world coordinates
     for i in range(len(Waypoints)-1):
-        # phi_data is already transformed to world coordinates, so use directly
+        # phi_data is already in world coordinates, use directly
         phi_new[i] = phi_data[i] + Flagb[i]*np.pi/2
     
     # NEW: Save trajectory parameters for later use

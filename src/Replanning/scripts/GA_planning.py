@@ -16,6 +16,10 @@ import sys
 sys.path.append('/root/workspace/config')
 from config_loader import config
 
+# Add coordinate frame import
+sys.path.append('/root/workspace/src/Replanning/scripts')
+from coordinate_transform import get_frame_info
+
 # Load configuration parameters
 case = config.case
 N = config.N
@@ -58,6 +62,11 @@ def fitness_func(ga_instance, solution, solution_idx):
     penalty = 0
     L = 0
     
+    # Reconstruct full solution with fixed phi0
+    full_solution = np.zeros(Nw)
+    full_solution[0] = phi0  # Fixed first angle
+    full_solution[1:] = solution  # GA optimizes the remaining angles
+    
     with open(config.get_full_path(Normalization_path, use_data_path=True), 'r') as file:
         data = json.load(file)
     al=data['al']
@@ -65,30 +74,30 @@ def fitness_func(ga_instance, solution, solution_idx):
     length_min=data['length_min']
     
     for i in range(Nw-1):
-        phi_new[i]=solution[i]+Flagb[i]*np.pi/2
-        sigma[i]=-1+np.cos(phi_new[i]-solution[i+1])
+        phi_new[i]=full_solution[i]+Flagb[i]*np.pi/2
+        sigma[i]=-1+np.cos(phi_new[i]-full_solution[i+1])
         
         # Handle sigma near zero more robustly
         if abs(sigma[i]) < 1e-6:
             r0[i] = 100000000
             l[i] = Distance[i][0]
         else:
-            l[i]=Distance[i][0]*(np.cos(Angle[i][0]-phi_new[i])-np.cos(Angle[i][0]-solution[i+1]))/sigma[i]
-            r0[i]=-Distance[i][0]*np.sin(Angle[i][0]-solution[i+1])/sigma[i]
+            l[i]=Distance[i][0]*(np.cos(Angle[i][0]-phi_new[i])-np.cos(Angle[i][0]-full_solution[i+1]))/sigma[i]
+            r0[i]=-Distance[i][0]*np.sin(Angle[i][0]-full_solution[i+1])/sigma[i]
             
-        length = abs((solution[i+1]- solution[i]-Flagb[i]*np.pi/2)*r0[i])+l[i]
-        curvature = abs(Distance[i][0]*np.sin(Angle[i][0]-solution[i+1]))
+        length = abs((full_solution[i+1]- full_solution[i]-Flagb[i]*np.pi/2)*r0[i])+l[i]
+        curvature = abs(Distance[i][0]*np.sin(Angle[i][0]-full_solution[i+1]))
         
         # EXTREMELY heavy penalties for hard constraints - make them infeasible
-        cos_constraint = np.cos((phi_new[i]-solution[i+1])/4)
+        cos_constraint = np.cos((phi_new[i]-full_solution[i+1])/4)
         if cos_constraint < 0:
             penalty += 1000000  # Massive penalty
             
-        dir_constraint1 = (phi_new[i]-Angle[i][0])*(phi_new[i]+solution[i+1]-2*Angle[i][0])
+        dir_constraint1 = (phi_new[i]-Angle[i][0])*(phi_new[i]+full_solution[i+1]-2*Angle[i][0])
         if dir_constraint1 < 0:
             penalty += 500000  # Very large penalty
             
-        dir_constraint2 = (phi_new[i]-Angle[i][0])*(solution[i+1]-Angle[i][0])
+        dir_constraint2 = (phi_new[i]-Angle[i][0])*(full_solution[i+1]-Angle[i][0])
         if dir_constraint2 > 0:
             penalty += 500000  # Very large penalty
             
@@ -105,11 +114,11 @@ def fitness_func(ga_instance, solution, solution_idx):
          
         # Safe corridor constraints - very important
         theta_start = phi_new[i]+np.pi/2
-        theta_end = solution[i+1]+np.pi/2
+        theta_end = full_solution[i+1]+np.pi/2
         center=(r0[i]*np.cos(theta_start),r0[i]*np.sin(theta_start))
         
         for k in range(3):
-            theta=phi_new[i]+np.pi/2+(solution[i+1]-phi_new[i])/3*(k+1)    
+            theta=phi_new[i]+np.pi/2+(full_solution[i+1]-phi_new[i])/3*(k+1)    
             x_k = r0[i] * np.cos(theta)-center[0]
             y_k = r0[i] * np.sin(theta)-center[1]
             x_new=x_k*np.cos(Angle[i][0])+y_k*np.sin(Angle[i][0])
@@ -134,33 +143,38 @@ def constraint_check(solution):
     violations = 0
     violation_details = []
     
+    # Reconstruct full solution with fixed phi0
+    full_solution = np.zeros(Nw)
+    full_solution[0] = phi0  # Fixed first angle
+    full_solution[1:] = solution  # GA optimizes the remaining angles
+    
     for i in range(Nw-1):
-        phi_new[i] = solution[i] + Flagb[i]*np.pi/2
-        sigma[i] = -1 + np.cos(phi_new[i] - solution[i+1])
+        phi_new[i] = full_solution[i] + Flagb[i]*np.pi/2
+        sigma[i] = -1 + np.cos(phi_new[i] - full_solution[i+1])
         
         # Handle sigma near zero more robustly
         if abs(sigma[i]) < 1e-6:
             r0[i] = 100000000
             l[i] = Distance[i][0]
         else:
-            l[i] = Distance[i][0]*(np.cos(Angle[i][0]-phi_new[i])-np.cos(Angle[i][0]-solution[i+1]))/sigma[i]
-            r0[i] = -Distance[i][0]*np.sin(Angle[i][0]-solution[i+1])/sigma[i]
+            l[i] = Distance[i][0]*(np.cos(Angle[i][0]-phi_new[i])-np.cos(Angle[i][0]-full_solution[i+1]))/sigma[i]
+            r0[i] = -Distance[i][0]*np.sin(Angle[i][0]-full_solution[i+1])/sigma[i]
         
         print(f'Segment {i}: l={l[i]:.3f}, r0={r0[i]:.3f}')
         
         # Check angle constraint
-        cos_check = np.cos((phi_new[i]-solution[i+1])/4)
+        cos_check = np.cos((phi_new[i]-full_solution[i+1])/4)
         if cos_check < 0:
             violations += 1
             violation_details.append(f'Segment {i}: Angle constraint violated (cos={cos_check:.3f})')
         
         # Check direction constraints  
-        dir_check1 = (phi_new[i]-Angle[i][0])*(phi_new[i]+solution[i+1]-2*Angle[i][0])
+        dir_check1 = (phi_new[i]-Angle[i][0])*(phi_new[i]+full_solution[i+1]-2*Angle[i][0])
         if dir_check1 < 0:
             violations += 1
             violation_details.append(f'Segment {i}: Direction constraint 1 violated ({dir_check1:.3f})')
             
-        dir_check2 = (phi_new[i]-Angle[i][0])*(solution[i+1]-Angle[i][0])
+        dir_check2 = (phi_new[i]-Angle[i][0])*(full_solution[i+1]-Angle[i][0])
         if dir_check2 > 0:
             violations += 1
             violation_details.append(f'Segment {i}: Direction constraint 2 violated ({dir_check2:.3f})')
@@ -182,11 +196,11 @@ def constraint_check(solution):
         
         # Check safe corridor constraints
         theta_start = phi_new[i] + np.pi/2
-        theta_end = solution[i+1] + np.pi/2
+        theta_end = full_solution[i+1] + np.pi/2
         center = (r0[i]*np.cos(theta_start), r0[i]*np.sin(theta_start))
         
         for k in range(3):
-            theta = phi_new[i] + np.pi/2 + (solution[i+1]-phi_new[i])/3*(k+1)
+            theta = phi_new[i] + np.pi/2 + (full_solution[i+1]-phi_new[i])/3*(k+1)
             x_k = r0[i] * np.cos(theta) - center[0]
             y_k = r0[i] * np.sin(theta) - center[1]
             x_new = x_k*np.cos(Angle[i][0]) + y_k*np.sin(Angle[i][0])
@@ -219,11 +233,9 @@ def constraint_check(solution):
 lb = (-np.pi * np.ones(Nw)).tolist()
 ub = (np.pi * np.ones(Nw)).tolist()
 
-# Set bounds around config phi0 for the first waypoint
-tolerance = 0.2*np.pi  # Allow ±0.2π around phi0
-lb[0] = max(-np.pi, phi0 - tolerance)
-ub[0] = min(np.pi, phi0 + tolerance)
-
+# Fix phi0 value exactly (same as Ipopt solver)
+lb[0] = phi0
+ub[0] = phi0
 # Improved bounds calculation for intermediate waypoints
 for i in range(1, Nw-2):
     if i < len(Angle) and i-1 < len(Angle):
@@ -251,7 +263,7 @@ else:
     lb[Nw-1] = -np.pi/2
     ub[Nw-1] = np.pi/2
 
-gene_space = [{'low': lb[i], 'high': ub[i]} for i in range(Nw)]
+gene_space = [{'low': lb[i], 'high': ub[i]} for i in range(1, Nw)]  # Skip index 0 (phi0)
 # ga = GA(func=fitness_func, n_dim=Nw, size_pop=80, max_iter=2000, prob_mut=0.2,lb=lb,ub=ub, precision=1e-1)
 # best_x, best_y = ga.run()
 # print('best_x:', best_x, '\n', 'best_y:', best_y)
@@ -311,19 +323,20 @@ def create_feasible_individual():
     
     return individual.tolist()
 
-# Create multiple diverse initial populations
+# Create multiple diverse initial populations for reduced dimension space
 initial_population = []
 
-# 60% constraint-aware individuals
+# 60% constraint-aware individuals (excluding fixed phi0)
 for _ in range(int(0.6 * sol_per_pop)):
     individual = create_feasible_individual()
-    initial_population.append(individual)
+    # Remove phi0 from the individual for reduced dimension optimization
+    individual_reduced = individual[1:]  # Skip first element (phi0)
+    initial_population.append(individual_reduced)
 
-# 30% angle-based individuals (more direct angle initialization)
+# 30% angle-based individuals (more direct angle initialization, excluding phi0)
 for _ in range(int(0.3 * sol_per_pop)):
     individual = []
-    individual.append(phi0)  # Use config phi0 instead of hardcoded value
-    for i in range(1, Nw):
+    for i in range(1, Nw):  # Start from index 1 (skip phi0)
         if i < len(Angle):
             try:
                 base = float(Angle[i-1][0] if isinstance(Angle[i-1], (list, np.ndarray)) else Angle[i-1])
@@ -335,18 +348,16 @@ for _ in range(int(0.3 * sol_per_pop)):
             individual.append(float(np.random.uniform(lb[i], ub[i])))
     initial_population.append(individual)
 
-# 10% completely random but bounded
+# 10% completely random but bounded (excluding phi0)
 for _ in range(sol_per_pop - len(initial_population)):
     individual = []
-    for i in range(Nw):
-        if i == 0:
-            individual.append(float(phi0))  # Use config phi0 instead of hardcoded value
-        else:
-            individual.append(float(np.random.uniform(lb[i], ub[i])))
+    for i in range(1, Nw):  # Start from index 1 (skip phi0)
+        individual.append(float(np.random.uniform(lb[i], ub[i])))
     initial_population.append(individual)
 
-# Ensure all individuals have the same length and are properly formatted
-initial_population = [ind[:Nw] if len(ind) > Nw else ind + [0.0]*(Nw-len(ind)) for ind in initial_population]
+# Ensure all individuals have the correct reduced length (Nw-1)
+expected_length = Nw-1
+initial_population = [ind[:expected_length] if len(ind) > expected_length else ind + [0.0]*(expected_length-len(ind)) for ind in initial_population]
 initial_population = np.array(initial_population, dtype=float)
 
 
@@ -359,21 +370,26 @@ def on_generation(ga_instance):
     if generation % 100 == 0:
         print(f"Generation {generation}: Best fitness = {fitness:.2f}")
         
+        # Reconstruct full solution with fixed phi0 for constraint checking
+        full_solution = np.zeros(Nw)
+        full_solution[0] = phi0  # Fixed first angle
+        full_solution[1:] = solution  # GA optimizes the remaining angles
+        
         # Quick feasibility check for current best solution
         violations = 0
         for i in range(Nw-1):
-            phi_new_i = solution[i] + Flagb[i]*np.pi/2
-            sigma_i = -1 + np.cos(phi_new_i - solution[i+1])
+            phi_new_i = full_solution[i] + Flagb[i]*np.pi/2
+            sigma_i = -1 + np.cos(phi_new_i - full_solution[i+1])
             
             if abs(sigma_i) < 1e-6:
                 r0_i = 100000000
                 l_i = Distance[i][0]
             else:
-                l_i = Distance[i][0]*(np.cos(Angle[i][0]-phi_new_i)-np.cos(Angle[i][0]-solution[i+1]))/sigma_i
-                r0_i = -Distance[i][0]*np.sin(Angle[i][0]-solution[i+1])/sigma_i
+                l_i = Distance[i][0]*(np.cos(Angle[i][0]-phi_new_i)-np.cos(Angle[i][0]-full_solution[i+1]))/sigma_i
+                r0_i = -Distance[i][0]*np.sin(Angle[i][0]-full_solution[i+1])/sigma_i
             
             # Check critical constraints
-            if np.cos((phi_new_i-solution[i+1])/4) < 0:
+            if np.cos((phi_new_i-full_solution[i+1])/4) < 0:
                 violations += 1
             if abs(r0_i) < r_lim:
                 violations += 1
@@ -395,7 +411,7 @@ ga_instance = pygad.GA(num_generations=num_generations,
                        mutation_probability=mutation_probability,
                        crossover_probability=crossover_probability,
                        sol_per_pop=sol_per_pop,
-                       num_genes=num_genes,
+                       num_genes=Nw-1,  # Optimize only Nw-1 variables
                        initial_population=initial_population,
                        gene_space=gene_space,
                        fitness_func=fitness_func,
@@ -424,9 +440,16 @@ print(f"Elapsed time: {elapsed_time} seconds")
 
 # Returning the details of the best solution.
 solution, solution_fitness, solution_idx = ga_instance.best_solution(ga_instance.last_generation_fitness)
-print(f"Parameters of the best solution : {solution}")
+print(f"Parameters of the best solution (Nw-1 variables): {solution}")
 print(f"Fitness value of the best solution = {solution_fitness}")
 print(f"Index of the best solution : {solution_idx}")
+
+# Reconstruct full solution with fixed phi0 for output
+full_solution = np.zeros(Nw)
+full_solution[0] = phi0
+full_solution[1:] = solution
+print(f"Full solution with fixed phi0: {full_solution}")
+
 Result_file = config.get_full_path(config.Result_file, use_data_path=True)
 figure_file = config.get_full_path(config.figure_file, use_data_path=True)
 # solution=best_x
@@ -467,25 +490,25 @@ for i in range(Nw-1):
         ax.plot(Ps[0], Ps[1], 'ro', label='relay point')
     else:
         plt.plot(Ps[0], Ps[1], 'go',label='waypoint')
-    phi_new_opt=solution[i]+Flagb[i]*np.pi/2 #A
-    thetaC_opt=solution[i+1]/2 + phi_new_opt/2
-    sigma_opt=-1+np.cos(phi_new_opt-solution[i+1])
+    phi_new_opt=full_solution[i]+Flagb[i]*np.pi/2 #A
+    thetaC_opt=full_solution[i+1]/2 + phi_new_opt/2
+    sigma_opt=-1+np.cos(phi_new_opt-full_solution[i+1])
     if sigma_opt==0:
         r0_opt=100000000
         l_opt=Distance[i][0]
-        x_line=np.linspace(0,l_opt*np.cos(solution[i+1]),100)
-        y_line=np.linspace(0,l_opt*np.sin(solution[i+1]),100)
+        x_line=np.linspace(0,l_opt*np.cos(full_solution[i+1]),100)
+        y_line=np.linspace(0,l_opt*np.sin(full_solution[i+1]),100)
         
         x_line=x_line+Ps[0]
         y_line=y_line+Ps[1]
         ax.plot(x_line, y_line,'b')
     else:
-        l_opt=Distance[i]*(np.cos(Angle[i]-phi_new_opt)-np.cos(Angle[i]-solution[i+1]))/sigma_opt
-        r0_opt=-Distance[i]*np.sin(Angle[i]-solution[i+1])/sigma_opt
+        l_opt=Distance[i]*(np.cos(Angle[i]-phi_new_opt)-np.cos(Angle[i]-full_solution[i+1]))/sigma_opt
+        r0_opt=-Distance[i]*np.sin(Angle[i]-full_solution[i+1])/sigma_opt
 #     # Plot the arc
 
         theta_start =phi_new_opt+np.pi/2
-        theta_end = solution[i+1]+np.pi/2 # Assuming the arc spans the angle phi_A
+        theta_end = full_solution[i+1]+np.pi/2 # Assuming the arc spans the angle phi_A
         center=(r0_opt*np.cos(theta_start),r0_opt*np.sin(theta_start))
         theta = np.linspace(theta_start, theta_end, 100)
         
@@ -496,19 +519,26 @@ for i in range(Nw-1):
         y=y+Ps[1]
         ax.plot(x, y,'b')
     # plot line 
-        x_line=np.linspace(r0_opt * np.cos(theta_end)-center[0],r0_opt * np.cos(theta_end)-center[0]+l_opt*np.cos(solution[i+1]),100)
-        y_line=np.linspace(r0_opt * np.sin(theta_end)-center[1],r0_opt * np.sin(theta_end)-center[1]+l_opt*np.sin(solution[i+1]),100)
+        x_line=np.linspace(r0_opt * np.cos(theta_end)-center[0],r0_opt * np.cos(theta_end)-center[0]+l_opt*np.cos(full_solution[i+1]),100)
+        y_line=np.linspace(r0_opt * np.sin(theta_end)-center[1],r0_opt * np.sin(theta_end)-center[1]+l_opt*np.sin(full_solution[i+1]),100)
         
         x_line=x_line+Ps[0]
         y_line=y_line+Ps[1]
         l_Opt[i]=l_opt
         r_Opt[i]=r0_opt
         ax.plot(x_line, y_line,'b')
+
+# Get coordinate frame information
+frame_info = get_frame_info()
+world_pixel_frame = frame_info['world_pixel_frame']
+
 data = {
-        'Initial_guess_phi': solution.tolist(),
+        'Initial_guess_phi': full_solution.tolist(),  # Save full solution with fixed phi0
         'Optimization_l': l_Opt.tolist(),
         'Optimization_r': r_Opt.tolist(),
-        'Optimizationf': solution_fitness
+        'Optimizationf': solution_fitness,
+        'coordinate_frame': world_pixel_frame['name'],
+        'units': world_pixel_frame['units']
         }
 with open(Result_file, 'w') as file:
             json.dump(data, file)  

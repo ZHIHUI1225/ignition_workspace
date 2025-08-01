@@ -174,7 +174,47 @@ if __name__ == "__main__":
     # rebuild the reeb graph
     reeb_graph_new = rebuild_graph(reeb_graph, loaded_environment,start, goal)
     # reeb_graph_new=reduce_node_number(reeb_graph_new,Distance_range=Distance_range,Angle_range=Angle_range)
-    save_reeb_graph_to_file(reeb_graph_new, "/root/workspace/data/" + New_graph_file_path )
+    
+    # Save the rebuilt graph with coordinate frame information preserved
+    # Load coordinate frame info from the original graph
+    with open("/root/workspace/data/" + Orginal_graph_file_path, 'r') as file:
+        original_graph_data = json.load(file)
+    
+    # Create the rebuilt graph data with coordinate frame metadata
+    from Graph import Node
+    node_id_map = {node: idx for idx, node in enumerate(reeb_graph_new.nodes)}
+    rebuilt_graph_data = {
+        'nodes': [(node_id_map[node], node.configuration.tolist(), node.parent, node.is_goal) for node in reeb_graph_new.nodes],
+        'in_neighbors': {node_id_map[node]: [node_id_map[neighbor] for neighbor in neighbors] for node, neighbors in reeb_graph_new.in_neighbors.items()},
+        'out_neighbors': {node_id_map[node]: [node_id_map[neighbor] for neighbor in neighbors] for node, neighbors in reeb_graph_new.out_neighbors.items()},
+        
+        # Preserve coordinate frame information from original graph
+        'coordinate_frame': original_graph_data.get('coordinate_frame', 'world_pixel'),
+        'data_coordinate_frame': original_graph_data.get('data_coordinate_frame', 'world_pixel'),
+        'coordinate_frames': original_graph_data.get('coordinate_frames', {}),
+        
+        # Preserve start/goal information
+        'start_pose': original_graph_data.get('start_pose', start.tolist()),
+        'goal_pose': original_graph_data.get('goal_pose', goal.tolist()),
+        
+        # Add rebuild metadata
+        'rebuild_info': {
+            'rebuilt_from': Orginal_graph_file_path,
+            'case': case,
+            'N': N,
+            'arc_range': arc_range,
+            'original_nodes': len(reeb_graph.nodes),
+            'rebuilt_nodes': len(reeb_graph_new.nodes)
+        }
+    }
+    
+    # Save with coordinate frame metadata
+    with open("/root/workspace/data/" + New_graph_file_path, 'w') as file:
+        json.dump(rebuilt_graph_data, file, indent=4)
+    
+    print(f"✓ Rebuilt graph saved to {New_graph_file_path} with coordinate frame metadata")
+    print(f"✓ Coordinate frame: {rebuilt_graph_data['coordinate_frame']}")
+    print(f"✓ Nodes: {len(reeb_graph_new.nodes)} (original: {len(reeb_graph.nodes)})")
     reeb_graph_new.draw("steelblue")
     # reeb_graph.draw("grey")
     Environment.draw(loaded_environment,"black")

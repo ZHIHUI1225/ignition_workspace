@@ -98,39 +98,48 @@ class MPCTestNode(Node):
         
     def load_trajectory(self):
         """Load reference trajectory from JSON file"""
-        # Try different possible paths for the trajectory file
-        possible_paths = [
-            '/root/workspace/data/experi/tb0_Trajectory.json',
-            '/root/workspace/data/simple_maze/tb0_Trajectory.json',
-            '/root/workspace/data/simulation/tb0_Trajectory.json',
-            '/root/workspace/data/tb0_Trajectory.json'
-        ]
+        # Load the specific trajectory file from experi folder
+        json_file_path = '/root/workspace/data/experi/tb0_Trajectory.json'
         
         trajectory_loaded = False
         
-        for json_file_path in possible_paths:
-            if os.path.exists(json_file_path):
-                try:
-                    with open(json_file_path, 'r') as json_file:
-                        data = json.load(json_file)
-                        self.ref_trajectory = data['Trajectory']
-                        trajectory_loaded = True
-                        self.get_logger().info(f'Loaded trajectory from: {json_file_path}')
-                        self.get_logger().info(f'Trajectory length: {len(self.ref_trajectory)} points')
-                        break
-                except Exception as e:
-                    self.get_logger().warn(f'Failed to load trajectory from {json_file_path}: {e}')
-                    continue
+        if os.path.exists(json_file_path):
+            try:
+                with open(json_file_path, 'r') as json_file:
+                    data = json.load(json_file)
+                    self.ref_trajectory = data['Trajectory']
+                    trajectory_loaded = True
+                    self.get_logger().info(f'Loaded trajectory from: {json_file_path}')
+                    self.get_logger().info(f'Trajectory length: {len(self.ref_trajectory)} points')
+                    
+                    # Log first few trajectory points for verification
+                    if len(self.ref_trajectory) > 0:
+                        first_point = self.ref_trajectory[0]
+                        self.get_logger().info(f'First trajectory point: x={first_point[0]:.3f}, y={first_point[1]:.3f}, θ={first_point[2]:.3f}')
+                        if len(self.ref_trajectory) > 1:
+                            last_point = self.ref_trajectory[-1]
+                            self.get_logger().info(f'Last trajectory point: x={last_point[0]:.3f}, y={last_point[1]:.3f}, θ={last_point[2]:.3f}')
+                            
+            except Exception as e:
+                self.get_logger().error(f'Failed to load trajectory from {json_file_path}: {e}')
+                trajectory_loaded = False
+        else:
+            self.get_logger().error(f'Trajectory file not found: {json_file_path}')
         
         if not trajectory_loaded:
-            self.get_logger().error('Could not load trajectory file from any expected location!')
+            self.get_logger().error('Could not load the required trajectory file!')
             # Create a simple test trajectory as fallback
             self.create_test_trajectory()
         
         # Set reference trajectory in MPC
-        if self.ref_trajectory:
+        if self.ref_trajectory and self.mpc is not None:
             ref_array = self.get_reference_trajectory_segment()
             self.mpc.set_reference_trajectory(ref_array)
+            
+            # Log initial trajectory information for debugging
+            first_ref = self.ref_trajectory[0]
+            self.get_logger().info(f'Setting reference trajectory. First point: x={first_ref[0]:.3f}, y={first_ref[1]:.3f}, θ={first_ref[2]:.3f}')
+            self.get_logger().info('Note: Robot should be positioned close to the trajectory start for best results')
             
     def create_test_trajectory(self):
         """Create a simple test trajectory as fallback"""
@@ -192,24 +201,28 @@ class MPCTestNode(Node):
             self.get_logger().error(f'Error in odom callback: {e}')
     
     def publish_robot_transform(self, odom_msg):
-        """Publish transform from camera_frame to base_link for visualization"""
+        """Publish transform from world to odom for visualization (connects camera_frame to robot frames)"""
         try:
+            # The e-puck driver already publishes odom -> robot0/base_link
+            # We need to publish world -> odom to complete the transform tree
+            # This allows RViz to visualize everything in the world frame
             transform = TransformStamped()
             
             # Header
             transform.header.stamp = self.get_clock().now().to_msg()
-            transform.header.frame_id = 'camera_frame'
-            transform.child_frame_id = 'base_link'
+            transform.header.frame_id = 'world'  # Parent frame (used in RViz)
+            transform.child_frame_id = 'odom'    # Child frame (used by e-puck driver)
             
-            # Copy position and orientation from odometry
-            transform.transform.translation.x = odom_msg.pose.pose.position.x
-            transform.transform.translation.y = odom_msg.pose.pose.position.y
-            transform.transform.translation.z = odom_msg.pose.pose.position.z
+            # For now, assume world and odom are aligned (identity transform)
+            # In a real system, this would come from SLAM or localization
+            transform.transform.translation.x = 0.0
+            transform.transform.translation.y = 0.0
+            transform.transform.translation.z = 0.0
             
-            transform.transform.rotation.x = odom_msg.pose.pose.orientation.x
-            transform.transform.rotation.y = odom_msg.pose.pose.orientation.y
-            transform.transform.rotation.z = odom_msg.pose.pose.orientation.z
-            transform.transform.rotation.w = odom_msg.pose.pose.orientation.w
+            transform.transform.rotation.x = 0.0
+            transform.transform.rotation.y = 0.0
+            transform.transform.rotation.z = 0.0
+            transform.transform.rotation.w = 1.0
             
             # Broadcast transform
             self.tf_broadcaster.sendTransform(transform)
@@ -294,13 +307,21 @@ class MPCTestNode(Node):
             # Debug: Log before MPC update
             if self._control_loop_counter % 4 == 1:
                 self.get_logger().info(f'Calling MPC update with state: [{self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f}]')
+                # Debug: Also log the current reference point
+                current_ref = self.ref_trajectory[self.trajectory_index]
+                self.get_logger().info(f'Current reference point: x={current_ref[0]:.3f}, y={current_ref[1]:.3f}, θ={current_ref[2]:.3f}')
+                # Calculate distance to reference
+                distance_to_ref = np.sqrt((self.current_state[0] - current_ref[0])**2 + (self.current_state[1] - current_ref[1])**2)
+                angle_diff = abs(self.current_state[2] - current_ref[2])
+                self.get_logger().info(f'Distance to reference: {distance_to_ref:.3f}m, angle difference: {angle_diff:.3f}rad')
             
             # Compute control command
             control_cmd = self.mpc.update(self.current_state)
             
-            # Debug: Log MPC result
+            # Debug: Log MPC result with more detail
             if control_cmd is not None:
-                self.get_logger().info(f'MPC returned control: v={control_cmd[0]:.3f}, ω={control_cmd[1]:.3f}')
+                if self._control_loop_counter % 4 == 1:
+                    self.get_logger().info(f'MPC returned control: v={control_cmd[0]:.3f}, ω={control_cmd[1]:.3f}')
             else:
                 self.get_logger().warn('MPC returned None control command')
             

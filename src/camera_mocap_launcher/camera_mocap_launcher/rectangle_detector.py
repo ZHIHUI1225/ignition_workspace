@@ -6,10 +6,22 @@ import rclpy
 import json
 import time
 import os
+import sys
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from collections import deque
+
+# Import coordinate transformation functions
+sys.path.append('/root/workspace/src/Replanning/scripts')
+from coordinate_transform import (
+    convert_camera_pixel_to_world_pixel,
+    convert_world_pixel_to_camera_pixel, 
+    convert_world_pixel_to_world_meter,
+    get_frame_info,
+    IMG_WIDTH,
+    IMG_HEIGHT
+)
 
 class RectangleDetector(Node):
     def __init__(self):
@@ -34,9 +46,9 @@ class RectangleDetector(Node):
         self.history_length = 30  # Number of frames to keep in history
         self.save_path = os.path.join(os.getcwd(), 'rectangle_data.json')
         
-        # 存储图像尺寸信息
-        self.image_width = 1280  # 默认值
-        self.image_height = 720  # 默认值
+        # Use cropped dimensions from coordinate transformation constants
+        self.image_width = IMG_WIDTH   # 1100 (cropped width)
+        self.image_height = IMG_HEIGHT  # 600 (cropped height)
         
         # Create a timer for saving data
         self.create_timer(0.5, self.check_tracking_status)
@@ -44,6 +56,16 @@ class RectangleDetector(Node):
         self.get_logger().info("Rectangle Detector Started - Subscribing to /camera/processed_image")
         self.get_logger().info("Detecting light blue rectangles in the video stream (minimum size: 100x100)")
         self.get_logger().info(f"Will track rectangles for {self.tracking_duration} seconds before saving to {self.save_path}")
+        self.get_logger().info("Rectangle coordinates will be saved in world_pixel frame (origin: left-lower corner, Y-up)")
+        
+        # Log coordinate frame information
+        try:
+            frame_info = get_frame_info()
+            self.get_logger().info("=== Coordinate Frame Configuration ===")
+            for frame_name, frame_data in frame_info.items():
+                self.get_logger().info(f"{frame_data['name']}: Units={frame_data['units']}")
+        except Exception as e:
+            self.get_logger().warn(f"Could not load coordinate frame info: {e}")
     def image_callback(self, msg):
         """Callback function for receiving images from camera node"""
         # ==================================================================================
@@ -56,8 +78,11 @@ class RectangleDetector(Node):
             # This img is already processed (undistorted + cropped) by camera_node
             img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             
-            # 更新图像尺寸 (these are the cropped dimensions)
-            self.image_height, self.image_width = img.shape[:2]
+            # Verify image dimensions match expected cropped dimensions
+            actual_height, actual_width = img.shape[:2]
+            if actual_height != self.image_height or actual_width != self.image_width:
+                self.get_logger().warn(f"Image dimensions mismatch: expected {self.image_width}x{self.image_height}, "
+                                     f"got {actual_width}x{actual_height}")
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {e}")
             return
@@ -224,18 +249,45 @@ class RectangleDetector(Node):
                 # 绘制中心点
                 cv2.circle(display_img, center, 5, (0, 0, 255), -1)
                 
-                # 添加到结果字典
+                # Convert rectangle data to world_pixel coordinates
+                # Camera pixel coordinates -> World pixel coordinates
+                center_world_pixel = convert_camera_pixel_to_world_pixel(center)
+                
+                # Convert all corner points to world pixel coordinates
+                corners_world_pixel = []
+                for corner in box:
+                    corner_world_pixel = convert_camera_pixel_to_world_pixel([corner[0], corner[1]])
+                    corners_world_pixel.append(corner_world_pixel.tolist())
+                
+                # Convert bounding box to world pixel coordinates
+                bbox_top_left_world = convert_camera_pixel_to_world_pixel([x, y])
+                bbox_bottom_right_world = convert_camera_pixel_to_world_pixel([x + w, y + h])
+                
+                # Calculate world pixel bounding box
+                world_bbox_x = min(bbox_top_left_world[0], bbox_bottom_right_world[0])
+                world_bbox_y = min(bbox_top_left_world[1], bbox_bottom_right_world[1])
+                world_bbox_w = abs(bbox_bottom_right_world[0] - bbox_top_left_world[0])
+                world_bbox_h = abs(bbox_bottom_right_world[1] - bbox_top_left_world[1])
+                
+                # Store rectangle data in world_pixel coordinates
                 rect_name = f"rect_{rect_count}"
                 rectangles[rect_name] = {
-                    'center': center,
-                    'width': w,
+                    'center': center_world_pixel.tolist(),
+                    'center_camera_pixel': center,  # Keep original camera coordinates for reference
+                    'width': w,  # Size remains the same in pixels
                     'height': h,
-                    'area': w * h,  # 使用轴对齐矩形的真实面积
-                    'corners': box.tolist(),
-                    'bounding_box': [x, y, w, h]  # 添加边界框信息
+                    'area': w * h,
+                    'corners': corners_world_pixel,  # World pixel coordinates
+                    'corners_camera_pixel': box.tolist(),  # Keep original camera coordinates for reference
+                    'bounding_box': [world_bbox_x, world_bbox_y, world_bbox_w, world_bbox_h],  # World pixel coordinates
+                    'bounding_box_camera_pixel': [x, y, w, h],  # Keep original camera coordinates for reference
+                    'coordinate_frame': 'world_pixel'  # Indicate the coordinate frame used
                 }
                 
-                # 绘制矩形信息
+                # Display information uses camera pixel coordinates for visualization
+                cx, cy = center  # Use camera pixel coordinates for display
+                
+                # 绘制矩形信息 (using camera coordinates for display)
                 cv2.putText(display_img, f"{rect_name} ({w}x{h})", (cx - 40, cy - 20), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 
@@ -285,7 +337,7 @@ class RectangleDetector(Node):
             if not rect_history['centers']:
                 continue
                 
-            # 计算中心点的平均值
+            # 计算中心点的平均值 (already in world_pixel coordinates)
             centers = rect_history['centers']
             avg_center_x = sum(c[0] for c in centers) / len(centers)
             avg_center_y = sum(c[1] for c in centers) / len(centers)
@@ -295,24 +347,34 @@ class RectangleDetector(Node):
             avg_height = sum(rect_history['heights']) / len(rect_history['heights'])
             avg_area = sum(rect_history['areas']) / len(rect_history['areas'])
             
-            # 计算角点的平均值 (轴对齐矩形)
+            # 计算角点的平均值 (corners are already in world_pixel coordinates)
             corners_list = rect_history['corners']
             if corners_list and len(corners_list) > 0:
-                # 对于轴对齐矩形，我们可以从平均中心点和平均宽高重新计算精确的角点
-                avg_x = avg_center_x - avg_width/2
-                avg_y = avg_center_y - avg_height/2
-                
-                # 创建标准的轴对齐矩形角点
-                avg_corners = [
-                    [float(avg_x), float(avg_y)],                           # 左上角
-                    [float(avg_x + avg_width), float(avg_y)],               # 右上角
-                    [float(avg_x + avg_width), float(avg_y + avg_height)],  # 右下角
-                    [float(avg_x), float(avg_y + avg_height)]               # 左下角
-                ]
-            else:
+                # Average the world pixel coordinates
                 avg_corners = []
+                for corner_idx in range(4):  # 4 corners
+                    corner_x_sum = sum(corners[corner_idx][0] for corners in corners_list)
+                    corner_y_sum = sum(corners[corner_idx][1] for corners in corners_list)
+                    avg_corner_x = corner_x_sum / len(corners_list)
+                    avg_corner_y = corner_y_sum / len(corners_list)
+                    avg_corners.append([float(avg_corner_x), float(avg_corner_y)])
+            else:
+                # Fallback: calculate corners directly in world_pixel frame
+                # No need to convert to camera and back - just calculate corners directly
+                world_center_x, world_center_y = avg_center_x, avg_center_y
+                half_w = avg_width / 2
+                half_h = avg_height / 2
+                
+                # Calculate corners directly in world_pixel coordinates
+                # Note: In world_pixel frame, Y increases upward (opposite of camera frame)
+                avg_corners = [
+                    [world_center_x - half_w, world_center_y + half_h],  # Top-left in world_pixel
+                    [world_center_x + half_w, world_center_y + half_h],  # Top-right in world_pixel  
+                    [world_center_x + half_w, world_center_y - half_h],  # Bottom-right in world_pixel
+                    [world_center_x - half_w, world_center_y - half_h]   # Bottom-left in world_pixel
+                ]
             
-            # 计算平均边界框 (如果存在)
+            # 计算平均边界框 (in world_pixel coordinates)
             avg_bounding_box = None
             if 'bounding_boxes' in rect_history and rect_history['bounding_boxes']:
                 bboxes = rect_history['bounding_boxes']
@@ -322,6 +384,7 @@ class RectangleDetector(Node):
                 avg_bbox_h = sum(bbox[3] for bbox in bboxes) / len(bboxes)
                 avg_bounding_box = [float(avg_bbox_x), float(avg_bbox_y), float(avg_bbox_w), float(avg_bbox_h)]
             
+            # Store averaged data in world_pixel coordinates
             average_data[rect_name] = {
                 'center': [float(avg_center_x), float(avg_center_y)],
                 'width': float(avg_width),
@@ -330,40 +393,47 @@ class RectangleDetector(Node):
                 'corners': avg_corners,
                 'bounding_box': avg_bounding_box,
                 'sample_count': len(centers),
-                'type': 'axis_aligned_rectangle'  # 标记为轴对齐矩形
+                'type': 'axis_aligned_rectangle',
+                'coordinate_frame': 'world_pixel'  # Specify coordinate frame
             }
             
-            # 为环境文件添加多边形
+            # 为环境文件添加多边形 (use world_pixel coordinates)
             if avg_corners:
                 polygons.append({
                     'vertices': [[int(point[0]), int(point[1])] for point in avg_corners]
                 })
+        
+        # Get coordinate frame information
+        frame_info = get_frame_info()
         
         # 添加时间戳和坐标系统信息
         data_to_save = {
             'timestamp': time.time(),
             'date_time': time.strftime('%Y-%m-%d %H:%M:%S'),
             'tracking_duration_seconds': self.tracking_duration,
-            'coordinate_system': {
-                'note': 'All coordinates are relative to the cropped image from camera_node',
+            'coordinate_frames': frame_info,  # Include all coordinate frame definitions
+            'data_coordinate_frame': 'world_pixel',  # Specify which frame the data uses
+            'coordinate_system_legacy': {
+                'note': 'Legacy note - All coordinates are now in world_pixel frame',
                 'original_camera_resolution': '1280x720',
                 'crop_applied': 'img[65:665, 50:1150]',
-                'cropped_dimensions': f'{self.image_width}x{self.image_height}',
+                'cropped_dimensions': f'{IMG_WIDTH}x{IMG_HEIGHT}',
                 'crop_offset': {'x': 50, 'y': 65}
             },
             'rectangles': average_data
         }
         
-        # 使用捕获的图像尺寸
-        img_width = self.image_width
-        img_height = self.image_height
+        # 使用固定的裁剪图像尺寸 (use fixed cropped dimensions from coordinate transform constants)
+        img_width = self.image_width   # 1100
+        img_height = self.image_height # 600
         
-        # 创建环境数据结构
+        # 创建环境数据结构 (using world_pixel coordinate bounds)
         environment_data = {
             'polygons': polygons,
-            'coord_bounds': [10, img_width, 10, img_height],
+            'coord_bounds': [0, img_width, 0, img_height],  # World pixel bounds: [x_min, x_max, y_min, y_max]
             'width': img_width,
-            'height': img_height
+            'height': img_height,
+            'coordinate_frame': 'world_pixel'
         }
         
         # 保存矩形数据为JSON文件

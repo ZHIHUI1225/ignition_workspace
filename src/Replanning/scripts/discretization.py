@@ -6,7 +6,7 @@ sys.path.append('/root/workspace/config')
 from config_loader import config
 
 # Import coordinate transformation utilities
-from coordinate_transform import convert_pixel_to_world_coordinates
+from coordinate_transform import convert_world_pixel_to_world_meter
 
 def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segments, Flagb, reeb_graph):
     """
@@ -33,7 +33,7 @@ def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segment
     seg_times = time_segments[i]
     # Convert from pixels to world coordinates using shared coordinate transformation
     pos_pixels = reeb_graph.nodes[waypoints[i]].configuration
-    pos = convert_pixel_to_world_coordinates(pos_pixels)
+    pos = convert_world_pixel_to_world_meter(pos_pixels)
     angle = phi[i] + Flagb[i]*np.pi/2
     
     # Separate arc and line parts
@@ -104,7 +104,7 @@ def discretize_segment(segment_idx, waypoints, phi, r0, l, phi_new, time_segment
         # Get the final waypoint position
         # Convert from pixels to world coordinates using shared coordinate transformation
         final_pos_pixels = reeb_graph.nodes[waypoints[i+1]].configuration
-        final_pos = convert_pixel_to_world_coordinates(final_pos_pixels)
+        final_pos = convert_world_pixel_to_world_meter(final_pos_pixels)
         
         # If the final position is not close enough to our last point, add it
         if len(x_discrete) > 0:
@@ -151,22 +151,10 @@ def visualize_segment_parts(waypoints, phi, r0, l, phi_new, time_segments, Flagb
     for i in range(N):
         # Get the segment info
         seg_times = time_segments[i]
-        # Convert from pixels to world coordinates with proper coordinate transformation
+        # Convert from world_pixel to world_meter coordinates using shared coordinate transformation
         start_pos_pixels = reeb_graph.nodes[waypoints[i]].configuration
-        
-        # Transform from camera pixel coordinates to world coordinates
-        img_height = 600  # Cropped image height (665-65=600)
-        pixel_x = start_pos_pixels[0]
-        pixel_y = start_pos_pixels[1]
-        
-        # World coordinates in pixels (relative to left-lower corner)
-        world_x_px = pixel_x  # X direction is the same
-        world_y_px = img_height - pixel_y  # Flip Y axis for world coordinates
-        
-        # Convert to world coordinates in meters
-        world_x = world_x_px * 0.0023  # Convert pixels to meters
-        world_y = world_y_px * 0.0023  # Convert pixels to meters
-        start_pos = [world_x, world_y]
+        start_pos_world_meter = convert_world_pixel_to_world_meter(start_pos_pixels)
+        start_pos = [start_pos_world_meter[0], start_pos_world_meter[1]]
         
         angle = phi[i] + Flagb[i]*np.pi/2
         
@@ -213,7 +201,9 @@ def visualize_segment_parts(waypoints, phi, r0, l, phi_new, time_segments, Flagb
     
     # Plot waypoints
     for i, wp_idx in enumerate(waypoints):
-        pos = reeb_graph.nodes[wp_idx].configuration/100.0
+        # Convert from pixels to world coordinates using shared coordinate transformation
+        pos_pixels = reeb_graph.nodes[wp_idx].configuration
+        pos = convert_world_pixel_to_world_meter(pos_pixels)
         plt.plot(pos[0], pos[1], 'ko', markersize=8)
         plt.text(pos[0], pos[1], f'W{wp_idx}', fontsize=12)
     
@@ -540,11 +530,11 @@ def compare_discretization_with_spline(waypoints, phi, r0, l, phi_new, time_segm
         
         # Find corresponding segment in the trajectory
         # We'll use the waypoint positions to find the nearest points in the trajectory
-        # Convert from pixels to meters
+        # Convert from pixels to world coordinates using shared coordinate transformation
         start_pos_pixels = reeb_graph.nodes[waypoints[start_idx]].configuration
-        start_pos = config.pixels_to_meters(start_pos_pixels)
+        start_pos = convert_world_pixel_to_world_meter(start_pos_pixels)
         end_pos_pixels = reeb_graph.nodes[waypoints[end_idx]].configuration
-        end_pos = config.pixels_to_meters(end_pos_pixels)
+        end_pos = convert_world_pixel_to_world_meter(end_pos_pixels)
         
         # Find closest trajectory points to these waypoints
         start_dists = [(x-start_pos[0])**2 + (y-start_pos[1])**2 for x, y in zip(x_uniform, y_uniform)]
@@ -608,9 +598,9 @@ def compare_discretization_with_spline(waypoints, phi, r0, l, phi_new, time_segm
     
     # Plot waypoints
     for i, wp_idx in enumerate(waypoints):
-        # Convert from pixels to meters
+        # Convert from pixels to world coordinates using shared coordinate transformation
         pos_pixels = reeb_graph.nodes[wp_idx].configuration
-        pos = config.pixels_to_meters(pos_pixels)
+        pos = convert_world_pixel_to_world_meter(pos_pixels)
         plt.plot(pos[0], pos[1], 'ko', markersize=8)
         plt.text(pos[0], pos[1], f'W{wp_idx}', fontsize=12)
     

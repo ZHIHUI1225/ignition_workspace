@@ -2,11 +2,20 @@
 import cv2
 import numpy as np
 import rclpy
+import sys
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
+
+# Import coordinate transformation functions
+sys.path.append('/root/workspace/src/Replanning/scripts')
+from coordinate_transform import (
+    convert_camera_pixel_to_world_meter,
+    convert_camera_angle_to_world_angle,
+    get_frame_info
+)
 
 class CameraNode(Node):
     def __init__(self):
@@ -160,6 +169,16 @@ class CameraNode(Node):
         self.get_logger().info(f"Max Z distance: {self.max_z_distance}m")
         self.get_logger().info(f"Target markers: {sorted(self.required_marker_ids)}")
         self.get_logger().info("=== End Configuration ===")
+        
+        # Log coordinate frame information
+        try:
+            frame_info = get_frame_info()
+            self.get_logger().info("=== Coordinate Frame Configuration ===")
+            for frame_name, frame_data in frame_info.items():
+                self.get_logger().info(f"{frame_data['name']}: Units={frame_data['units']}")
+            self.get_logger().info("Publishing robot poses in world frame (origin: left-lower corner, Y-up, meters)")
+        except Exception as e:
+            self.get_logger().warn(f"Could not load coordinate frame info: {e}")
 
     def create_pose_message(self, rvec, tvec, frame_id="camera_frame"):
         """Convert rotation and translation vectors to Odometry message with validation"""
@@ -213,22 +232,20 @@ class CameraNode(Node):
             img_height = 600  # Cropped image height (665-65=600)
             img_width = 1100   # Cropped image width (1150-50=1100)
             
-            # Transform from camera pixel coordinates to world coordinates
-            # Camera origin: left-upper corner, World origin: left-lower corner
-            # Camera X-right → World X-right (same direction)
-            # Camera Y-down → World Y-up (flip and offset)
-            
             # Add image center offset since camera pose is relative to camera center
             center_x_px = img_width / 2
             center_y_px = img_height / 2
             
-            # World coordinates in pixels (relative to left-lower corner)
-            world_x_px = center_x_px + camera_x_px  # Add camera center offset
-            world_y_px = img_height - (center_y_px + camera_y_px)  # Flip Y axis and add offset
+            # Camera pixel coordinates relative to cropped image
+            camera_pixel_x = center_x_px + camera_x_px  # Add camera center offset
+            camera_pixel_y = center_y_px + camera_y_px  # Add camera center offset
             
-            # Convert to world coordinates in meters
-            world_x = world_x_px * 0.0023  # Convert pixels to meters
-            world_y = world_y_px * 0.0023  # Convert pixels to meters
+            # Use coordinate transformation function to convert to world meters
+            camera_pixel_pos = [camera_pixel_x, camera_pixel_y]
+            world_meter_pos = convert_camera_pixel_to_world_meter(camera_pixel_pos)
+            
+            world_x = float(world_meter_pos[0])
+            world_y = float(world_meter_pos[1])
             world_z = 0.0  # Robots are on the ground plane
             
             # Set transformed position
@@ -268,13 +285,16 @@ class CameraNode(Node):
             # Extract only the Z-axis rotation (yaw) for ground robots
             # This assumes robots move in 2D plane with only yaw rotation
             # Extract yaw angle from rotation matrix
-            yaw = np.arctan2(world_rotation_matrix[1, 0], world_rotation_matrix[0, 0])
+            camera_yaw = np.arctan2(world_rotation_matrix[1, 0], world_rotation_matrix[0, 0])
+            
+            # Convert camera frame angle to world frame angle
+            world_yaw = convert_camera_angle_to_world_angle(camera_yaw)
             
             # Create quaternion for pure Z-axis rotation (yaw only)
             qx = 0.0
             qy = 0.0
-            qz = np.sin(yaw / 2.0)
-            qw = np.cos(yaw / 2.0)
+            qz = np.sin(world_yaw / 2.0)
+            qw = np.cos(world_yaw / 2.0)
             
             # Set orientation (quaternion)
             odom_msg.pose.pose.orientation.x = float(qx)

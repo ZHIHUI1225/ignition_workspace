@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'mpc_test_node = mpc_test_package.mpc_test_node:main',
+            'cmd_vel_publisher = mpc_test_package.cmd_vel_publisher:main',
         ],
     },
 )

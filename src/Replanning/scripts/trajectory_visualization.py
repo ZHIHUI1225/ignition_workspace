@@ -21,7 +21,7 @@ import sys
 sys.path.append('/root/workspace/config')
 
 # Import coordinate transformation utilities
-from coordinate_transform import convert_pixel_to_world_coordinates
+from coordinate_transform import convert_world_pixel_to_world_meter
 
 try:
     from config_loader import config
@@ -173,9 +173,9 @@ def plot_trajectory_with_time(waypoints, phi, r0, l, phi_new, time_segments, fig
             Flagb = [0] * len(waypoints)
     
     for wp_idx in waypoints:
-        # Convert from pixels to world coordinates using shared coordinate transformation
-        node_pos_pixels = reeb_graph.nodes[wp_idx].configuration
-        world_pos = convert_pixel_to_world_coordinates(node_pos_pixels)
+        # Convert from world_pixel to world_meter coordinates directly
+        node_pos_world_pixel = reeb_graph.nodes[wp_idx].configuration
+        world_pos = convert_world_pixel_to_world_meter(node_pos_world_pixel)
         
         wp_x.append(world_pos[0])
         wp_y.append(world_pos[1])

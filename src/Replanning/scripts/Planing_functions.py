@@ -883,6 +883,29 @@ def Planning_error_withinSC(waypoints_file_path,Normalization_path,environment_f
         plt.savefig(figure_file)
     else:    
         print("Solver failed!")
+        # Print detailed solver statistics for debugging
+        stats = solver.stats()
+        print(f"Solver statistics:")
+        print(f"  Return status: {stats.get('return_status', 'unknown')}")
+        print(f"  Success: {stats.get('success', False)}")
+        print(f"  Iterations: {stats.get('iter_count', 'unknown')}")
+        print(f"  Objective value: {sol['f']}")
+        print(f"  Constraint violation: {stats.get('constr_viol', 'unknown')}")
+        
+        # Still save the solution data even if solver "failed" but found a solution
+        phi_opt = sol['x'].full().flatten()
+        print(f"Final phi values: {phi_opt}")
+        
+        # Save the result anyway - sometimes Ipopt reports "failure" but still finds good solutions
+        data = {
+            'phi': phi_opt.tolist(),
+            'objective_value': float(sol['f']),
+            'solver_success': False,
+            'solver_stats': {k: str(v) for k, v in stats.items()},
+            'coordinate_frame': 'world_pixel'
+        }
+        with open(Result_file, 'w') as file:
+            json.dump(data, file, indent=4)
 
 
 # normally unsolved!

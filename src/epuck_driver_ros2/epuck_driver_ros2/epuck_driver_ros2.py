@@ -22,8 +22,8 @@ IMAGE_FORMAT = 'RGB_365'
 CAMERA_ZOOM = 8
 
 ## Epuck dimensions
-# Wheel Radio (cm)
-WHEEL_DIAMETER = 4
+# Wheel Radio (cm) - CORRECTED from official e-puck2 documentation
+WHEEL_DIAMETER = 4.1  # 41 mm according to official specs
 # Separation between wheels (cm)
 WHEEL_SEPARATION = 5.3
 
@@ -60,7 +60,10 @@ class EPuckDriverROS2(Node):
         
         # Get parameters
         epuck_address = self.get_parameter('epuck_address').get_parameter_value().string_value
-        self._name = self.get_parameter('epuck_name').get_parameter_value().string_value
+        # Use the node's namespace as the robot name (removes leading '/' if present)
+        self._name = self.get_namespace().lstrip('/')
+        if not self._name:  # If no namespace, use epuck_name parameter as fallback
+            self._name = self.get_parameter('epuck_name').get_parameter_value().string_value
         init_xpos = self.get_parameter('xpos').get_parameter_value().double_value
         init_ypos = self.get_parameter('ypos').get_parameter_value().double_value
         init_theta = self.get_parameter('theta').get_parameter_value().double_value
@@ -69,7 +72,7 @@ class EPuckDriverROS2(Node):
             self.get_logger().error('epuck_address parameter is required!')
             return
             
-        self._bridge = ePuck(epuck_address, True)  # Enable debug for troubleshooting
+        self._bridge = ePuck(epuck_address, False)  # Disable debug to reduce console output
 
         self.enabled_sensors = {}
         for sensor in sensors:
@@ -90,6 +93,15 @@ class EPuckDriverROS2(Node):
         self.startTime = time.time()
         self.endTime = time.time()
         self.br = TransformBroadcaster(self)
+        
+        # Add odometry publisher
+        self.odom_publisher = self.create_publisher(Odometry, 'odom', 10)
+        
+        # Motor speed tracking for velocity feedback
+        self.commanded_left_speed = 0.0
+        self.commanded_right_speed = 0.0
+        self.current_linear_vel = 0.0
+        self.current_angular_vel = 0.0
 
     def greeting(self):
         """
@@ -109,10 +121,29 @@ class EPuckDriverROS2(Node):
 
     def setup_sensors(self):
         """
-        Disable all sensors - only motor control enabled
+        Enable minimal sensors for motor control and velocity feedback
         """
-        # Disable all sensors to reduce data transfer
-        self._bridge.enable()  # Enable only basic communication
+        # Enable basic communication
+        self._bridge.enable()
+        
+        # Enable motor position sensing for odometry/velocity feedback
+        # Use the correct method for enabling motor position sensors
+        try:
+            if hasattr(self._bridge, 'enable_motor_position'):
+                self._bridge.enable_motor_position()
+                self.get_logger().info("Motor position sensors enabled via enable_motor_position()")
+            elif hasattr(self._bridge, 'set_motors_position_sensor'):
+                self._bridge.set_motors_position_sensor(True)
+                self.get_logger().info("Motor position sensors enabled via set_motors_position_sensor()")
+            elif hasattr(self._bridge, 'enable_position'):
+                self._bridge.enable_position()
+                self.get_logger().info("Motor position sensors enabled via enable_position()")
+            else:
+                # Only log this once
+                self.get_logger().info("Motor position sensing: Will attempt to read positions without explicit enabling")
+        except Exception as e:
+            self.get_logger().warn(f"Could not enable motor position sensors: {str(e)}")
+            self.get_logger().info("Will attempt to read motor positions anyway")
 
     def run(self):
         # Connect to the ePuck
@@ -133,7 +164,7 @@ class EPuckDriverROS2(Node):
         # Subscribe to Command Velocity Topic
         self.cmd_vel_subscription = self.create_subscription(
             Twist,
-            'cmd_vel',
+            'cmd_vel',  # Use relative topic name - namespace will be added by launch file
             self.handler_velocity,
             10)
 
@@ -145,13 +176,49 @@ class EPuckDriverROS2(Node):
 
     def update_sensors(self):
         """
-        Update function - now only sends motor commands without reading sensors
+        Update function - sends motor commands and reads motor positions for velocity feedback
         """
         try:
-            # Only send motor commands, no sensor reading
+            # Send motor commands and read sensor data
             self._bridge.step()
             
-            # No sensor data processing - removed all sensor publishing code
+            # Read motor positions for odometry and velocity feedback
+            try:
+                motor_pos = None
+                # Try different methods to get motor position
+                if hasattr(self._bridge, 'get_motor_position_sensor'):
+                    motor_pos = self._bridge.get_motor_position_sensor()
+                elif hasattr(self._bridge, 'get_motors_position'):
+                    motor_pos = self._bridge.get_motors_position()
+                elif hasattr(self._bridge, 'get_position'):
+                    motor_pos = self._bridge.get_position()
+                elif hasattr(self._bridge, 'motor_position'):
+                    motor_pos = self._bridge.motor_position
+                else:
+                    # List available methods for debugging
+                    if not hasattr(self, '_methods_logged'):
+                        methods = [method for method in dir(self._bridge) if not method.startswith('_')]
+                        self.get_logger().info(f"Available ePuck methods: {sorted(methods)}")
+                        self._methods_logged = True
+                
+                if motor_pos is not None and len(motor_pos) >= 2:
+                    # Publish odometry with velocity information
+                    self.publish_odometry(motor_pos)
+                else:
+                    # If no motor position available, publish odometry without encoder feedback
+                    if not hasattr(self, '_no_encoder_logged'):
+                        self.get_logger().info("No motor position data available - using commanded velocities for odometry")
+                        self._no_encoder_logged = True
+                    # Still publish basic odometry based on commanded velocities
+                    self.publish_odometry_without_encoders()
+                    
+            except Exception as e:
+                # Only log motor position errors occasionally to avoid spam
+                if not hasattr(self, '_motor_error_count'):
+                    self._motor_error_count = 0
+                self._motor_error_count += 1
+                if self._motor_error_count % 50 == 1:  # Log every 50th error (once per 5 seconds)
+                    self.get_logger().debug(f'Could not read motor positions: {str(e)}')
             
         except Exception as e:
             self.get_logger().error(f'Error in update cycle: {str(e)}')
@@ -192,7 +259,7 @@ class EPuckDriverROS2(Node):
             self.br.sendTransform(t)
 
     def publish_odometry(self, motor_pos):
-        """Publish odometry based on motor positions"""
+        """Publish odometry based on motor positions with enhanced velocity feedback"""
         leftSteps = motor_pos[0]
         rightSteps = motor_pos[1]
         
@@ -221,7 +288,136 @@ class EPuckDriverROS2(Node):
         while self.theta < -math.pi:
             self.theta += 2.0 * math.pi
         
+        # Calculate actual velocities
+        self.endTime = time.time()
+        dt = self.endTime - self.startTime
+        
+        if dt > 0.001:  # Avoid division by very small numbers
+            self.current_linear_vel = deltaS / dt
+            self.current_angular_vel = self.deltaTheta / dt
+        else:
+            self.current_linear_vel = 0.0
+            self.current_angular_vel = 0.0
+        
         # Publish odometry
+        odom_msg = Odometry()
+        odom_msg.header.stamp = self.get_clock().now().to_msg()
+        odom_msg.header.frame_id = 'odom'
+        odom_msg.child_frame_id = 'base_link'
+        
+        # Position
+        odom_msg.pose.pose.position.x = self.x_pos
+        odom_msg.pose.pose.position.y = self.y_pos
+        odom_msg.pose.pose.position.z = 0.0
+        
+        # Orientation
+        cy = math.cos(self.theta * 0.5)
+        sy = math.sin(self.theta * 0.5)
+        odom_msg.pose.pose.orientation.x = 0.0
+        odom_msg.pose.pose.orientation.y = 0.0
+        odom_msg.pose.pose.orientation.z = sy
+        odom_msg.pose.pose.orientation.w = cy
+        
+        # Velocity (actual measured velocity from encoder feedback)
+        odom_msg.twist.twist.linear.x = self.current_linear_vel
+        odom_msg.twist.twist.linear.y = 0.0
+        odom_msg.twist.twist.linear.z = 0.0
+        odom_msg.twist.twist.angular.x = 0.0
+        odom_msg.twist.twist.angular.y = 0.0
+        odom_msg.twist.twist.angular.z = self.current_angular_vel
+        
+        # Add covariance information (rough estimates)
+        # Position covariance (x, y, z, roll, pitch, yaw)
+        odom_msg.pose.covariance = [0.001, 0.0, 0.0, 0.0, 0.0, 0.0,  # x
+                                   0.0, 0.001, 0.0, 0.0, 0.0, 0.0,   # y  
+                                   0.0, 0.0, 0.001, 0.0, 0.0, 0.0,   # z
+                                   0.0, 0.0, 0.0, 0.001, 0.0, 0.0,   # roll
+                                   0.0, 0.0, 0.0, 0.0, 0.001, 0.0,   # pitch
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.01]    # yaw
+        
+        # Velocity covariance (vx, vy, vz, vroll, vpitch, vyaw)
+        odom_msg.twist.covariance = [0.001, 0.0, 0.0, 0.0, 0.0, 0.0,  # vx
+                                    0.0, 0.001, 0.0, 0.0, 0.0, 0.0,   # vy
+                                    0.0, 0.0, 0.001, 0.0, 0.0, 0.0,   # vz
+                                    0.0, 0.0, 0.0, 0.001, 0.0, 0.0,   # vroll
+                                    0.0, 0.0, 0.0, 0.0, 0.001, 0.0,   # vpitch
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.01]    # vyaw
+        
+        self.odom_publisher.publish(odom_msg)
+        
+        # Also publish transform
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = f'{self._name}/base_link'
+        t.transform.translation.x = self.x_pos
+        t.transform.translation.y = self.y_pos
+        t.transform.translation.z = 0.0
+        t.transform.rotation = odom_msg.pose.pose.orientation
+        self.br.sendTransform(t)
+        
+        # Periodic velocity feedback logging (every 100 updates ≈ 10 seconds at 10Hz)
+        if hasattr(self, '_odom_log_count'):
+            self._odom_log_count += 1
+        else:
+            self._odom_log_count = 0
+            
+        if self._odom_log_count % 100 == 0:
+            # Calculate commanded velocities for comparison
+            cmd_linear = (self.commanded_left_speed + self.commanded_right_speed) * MOT_STEP_DIST / 2.0 / dt if dt > 0 else 0
+            cmd_angular = (self.commanded_right_speed - self.commanded_left_speed) * MOT_STEP_DIST / WHEEL_DISTANCE / dt if dt > 0 else 0
+            
+            self.get_logger().info(f'=== Velocity Feedback ===')
+            self.get_logger().info(f'Commanded: linear={cmd_linear:.3f} m/s, angular={cmd_angular:.3f} rad/s')
+            self.get_logger().info(f'Actual:    linear={self.current_linear_vel:.3f} m/s, angular={self.current_angular_vel:.3f} rad/s')
+            self.get_logger().info(f'Position: x={self.x_pos:.3f} m, y={self.y_pos:.3f} m, theta={self.theta:.3f} rad')
+        
+        # Update previous values
+        self.leftStepsPrev = leftSteps
+        self.rightStepsPrev = rightSteps
+        self.startTime = self.endTime
+
+    def publish_odometry_without_encoders(self):
+        """Publish odometry based on commanded velocities when encoders are not available"""
+        # Calculate time difference
+        self.endTime = time.time()
+        dt = self.endTime - self.startTime
+        
+        if dt > 0.001:  # Avoid division by very small numbers
+            # Use commanded velocities to estimate movement
+            # Convert commanded motor speeds back to linear/angular velocities
+            left_speed_ms = self.commanded_left_speed * MOT_STEP_DIST
+            right_speed_ms = self.commanded_right_speed * MOT_STEP_DIST
+            
+            # Calculate estimated robot movement based on commanded speeds
+            estimated_linear_vel = (left_speed_ms + right_speed_ms) / 2.0
+            estimated_angular_vel = (right_speed_ms - left_speed_ms) / WHEEL_DISTANCE
+            
+            # Update position based on estimated movement
+            deltaS = estimated_linear_vel * dt
+            deltaTheta = estimated_angular_vel * dt
+            
+            deltaX = deltaS * math.cos(self.theta + deltaTheta/2.0)
+            deltaY = deltaS * math.sin(self.theta + deltaTheta/2.0)
+            
+            self.x_pos += deltaX
+            self.y_pos += deltaY
+            self.theta += deltaTheta
+            
+            # Normalize theta
+            while self.theta > math.pi:
+                self.theta -= 2.0 * math.pi
+            while self.theta < -math.pi:
+                self.theta += 2.0 * math.pi
+            
+            # Store estimated velocities
+            self.current_linear_vel = estimated_linear_vel
+            self.current_angular_vel = estimated_angular_vel
+        else:
+            self.current_linear_vel = 0.0
+            self.current_angular_vel = 0.0
+        
+        # Publish odometry message
         odom_msg = Odometry()
         odom_msg.header.stamp = self.get_clock().now().to_msg()
         odom_msg.header.frame_id = 'odom'
@@ -240,12 +436,30 @@ class EPuckDriverROS2(Node):
         odom_msg.pose.pose.orientation.z = sy
         odom_msg.pose.pose.orientation.w = cy
         
-        # Velocity (simplified)
-        self.endTime = time.time()
-        dt = self.endTime - self.startTime
-        if dt > 0:
-            odom_msg.twist.twist.linear.x = deltaS / dt
-            odom_msg.twist.twist.angular.z = self.deltaTheta / dt
+        # Velocity (estimated from commanded speeds)
+        odom_msg.twist.twist.linear.x = self.current_linear_vel
+        odom_msg.twist.twist.linear.y = 0.0
+        odom_msg.twist.twist.linear.z = 0.0
+        odom_msg.twist.twist.angular.x = 0.0
+        odom_msg.twist.twist.angular.y = 0.0
+        odom_msg.twist.twist.angular.z = self.current_angular_vel
+        
+        # Higher covariance since we're estimating without encoder feedback
+        # Position covariance (x, y, z, roll, pitch, yaw)
+        odom_msg.pose.covariance = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0,   # x
+                                   0.0, 0.01, 0.0, 0.0, 0.0, 0.0,    # y  
+                                   0.0, 0.0, 0.01, 0.0, 0.0, 0.0,    # z
+                                   0.0, 0.0, 0.0, 0.01, 0.0, 0.0,    # roll
+                                   0.0, 0.0, 0.0, 0.0, 0.01, 0.0,    # pitch
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.1]     # yaw
+        
+        # Velocity covariance (higher uncertainty without encoders)
+        odom_msg.twist.covariance = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0,  # vx
+                                    0.0, 0.01, 0.0, 0.0, 0.0, 0.0,   # vy
+                                    0.0, 0.0, 0.01, 0.0, 0.0, 0.0,   # vz
+                                    0.0, 0.0, 0.0, 0.01, 0.0, 0.0,   # vroll
+                                    0.0, 0.0, 0.0, 0.0, 0.01, 0.0,   # vpitch
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.1]    # vyaw
         
         self.odom_publisher.publish(odom_msg)
         
@@ -260,9 +474,17 @@ class EPuckDriverROS2(Node):
         t.transform.rotation = odom_msg.pose.pose.orientation
         self.br.sendTransform(t)
         
-        # Update previous values
-        self.leftStepsPrev = leftSteps
-        self.rightStepsPrev = rightSteps
+        # Periodic velocity feedback logging (every 100 updates ≈ 10 seconds at 10Hz)
+        if hasattr(self, '_odom_fallback_log_count'):
+            self._odom_fallback_log_count += 1
+        else:
+            self._odom_fallback_log_count = 0
+            
+        if self._odom_fallback_log_count % 100 == 0:
+            self.get_logger().info(f'=== Velocity Feedback (Estimated) ===')
+            self.get_logger().info(f'Estimated: linear={self.current_linear_vel:.3f} m/s, angular={self.current_angular_vel:.3f} rad/s')
+            self.get_logger().info(f'Position: x={self.x_pos:.3f} m, y={self.y_pos:.3f} m, theta={self.theta:.3f} rad')
+        
         self.startTime = self.endTime
 
     def handler_velocity(self, data):
@@ -272,16 +494,42 @@ class EPuckDriverROS2(Node):
         linear = data.linear.x
         angular = data.angular.z
 
-        # Kinematic model for differential robot.
-        wl = (linear - (WHEEL_SEPARATION / 2.) * angular) / WHEEL_DIAMETER
-        wr = (linear + (WHEEL_SEPARATION / 2.) * angular) / WHEEL_DIAMETER
+        # Convert physical constants to meters for kinematic calculations
+        wheel_diameter_m = WHEEL_DIAMETER / 100.0  # Convert cm to m (0.041 m)
+        wheel_separation_m = WHEEL_SEPARATION / 100.0  # Convert cm to m (0.053 m)
 
-        # At input 1000, angular velocity is 1 cycle / s or  2*pi/s.
-        left_vel = wl * 1000.
-        right_vel = wr * 1000.
+        # Kinematic model for differential robot.
+        # wl and wr are wheel angular velocities in rad/s
+        wl = (linear - (wheel_separation_m / 2.) * angular) / (wheel_diameter_m / 2.)
+        wr = (linear + (wheel_separation_m / 2.) * angular) / (wheel_diameter_m / 2.)
+
+        # Convert wheel angular velocity (rad/s) to motor steps/s
+        # 1000 steps = 1 full wheel revolution = 2*pi radians
+        left_vel = wl * 1000. / (2 * math.pi)
+        right_vel = wr * 1000. / (2 * math.pi)
+        
+        # Apply e-puck2 speed limits (max 1200 steps/s according to specs)
+        MAX_STEPS_PER_SEC = 1200
+        left_vel = max(-MAX_STEPS_PER_SEC, min(MAX_STEPS_PER_SEC, left_vel))
+        right_vel = max(-MAX_STEPS_PER_SEC, min(MAX_STEPS_PER_SEC, right_vel))
+        
+        # Store commanded speeds for velocity feedback
+        self.commanded_left_speed = left_vel
+        self.commanded_right_speed = right_vel
         
         try:
             self._bridge.set_motors_speed(left_vel, right_vel)
+            
+            # Log velocity commands very occasionally (every 100 cycles ≈ 10 seconds at 10Hz)
+            if hasattr(self, '_velocity_log_count'):
+                self._velocity_log_count += 1
+            else:
+                self._velocity_log_count = 0
+                
+            if self._velocity_log_count % 100 == 0:
+                self.get_logger().info(f'Commanded: linear={linear:.3f} m/s, angular={angular:.3f} rad/s')
+                self.get_logger().info(f'Motor speeds: left={left_vel:.0f}, right={right_vel:.0f} steps/s (max: {MAX_STEPS_PER_SEC})')
+                
         except Exception as e:
             self.get_logger().error(f'Error setting motor speed: {str(e)}')
 

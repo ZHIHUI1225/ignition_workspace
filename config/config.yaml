@@ -85,7 +85,7 @@ coordinate_conversion:
 
 # Planning Parameters
 planning:
-  phi0: 1.2566370614359172  # Initial angle (0.4 * pi)
+  phi0: 0.0 # Initial angle 0
   deltal: 0.02              # Small segment length for discretization (m)
 
 # Arc Range Configuration
@@ -99,8 +99,8 @@ paths:
 
 # Start and Goal Poses
 poses:
-  start_pose: [200.0, 50.0, 1.2560000000000002]  # [x, y, theta]
-  goal_pose: [1050.0, 80.0, 3.14159265]   # [x, y, theta]
+  start_pose: [150.0, 550.0, 1.2560000000000002]  # [x, y, theta]
+  goal_pose: [1050.0, 580.0, 3.14159265]   # [x, y, theta]
 
 # Genetic Algorithm Parameters
 genetic_algorithm:
