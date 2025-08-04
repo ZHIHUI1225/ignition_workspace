@@ -136,32 +136,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /robot0/odom
       Value: true
-    - Class: rviz_default_plugins/TF
+    - Alpha: 1
+      Angular Scale: 1
+      Class: rviz_default_plugins/Twist
       Enabled: true
-      Filter (blacklist): ""
-      Filter (whitelist): ""
-      Frame Timeout: 15
-      Frames:
-        All Enabled: true
-        base_link:
-          Value: true
-        odom:
-          Value: true
-        robot0/base_link:
-          Value: true
-        world:
-          Value: true
-      Marker Scale: 1
-      Name: TF
-      Show Arrows: true
-      Show Axes: true
-      Show Names: true
-      Tree:
-        world:
-          odom:
-            robot0/base_link:
-              {}
-      Update Interval: 0
+      Linear Scale: 1
+      Name: Cmd Vel
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot0/cmd_vel
       Value: true
   Enabled: true
   Global Options:

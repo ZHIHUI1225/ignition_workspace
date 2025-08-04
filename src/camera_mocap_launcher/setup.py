@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'camera_node = camera_mocap_launcher.camera_node:main',
             'rectangle_detector = camera_mocap_launcher.rectangle_detector:main',
+            'plot_path_on_video = camera_mocap_launcher.plot_path_on_video:main',
         ],
     },
 )

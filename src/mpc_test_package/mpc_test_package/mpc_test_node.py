@@ -76,9 +76,9 @@ class MPCTestNode(Node):
         # Transform broadcaster for visualization
         self.tf_broadcaster = TransformBroadcaster(self)
         
-        # Control timer - run MPC at 2Hz
+        # Control timer - run MPC at 10Hz
         self.control_timer = self.create_timer(
-            0.5,  # 0.5 seconds = 2Hz
+            0.1,  # 0.1 seconds = 10Hz
             self.control_loop
         )
         
@@ -139,7 +139,31 @@ class MPCTestNode(Node):
             # Log initial trajectory information for debugging
             first_ref = self.ref_trajectory[0]
             self.get_logger().info(f'Setting reference trajectory. First point: x={first_ref[0]:.3f}, y={first_ref[1]:.3f}, θ={first_ref[2]:.3f}')
-            self.get_logger().info('Note: Robot should be positioned close to the trajectory start for best results')
+            self.get_logger().info('Note: Will find closest trajectory point when robot position is available')
+    
+    def find_closest_trajectory_point(self, current_position):
+        """Find the closest point on the reference trajectory to current robot position"""
+        if not self.ref_trajectory:
+            return 0
+        
+        min_distance = float('inf')
+        closest_index = 0
+        
+        current_x, current_y = current_position[0], current_position[1]
+        
+        for i, traj_point in enumerate(self.ref_trajectory):
+            # Calculate Euclidean distance to trajectory point
+            distance = np.sqrt((current_x - traj_point[0])**2 + (current_y - traj_point[1])**2)
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_index = i
+        
+        self.get_logger().info(f'Found closest trajectory point: index {closest_index}/{len(self.ref_trajectory)}, distance: {min_distance:.3f}m')
+        closest_point = self.ref_trajectory[closest_index]
+        self.get_logger().info(f'Closest point: x={closest_point[0]:.3f}, y={closest_point[1]:.3f}, θ={closest_point[2]:.3f}')
+        
+        return closest_index
             
     def create_test_trajectory(self):
         """Create a simple test trajectory as fallback"""
@@ -189,10 +213,20 @@ class MPCTestNode(Node):
                 position_x, position_y, yaw, linear_x, angular_z
             ])
             
-            # Log first odometry received
+            # Log first odometry received and find closest trajectory point
             if not hasattr(self, '_first_odom_received'):
                 self._first_odom_received = True
                 self.get_logger().info(f'First Odometry received: x={position_x:.3f}, y={position_y:.3f}, θ={yaw:.3f}')
+                
+                # Find closest trajectory point and start from there
+                if self.ref_trajectory:
+                    self.trajectory_index = self.find_closest_trajectory_point([position_x, position_y])
+                    self.get_logger().info(f'Starting trajectory following from index {self.trajectory_index}')
+                    
+                    # Update MPC with new reference starting from closest point
+                    if self.mpc is not None:
+                        ref_array = self.get_reference_trajectory_segment()
+                        self.mpc.set_reference_trajectory(ref_array)
             
             # Publish transform for visualization
             self.publish_robot_transform(msg)
@@ -281,7 +315,7 @@ class MPCTestNode(Node):
         
         # Check if we have valid pose data
         if self.current_state is None:
-            if self._control_loop_counter % 4 == 1:  # Log every 2 seconds
+            if self._control_loop_counter % 20 == 1:  # Log every 2 seconds at 10Hz
                 self.get_logger().warn('No pose data received yet, skipping control loop')
             return
         
@@ -290,7 +324,7 @@ class MPCTestNode(Node):
             return
         
         # Debug: Log that we're entering the control computation
-        if self._control_loop_counter % 4 == 1:
+        if self._control_loop_counter % 20 == 1:  # Log every 2 seconds at 10Hz
             self.get_logger().info(f'Control loop {self._control_loop_counter}: Computing MPC control...')
         
         try:
@@ -298,14 +332,14 @@ class MPCTestNode(Node):
             ref_array = self.get_reference_trajectory_segment()
             
             # Debug: Log reference trajectory info
-            if self._control_loop_counter % 10 == 1:
+            if self._control_loop_counter % 50 == 1:  # Log every 5 seconds at 10Hz
                 self.get_logger().info(f'Reference trajectory shape: {ref_array.shape}, first point: [{ref_array[0,0]:.3f}, {ref_array[1,0]:.3f}]')
             
             # Update MPC reference
             self.mpc.set_reference_trajectory(ref_array)
             
             # Debug: Log before MPC update
-            if self._control_loop_counter % 4 == 1:
+            if self._control_loop_counter % 20 == 1:  # Log every 2 seconds at 10Hz
                 self.get_logger().info(f'Calling MPC update with state: [{self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f}]')
                 # Debug: Also log the current reference point
                 current_ref = self.ref_trajectory[self.trajectory_index]
@@ -320,7 +354,7 @@ class MPCTestNode(Node):
             
             # Debug: Log MPC result with more detail
             if control_cmd is not None:
-                if self._control_loop_counter % 4 == 1:
+                if self._control_loop_counter % 20 == 1:  # Log every 2 seconds at 10Hz
                     self.get_logger().info(f'MPC returned control: v={control_cmd[0]:.3f}, ω={control_cmd[1]:.3f}')
             else:
                 self.get_logger().warn('MPC returned None control command')
@@ -342,7 +376,7 @@ class MPCTestNode(Node):
                 self._control_counter = 0
             self._control_counter += 1
             
-            if self._control_counter % 2 == 1:  # Log every 1 second (2 * 0.5s)
+            if self._control_counter % 10 == 1:  # Log every 1 second at 10Hz (10 * 0.1s)
                 self.get_logger().info(
                     f'Control: v={cmd_msg.linear.x:.3f} m/s, ω={cmd_msg.angular.z:.3f} rad/s | '
                     f'State: x={self.current_state[0]:.3f}, y={self.current_state[1]:.3f}, '
@@ -378,9 +412,17 @@ class MPCTestNode(Node):
                 (self.current_state[1] - ref_point[1])**2
             )
             
+            # If robot is very far from current reference point, find closest point again
+            if distance > 1.0:  # 1 meter threshold for re-searching
+                self.get_logger().warn(f'Robot far from trajectory (distance: {distance:.3f}m), finding new closest point')
+                self.trajectory_index = self.find_closest_trajectory_point(self.current_state[:2])
+                return
+            
             # Advance if we're close to current reference point
             if distance < 0.1:  # 10cm threshold
                 self.trajectory_index = min(self.trajectory_index + 1, len(self.ref_trajectory) - 1)
+                if self.trajectory_index % 10 == 0:  # Log progress every 10 points
+                    self.get_logger().info(f'Advanced to trajectory point {self.trajectory_index}/{len(self.ref_trajectory)}')
                 
         # Check if we've completed the trajectory
         if self.trajectory_index >= len(self.ref_trajectory) - 1:

@@ -11,21 +11,21 @@ import os
 
 class MobileRobotMPC:
     def __init__(self):
-        # MPC parameters - optimized for position convergence
-        self.N = 8           # Longer horizon for better convergence
-        self.N_c = 3         # Longer control horizon for smoother control
-        self.dt = 0.5        # Time step (increased from 0.1s to 0.5s)
+                # MPC parameters - optimized for 10Hz control frequency
+        self.N = 8           # Prediction horizon (8 steps)
+        self.N_c = 3         # Control horizon for smoother control
+        self.dt = 0.1        # Time step matching 10Hz control frequency
         
-        # Increased weights for better position convergence
-        self.Q = np.diag([150.0, 150.0, 20.0, 1.0, 1.0])  # Higher position weights (x, y, theta, v, omega)
-        self.R = np.diag([0.5, 0.5])                       # Lower control weights for more aggressive control
-        self.F = np.diag([300.0, 300.0, 50.0, 2.0, 2.0])  # Much higher terminal cost weights for convergence
+        # Reduced weights to handle large initial errors better
+        self.Q = np.diag([50.0, 50.0, 10.0, 1.0, 1.0])   # Lower position weights for large errors
+        self.R = np.diag([1.0, 1.0])                      # Higher control weights for stability
+        self.F = np.diag([100.0, 100.0, 20.0, 2.0, 2.0]) # Lower terminal cost to reduce infeasibility
         
-        # Conservative velocity constraints for numerical stability
-        self.max_vel = 0.2       # m/s
-        self.min_vel = 0.0    # m/s - minimal reverse
-        self.max_omega = np.pi/3 # rad/s
-        self.min_omega = -np.pi/3 # rad/s
+        # More aggressive velocity constraints to handle large errors
+        self.max_vel = 0.5       # m/s - increased for faster convergence
+        self.min_vel = -0.1      # m/s - allow small reverse
+        self.max_omega = np.pi/2 # rad/s - increased for faster turning
+        self.min_omega = -np.pi/2 # rad/s
         
         # Numerical stability parameters
         self.eps = 1e-6          # Small regularization term
