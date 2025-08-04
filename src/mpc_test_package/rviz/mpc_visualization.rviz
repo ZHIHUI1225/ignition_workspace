@@ -72,7 +72,7 @@ Visualization Manager:
         Value: /robot0/reference_path
       Value: true
     - Class: rviz_default_plugins/Path
-      Color: 255; 25; 0
+      Color: 0; 100; 255
       Enabled: true
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
@@ -107,13 +107,13 @@ Visualization Manager:
           Frame: Local
           Offset: 1
           Scale: 1
-          Value: true
+          Value: false
         Position:
           Alpha: 0.30000001192092896
           Color: 204; 51; 204
           Scale: 1
-          Value: true
-        Value: true
+          Value: false
+        Value: false
       Enabled: true
       Keep: 100
       Name: Robot Odometry

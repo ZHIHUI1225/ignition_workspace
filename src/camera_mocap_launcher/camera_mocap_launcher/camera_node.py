@@ -117,6 +117,14 @@ class CameraNode(Node):
         # Setup display window (no mouse tracking needed)
         cv2.namedWindow('Camera Feed')
         
+        # Setup video recording
+        self.video_output_path = '/root/workspace/camera_recording.mp4'
+        self.fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.video_fps = 30
+        self.video_writer = None  # Will be initialized on first frame
+        self.is_recording = True  # Flag to control recording
+        self.get_logger().info(f"Video will be saved to: {self.video_output_path}")
+        
         # ROI tracking for consecutive frames
         self.previous_markers = {}  # Store previous marker positions {marker_id: (center_x, center_y)}
         self.roi_expansion = 100  # Pixels to expand around previous marker position
@@ -124,6 +132,15 @@ class CameraNode(Node):
         self.frame_count = 0
         self.show_roi_debug = False  # Set to True to visualize ROI regions
         self.required_marker_ids = {0, 1, 2, 5, 6, 7}  # All required marker IDs
+        
+        # Predictive pose estimation for robustness
+        self.pose_history = {}  # Store pose history for each marker: {marker_id: [(timestamp, x, y, theta), ...]}
+        self.max_history_length = 10  # Keep last 10 poses for prediction
+        self.prediction_timeout = 0.5  # Predict for up to 0.5 seconds without detection
+        self.last_detection_time = {}  # Track last detection time for each marker
+        self.predicted_poses = {}  # Store current predicted poses
+        
+        self.get_logger().info('Pose prediction system initialized for robust tracking')
         
         # Log coordinate frame information
         try:
@@ -206,20 +223,108 @@ class CameraNode(Node):
             # Update previous markers for next frame
             self.previous_markers = current_markers
 
-    def publish_aruco_pose_simple(self, marker_id, center_x, center_y, camera_angle_rad):
-        """Publish ArUco marker pose using simple center position and X-axis orientation"""
+    def update_pose_history(self, marker_id, world_x, world_y, world_angle_rad):
+        """Update pose history for predictive estimation"""
+        current_time = self.get_clock().now().nanoseconds / 1e9  # Convert to seconds
+        
+        # Initialize history if not exists
+        if marker_id not in self.pose_history:
+            self.pose_history[marker_id] = []
+        
+        # Add new pose to history
+        pose_data = (current_time, world_x, world_y, world_angle_rad)
+        self.pose_history[marker_id].append(pose_data)
+        
+        # Keep only recent history
+        if len(self.pose_history[marker_id]) > self.max_history_length:
+            self.pose_history[marker_id] = self.pose_history[marker_id][-self.max_history_length:]
+        
+        # Update last detection time
+        self.last_detection_time[marker_id] = current_time
+        
+        # Clear any predicted pose since we have a real detection
+        if marker_id in self.predicted_poses:
+            del self.predicted_poses[marker_id]
+
+    def predict_pose(self, marker_id):
+        """Predict current pose based on movement history"""
+        if marker_id not in self.pose_history or len(self.pose_history[marker_id]) < 2:
+            return None
+        
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        last_detection = self.last_detection_time.get(marker_id, 0)
+        
+        # Don't predict if too much time has passed
+        if current_time - last_detection > self.prediction_timeout:
+            return None
+        
+        history = self.pose_history[marker_id]
+        
+        # Use linear extrapolation based on last two poses
+        if len(history) >= 2:
+            # Get last two poses
+            (t1, x1, y1, theta1) = history[-2]
+            (t2, x2, y2, theta2) = history[-1]
+            
+            dt_history = t2 - t1
+            if dt_history <= 0:
+                return (x2, y2, theta2)  # Return last known pose
+            
+            # Calculate velocities
+            vx = (x2 - x1) / dt_history
+            vy = (y2 - y1) / dt_history
+            
+            # Handle angle wraparound for angular velocity
+            dtheta = theta2 - theta1
+            if dtheta > np.pi:
+                dtheta -= 2 * np.pi
+            elif dtheta < -np.pi:
+                dtheta += 2 * np.pi
+            vtheta = dtheta / dt_history
+            
+            # Predict current pose
+            dt_predict = current_time - t2
+            
+            predicted_x = x2 + vx * dt_predict
+            predicted_y = y2 + vy * dt_predict
+            predicted_theta = theta2 + vtheta * dt_predict
+            
+            # Normalize predicted angle
+            while predicted_theta > np.pi:
+                predicted_theta -= 2 * np.pi
+            while predicted_theta < -np.pi:
+                predicted_theta += 2 * np.pi
+            
+            # Store prediction for debugging
+            self.predicted_poses[marker_id] = (predicted_x, predicted_y, predicted_theta)
+            
+            return (predicted_x, predicted_y, predicted_theta)
+        
+        return None
+
+    def get_robust_pose(self, marker_id):
+        """Get robust pose - either detected or predicted"""
+        # First check if we have a current detection
+        if marker_id in self.last_detection_time:
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            last_detection = self.last_detection_time[marker_id]
+            
+            # If recent detection exists, use the last known pose
+            if current_time - last_detection < 0.1:  # Within 100ms
+                if marker_id in self.pose_history and self.pose_history[marker_id]:
+                    last_pose = self.pose_history[marker_id][-1]
+                    return (last_pose[1], last_pose[2], last_pose[3], 'detected')
+            
+            # Try prediction if detection is older
+            predicted_pose = self.predict_pose(marker_id)
+            if predicted_pose is not None:
+                return (predicted_pose[0], predicted_pose[1], predicted_pose[2], 'predicted')
+        
+        return None
+
+    def publish_robust_pose(self, marker_id, world_x, world_y, world_angle_rad, pose_type='detected'):
+        """Publish pose with status information"""
         try:
-            # Convert camera pixel position to world coordinates
-            camera_pixel_pos = [center_x, center_y]
-            world_meter_pos = convert_camera_pixel_to_world_meter(camera_pixel_pos)
-            
-            world_x = float(world_meter_pos[0])
-            world_y = float(world_meter_pos[1])
-            world_z = 0.0  # Robots are on the ground plane
-            
-            # Convert camera angle to world angle
-            world_angle_rad = convert_camera_angle_to_world_angle(camera_angle_rad)
-            
             # Create Odometry message
             odom_msg = Odometry()
             odom_msg.header.stamp = self.get_clock().now().to_msg()
@@ -227,9 +332,9 @@ class CameraNode(Node):
             odom_msg.child_frame_id = "base_link"
             
             # Set position
-            odom_msg.pose.pose.position.x = world_x
-            odom_msg.pose.pose.position.y = world_y
-            odom_msg.pose.pose.position.z = world_z
+            odom_msg.pose.pose.position.x = float(world_x)
+            odom_msg.pose.pose.position.y = float(world_y)
+            odom_msg.pose.pose.position.z = 0.0
             
             # Create quaternion for pure Z-axis rotation (yaw only)
             qx = 0.0
@@ -243,7 +348,27 @@ class CameraNode(Node):
             odom_msg.pose.pose.orientation.z = float(qz)
             odom_msg.pose.pose.orientation.w = float(qw)
             
-            # Set twist to zero
+            # Set higher covariance for predicted poses
+            if pose_type == 'predicted':
+                # Higher uncertainty for predicted poses
+                pos_cov = 0.01  # 1cm standard deviation
+                angle_cov = 0.1  # ~6 degree standard deviation
+            else:
+                # Lower uncertainty for detected poses
+                pos_cov = 0.001  # 1mm standard deviation
+                angle_cov = 0.01  # ~0.6 degree standard deviation
+            
+            # Set covariance matrix (6x6 flattened for pose: x, y, z, roll, pitch, yaw)
+            odom_msg.pose.covariance = [
+                pos_cov, 0.0, 0.0, 0.0, 0.0, 0.0,       # x row
+                0.0, pos_cov, 0.0, 0.0, 0.0, 0.0,       # y row
+                0.0, 0.0, 0.001, 0.0, 0.0, 0.0,         # z row (fixed)
+                0.0, 0.0, 0.0, 0.001, 0.0, 0.0,         # roll row (fixed)
+                0.0, 0.0, 0.0, 0.0, 0.001, 0.0,         # pitch row (fixed)
+                0.0, 0.0, 0.0, 0.0, 0.0, angle_cov      # yaw row
+            ]
+            
+            # Set twist to zero (we don't estimate velocity from vision)
             odom_msg.twist.twist.linear.x = 0.0
             odom_msg.twist.twist.linear.y = 0.0
             odom_msg.twist.twist.linear.z = 0.0
@@ -256,14 +381,15 @@ class CameraNode(Node):
             try:
                 if marker_id == 0:
                     self.robot0_publisher.publish(odom_msg)
-                    # Special logging for robot 0
-                    camera_pixel_x = int(round(center_x))
-                    camera_pixel_y = int(round(center_y))
-                    yaw_deg = np.degrees(world_angle_rad)
-                    print(f"[ROBOT0_POSITION] === Position in different frames ===")
+                    
+                    # Enhanced logging for robot0 with prediction status
+                    if pose_type == 'detected':
+                        print(f"[ROBOT0_POSITION] === DETECTED Position ===")
+                    else:
+                        print(f"[ROBOT0_POSITION] === PREDICTED Position ===")
                     print(f"[ROBOT0_POSITION] World_meter: x={world_x:.4f}m, y={world_y:.4f}m")
-                    print(f"[ROBOT0_POSITION] Camera_pixel: x={camera_pixel_x}px, y={camera_pixel_y}px (image: 1100x600)")
-                    print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {yaw_deg:.2f} deg")
+                    print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {np.degrees(world_angle_rad):.2f} deg")
+                    print(f"[ROBOT0_POSITION] Pose type: {pose_type.upper()}")
                     print(f"[ROBOT0_POSITION] =====================================")
                     success = True
                 elif marker_id == 1:
@@ -281,12 +407,46 @@ class CameraNode(Node):
                 elif marker_id == 7:
                     self.parcel2_publisher.publish(odom_msg)
                     success = True
-                else:
-                    self.get_logger().warn(f"Unknown marker ID for pose publishing: {marker_id}")
-                    return
+                    
+                if success and pose_type == 'predicted':
+                    self.get_logger().debug(f"Published predicted pose for marker {marker_id}")
                     
             except Exception as publish_error:
                 self.get_logger().error(f"Failed to publish pose for marker {marker_id}: {publish_error}")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error in publish_robust_pose for marker {marker_id}: {e}")
+
+    def publish_aruco_pose_simple(self, marker_id, center_x, center_y, camera_angle_rad):
+        """Publish ArUco marker pose using simple center position and X-axis orientation"""
+        try:
+            # Convert camera pixel position to world coordinates
+            camera_pixel_pos = [center_x, center_y]
+            world_meter_pos = convert_camera_pixel_to_world_meter(camera_pixel_pos)
+            
+            world_x = float(world_meter_pos[0])
+            world_y = float(world_meter_pos[1])
+            world_z = 0.0  # Robots are on the ground plane
+            
+            # Convert camera angle to world angle
+            world_angle_rad = convert_camera_angle_to_world_angle(camera_angle_rad)
+            
+            # Update pose history for prediction system
+            self.update_pose_history(marker_id, world_x, world_y, world_angle_rad)
+            
+            # Publish detected pose using robust system
+            self.publish_robust_pose(marker_id, world_x, world_y, world_angle_rad, 'detected')
+            
+            # Special logging for robot 0
+            if marker_id == 0:
+                camera_pixel_x = int(round(center_x))
+                camera_pixel_y = int(round(center_y))
+                yaw_deg = np.degrees(world_angle_rad)
+                print(f"[ROBOT0_POSITION] === Position in different frames ===")
+                print(f"[ROBOT0_POSITION] World_meter: x={world_x:.4f}m, y={world_y:.4f}m")
+                print(f"[ROBOT0_POSITION] Camera_pixel: x={camera_pixel_x}px, y={camera_pixel_y}px (image: 1100x600)")
+                print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {yaw_deg:.2f} deg")
+                print(f"[ROBOT0_POSITION] =====================================")
                 
         except Exception as e:
             self.get_logger().error(f"Error in publish_aruco_pose_simple for marker {marker_id}: {e}")
@@ -311,6 +471,17 @@ class CameraNode(Node):
         
         # Create a clean copy of the image for publishing (this is the priority)
         clean_img = img.copy()
+        
+        # Initialize video writer if not already done
+        if self.is_recording and self.video_writer is None:
+            h, w = clean_img.shape[:2]
+            self.video_writer = cv2.VideoWriter(
+                self.video_output_path, 
+                self.fourcc, 
+                self.video_fps, 
+                (w, h)
+            )
+            self.get_logger().info(f"Video recording started: {w}x{h} @ {self.video_fps}fps")
         
         # Publish the clean processed image via ROS2 topic (before ArUco detection)
         try:
@@ -355,9 +526,13 @@ class CameraNode(Node):
             # Draw all detected markers with ID < 15
             cv2.aruco.drawDetectedMarkers(img, corners, ids)
             
+            # Track which markers we detected this frame
+            detected_markers = set()
+            
             # Simple pose estimation using marker center and X-axis direction
             for i, corner in enumerate(corners):
                 marker_id = int(ids[i][0])
+                detected_markers.add(marker_id)
                 
                 # Get the 4 corner points of the marker
                 corner_points = corner[0]  # Shape: (4, 2) - four corners with (x, y)
@@ -396,6 +571,32 @@ class CameraNode(Node):
                     
                 except Exception as e:
                     self.get_logger().error(f"Error processing marker {marker_id}: {e}")
+            
+            # Check for missing markers that we were tracking and predict their poses
+            for marker_id in [0, 1, 2, 5, 6, 7]:
+                if marker_id not in detected_markers and marker_id in self.pose_history:
+                    # Marker was not detected but we have history - predict its pose
+                    predicted_pose = self.get_robust_pose(marker_id)
+                    if predicted_pose is not None:
+                        world_x, world_y, world_angle_rad, status = predicted_pose
+                        if status == 'predicted':
+                            # Publish predicted pose
+                            self.publish_robust_pose(marker_id, world_x, world_y, world_angle_rad, 'predicted')
+                            
+                            # Visual indication of predicted marker
+                            # Convert world coordinates back to camera pixels for visualization
+                            try:
+                                camera_pos = convert_world_meter_to_camera_pixel([world_x, world_y])
+                                cam_x, cam_y = int(camera_pos[0]), int(camera_pos[1])
+                                
+                                # Draw predicted marker position with different color
+                                cv2.circle(img, (cam_x, cam_y), 8, (0, 0, 255), 2)  # Red circle outline
+                                cv2.putText(img, f"PRED_{marker_id}", 
+                                           (cam_x-15, cam_y-25),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                            except:
+                                # If coordinate conversion fails, just log
+                                pass
         
         # Optional: Draw ROI regions for debugging
         if self.show_roi_debug and self.previous_markers:
@@ -412,6 +613,11 @@ class CameraNode(Node):
         # Show frame locally (optional - can be disabled for headless operation)
         cv2.imshow('Camera Feed', img)
         cv2.waitKey(1)
+        
+        # Save frame to video file
+        if self.is_recording and self.video_writer is not None:
+            # Write the frame with ArUco markers and annotations
+            self.video_writer.write(img)
 
     def check_system_health(self):
         """Periodic health check for pose publishing system"""
@@ -422,6 +628,11 @@ class CameraNode(Node):
                 self.get_logger().info(f"Actively tracking markers: {sorted(active_markers)}")
             else:
                 self.get_logger().info("No markers currently detected")
+            
+            # Report video recording status if recording
+            if hasattr(self, 'video_writer') and self.video_writer is not None and self.is_recording:
+                elapsed_time = (self.get_clock().now().nanoseconds / 1e9) - (self.timer.timer_period_ns * self.frame_count / 1e9)
+                self.get_logger().info(f"Video recording in progress: {elapsed_time:.1f} seconds recorded")
                 
         except Exception as e:
             self.get_logger().error(f"Error in system health check: {e}")
@@ -442,6 +653,11 @@ class CameraNode(Node):
                 self.cap.release()
                 self.get_logger().info("Camera released")
             
+            # Finalize video recording
+            if hasattr(self, 'video_writer') and self.video_writer is not None:
+                self.video_writer.release()
+                self.get_logger().info(f"Video saved to: {self.video_output_path}")
+            
             # Destroy OpenCV windows
             cv2.destroyAllWindows()
             
@@ -459,12 +675,16 @@ def main(args=None):
     
     try:
         camera_node = CameraNode()
+        print("Camera node started - press Ctrl+C to stop recording and save the video")
         rclpy.spin(camera_node)
     except KeyboardInterrupt:
         pass
     finally:
         if 'camera_node' in locals():
+            print("Finalizing video recording...")
             camera_node.destroy_node()
+            if hasattr(camera_node, 'video_output_path'):
+                print(f"Video saved to: {camera_node.video_output_path}")
         rclpy.shutdown()
         print("Camera node shutdown complete")
 

@@ -25,6 +25,12 @@ class PlanningConfig:
         self.r_lim = config['robots']['radius_limit']
         self.min_length = config['robots']['min_length']
         
+        # Minimum turning radius (used by Planning_deltaT and other modules)
+        self.r_limit = self.r_lim  # Use the same radius_limit from robots section
+        
+        # Timing configuration
+        self.discrete_dt = config['discrete_dt']  # Time step for trajectory discretization and MPC frequency
+        
         # Planning parameters
         self.phi0 = config['planning']['phi0']
         self.deltal = config['planning']['deltal']  # Small segment length for discretization
@@ -41,8 +47,9 @@ class PlanningConfig:
         operational_limits = robot_phys['operational_limits']
         self.aw_max = operational_limits['angular_acceleration_max']
         self.w_max = operational_limits['angular_velocity_max']
-        self.r_limit = operational_limits['turning_radius_limit']
+        self.w_min = operational_limits.get('angular_velocity_min', -self.w_max)  # Default to negative max if not specified
         self.v_max = operational_limits['linear_velocity_max']
+        self.v_min = operational_limits.get('linear_velocity_min', 0.0)  # Default to 0 if not specified
         self.a_max = operational_limits['linear_acceleration_max']
         self.mu = operational_limits['friction_coefficient']
         self.mu_f = operational_limits['safety_factor']
@@ -155,7 +162,9 @@ class PlanningConfig:
             # Operational limits (used in planning)
             'aw_max': self.aw_max,
             'w_max': self.w_max,
+            'w_min': self.w_min,
             'v_max': self.v_max,
+            'v_min': self.v_min,
             'a_max': self.a_max,
             'wheel_w_max': self.wheel_w_max,
             'wheel_aw_max': self.wheel_aw_max,

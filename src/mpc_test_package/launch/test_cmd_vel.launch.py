@@ -86,7 +86,7 @@ def generate_launch_description():
             parameters=[{
                 'linear_x': 0.1,      # 0.05 m/s forward
                 'linear_y': 0.0,       # No sideways movement
-                'angular_z': 0.0,      # No rotation
+                'angular_z': 0.2,      # No rotation
                 'publish_rate': 10.0,  # 10 Hz
                 'use_sim_time': False
             }]

@@ -4,6 +4,9 @@
 # Current Active Case
 case_name: "experi"  # Change this to switch between cases
 
+# Timing Configuration (used by both planning and MPC)
+discrete_dt: 0.2          # Time step for trajectory discretization and MPC frequency (s)
+
 # Robot Configuration
 robots:
   count: 3  # N - number of agents/robots
@@ -46,31 +49,28 @@ robot_physical:
   
   # ===== USER-DEFINED OPERATIONAL LIMITATIONS (set by you for safety/control) =====
   operational_limits:
-    # Wheel speed limits (your chosen operational values)
-    wheel_angular_velocity_max: 1.5708   # rad/s - your chosen limit (0.5π rad/s)
+    # Wheel speed limits (realistic operational values based on e-puck2 capabilities)
+    # Using 80% of hardware maximum for safety: 0.8 * 1200 = 960 steps/s
+    wheel_angular_velocity_max: 2.0     # rad/s - 80% of hardware max (960 steps/s)
     
-    # Speed limits (calculated from your wheel limit)
-    # Linear velocity = wheel_angular_velocity × wheel_radius = 1.5708 × 0.0205 = 0.0322 m/s (3.2 cm/s)
-    # Angular velocity = 2 × linear_velocity / wheelbase = 2 × 0.0322 / 0.053 = 1.215 rad/s (69.6°/s)
-    linear_velocity_max: 0.0322      # m/s - from wheel limit × radius (3.2 cm/s)
-    angular_velocity_max: 1.215      # rad/s - differential drive calculation (69.6°/s)
+    # Speed limits (calculated from realistic wheel limit) - matching MPC controller settings
+    # Linear velocity = wheel_angular_velocity × wheel_radius = 6.03 × 0.0205 = 0.124 m/s (12.4 cm/s)
+    # Angular velocity = 2 × linear_velocity / wheelbase = 2 × 0.124 / 0.053 = 4.68 rad/s
+    linear_velocity_max: 0.05        # m/s - reduced for smooth control (5 cm/s)
+    linear_velocity_min: 0.0         # m/s - no reverse motion (matching MPC controller)
+    angular_velocity_max: 0.4        # rad/s - reduced for smooth control (23 deg/s)
+    angular_velocity_min: -0.4       # rad/s - matching MPC controller
     
-    # Acceleration limits (your chosen operational values)
-    # Angular acceleration set to 0.2π rad/s² = 0.6283 rad/s²
-    # Corresponding linear acceleration calculated from wheel dynamics
-    angular_acceleration_max: 0.6283    # rad/s² - your chosen limit (0.2π rad/s²)
-    
-    # Calculate linear acceleration from angular acceleration:
-    # For differential drive: α_linear = α_angular × wheelbase / 2
-    # Linear acceleration = 0.6283 × 0.053 / 2 = 0.0166 m/s²
-    linear_acceleration_max: 0.0166     # m/s² - calculated from angular acceleration
+    # Acceleration limits (consistent with velocity limits for smooth control)
+    # Reasonable acceleration that allows reaching max velocity in 2-3 seconds
+    # Linear: a_max = v_max / t_accel = 0.05 / 2.5 = 0.02 m/s²
+    linear_acceleration_max: 0.02       # m/s² - smooth acceleration (2.5s to max speed)
+    # Angular: α_max = ω_max / t_accel = 0.4 / 2.5 = 0.16 rad/s²
+    angular_acceleration_max: 0.16      # rad/s² - smooth angular acceleration (2.5s to max speed)
     
     # Calculate wheel angular acceleration:
-    # α_wheel = α_linear / wheel_radius = 0.0166 / 0.0205 = 0.81 rad/s²
-    wheel_angular_acceleration_max: 0.81 # rad/s² - calculated from linear acceleration
-    
-    # Geometric constraints (your safety margins)
-    turning_radius_limit: 0.75       # m - minimum turning radius you allow
+    # α_wheel = α_linear / wheel_radius = 0.053 / 0.0205 = 2.59 rad/s²
+    wheel_angular_acceleration_max: 0.5 # rad/s² - calculated from linear acceleration
     
     # Environmental parameters (your assumptions)
     friction_coefficient: 0.7    # μ - coefficient of friction (rubber on concrete)
@@ -82,6 +82,24 @@ robot_physical:
 coordinate_conversion:
   pixel_to_meter_scale: 0.0023  # Scale factor to convert pixels to meters
   meter_to_pixel_scale: 434.78  # Scale factor to convert meters to pixels (1/0.0023)
+
+# MPC Controller Settings
+mpc_controller:
+  # Velocity limits for smooth motion (matching operational_limits)
+  max_linear_velocity: 0.05    # m/s - consistent with operational limits (5 cm/s)
+  min_linear_velocity: 0.0     # m/s - no reverse motion allowed
+  max_angular_velocity: 0.4    # rad/s - consistent with operational limits (23 deg/s)
+  min_angular_velocity: -0.4   # rad/s - consistent with operational limits
+  
+  # Control frequency and horizon
+  prediction_horizon: 5        # MPC prediction steps
+  
+  # PI Controller fallback parameters (when MPC fails)
+  pi_controller:
+    kp_position: 0.3           # Position proportional gain - further reduced
+    ki_position: 0.01          # Position integral gain - further reduced
+    kp_angle: 0.25             # Angle proportional gain - much lower to prevent over-rotation
+    ki_angle: 0.005            # Angle integral gain - very low to prevent oscillation
 
 # Planning Parameters
 planning:
@@ -99,8 +117,8 @@ paths:
 
 # Start and Goal Poses
 poses:
-  start_pose: [150.0, 550.0, 1.2560000000000002]  # [x, y, theta]
-  goal_pose: [1050.0, 580.0, 3.14159265]   # [x, y, theta]
+  start_pose: [150.0, 540.0, 1.2560000000000002]  # [x, y, theta]
+  goal_pose: [980.0, 520.0, 3.14159265]   # [x, y, theta]
 
 # Genetic Algorithm Parameters
 genetic_algorithm:

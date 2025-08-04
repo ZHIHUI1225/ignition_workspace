@@ -94,8 +94,8 @@ class EPuckDriverROS2(Node):
         self.endTime = time.time()
         self.br = TransformBroadcaster(self)
         
-        # Add odometry publisher
-        self.odom_publisher = self.create_publisher(Odometry, 'odom', 10)
+        # Disable odometry publisher to avoid conflict with camera-based localization
+        # self.odom_publisher = self.create_publisher(Odometry, 'odom', 10)
         
         # Motor speed tracking for velocity feedback
         self.commanded_left_speed = 0.0
@@ -202,15 +202,15 @@ class EPuckDriverROS2(Node):
                         self._methods_logged = True
                 
                 if motor_pos is not None and len(motor_pos) >= 2:
-                    # Publish odometry with velocity information
-                    self.publish_odometry(motor_pos)
+                    # Update internal odometry tracking but don't publish (camera provides localization)
+                    self.update_internal_odometry(motor_pos)
                 else:
-                    # If no motor position available, publish odometry without encoder feedback
+                    # If no motor position available, update internal tracking without encoder feedback
                     if not hasattr(self, '_no_encoder_logged'):
-                        self.get_logger().info("No motor position data available - using commanded velocities for odometry")
+                        self.get_logger().info("No motor position data available - using commanded velocities for internal tracking")
                         self._no_encoder_logged = True
-                    # Still publish basic odometry based on commanded velocities
-                    self.publish_odometry_without_encoders()
+                    # Still update internal odometry based on commanded velocities
+                    self.update_internal_odometry_without_encoders()
                     
             except Exception as e:
                 # Only log motor position errors occasionally to avoid spam
@@ -258,8 +258,8 @@ class EPuckDriverROS2(Node):
             
             self.br.sendTransform(t)
 
-    def publish_odometry(self, motor_pos):
-        """Publish odometry based on motor positions with enhanced velocity feedback"""
+    def update_internal_odometry(self, motor_pos):
+        """Update internal odometry tracking without publishing (camera provides localization)"""
         leftSteps = motor_pos[0]
         rightSteps = motor_pos[1]
         
@@ -299,62 +299,8 @@ class EPuckDriverROS2(Node):
             self.current_linear_vel = 0.0
             self.current_angular_vel = 0.0
         
-        # Publish odometry
-        odom_msg = Odometry()
-        odom_msg.header.stamp = self.get_clock().now().to_msg()
-        odom_msg.header.frame_id = 'odom'
-        odom_msg.child_frame_id = 'base_link'
-        
-        # Position
-        odom_msg.pose.pose.position.x = self.x_pos
-        odom_msg.pose.pose.position.y = self.y_pos
-        odom_msg.pose.pose.position.z = 0.0
-        
-        # Orientation
-        cy = math.cos(self.theta * 0.5)
-        sy = math.sin(self.theta * 0.5)
-        odom_msg.pose.pose.orientation.x = 0.0
-        odom_msg.pose.pose.orientation.y = 0.0
-        odom_msg.pose.pose.orientation.z = sy
-        odom_msg.pose.pose.orientation.w = cy
-        
-        # Velocity (actual measured velocity from encoder feedback)
-        odom_msg.twist.twist.linear.x = self.current_linear_vel
-        odom_msg.twist.twist.linear.y = 0.0
-        odom_msg.twist.twist.linear.z = 0.0
-        odom_msg.twist.twist.angular.x = 0.0
-        odom_msg.twist.twist.angular.y = 0.0
-        odom_msg.twist.twist.angular.z = self.current_angular_vel
-        
-        # Add covariance information (rough estimates)
-        # Position covariance (x, y, z, roll, pitch, yaw)
-        odom_msg.pose.covariance = [0.001, 0.0, 0.0, 0.0, 0.0, 0.0,  # x
-                                   0.0, 0.001, 0.0, 0.0, 0.0, 0.0,   # y  
-                                   0.0, 0.0, 0.001, 0.0, 0.0, 0.0,   # z
-                                   0.0, 0.0, 0.0, 0.001, 0.0, 0.0,   # roll
-                                   0.0, 0.0, 0.0, 0.0, 0.001, 0.0,   # pitch
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.01]    # yaw
-        
-        # Velocity covariance (vx, vy, vz, vroll, vpitch, vyaw)
-        odom_msg.twist.covariance = [0.001, 0.0, 0.0, 0.0, 0.0, 0.0,  # vx
-                                    0.0, 0.001, 0.0, 0.0, 0.0, 0.0,   # vy
-                                    0.0, 0.0, 0.001, 0.0, 0.0, 0.0,   # vz
-                                    0.0, 0.0, 0.0, 0.001, 0.0, 0.0,   # vroll
-                                    0.0, 0.0, 0.0, 0.0, 0.001, 0.0,   # vpitch
-                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.01]    # vyaw
-        
-        self.odom_publisher.publish(odom_msg)
-        
-        # Also publish transform
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'odom'
-        t.child_frame_id = f'{self._name}/base_link'
-        t.transform.translation.x = self.x_pos
-        t.transform.translation.y = self.y_pos
-        t.transform.translation.z = 0.0
-        t.transform.rotation = odom_msg.pose.pose.orientation
-        self.br.sendTransform(t)
+        # Don't publish odometry - camera node provides localization
+        # Just update internal tracking for velocity feedback
         
         # Periodic velocity feedback logging (every 100 updates ≈ 10 seconds at 10Hz)
         if hasattr(self, '_odom_log_count'):
@@ -367,18 +313,19 @@ class EPuckDriverROS2(Node):
             cmd_linear = (self.commanded_left_speed + self.commanded_right_speed) * MOT_STEP_DIST / 2.0 / dt if dt > 0 else 0
             cmd_angular = (self.commanded_right_speed - self.commanded_left_speed) * MOT_STEP_DIST / WHEEL_DISTANCE / dt if dt > 0 else 0
             
-            self.get_logger().info(f'=== Velocity Feedback ===')
+            self.get_logger().info(f'=== Velocity Feedback (E-puck Internal) ===')
             self.get_logger().info(f'Commanded: linear={cmd_linear:.3f} m/s, angular={cmd_angular:.3f} rad/s')
             self.get_logger().info(f'Actual:    linear={self.current_linear_vel:.3f} m/s, angular={self.current_angular_vel:.3f} rad/s')
-            self.get_logger().info(f'Position: x={self.x_pos:.3f} m, y={self.y_pos:.3f} m, theta={self.theta:.3f} rad')
+            self.get_logger().info(f'Internal Position: x={self.x_pos:.3f} m, y={self.y_pos:.3f} m, theta={self.theta:.3f} rad')
+            self.get_logger().info(f'Note: Camera node provides published localization, this is internal tracking only')
         
         # Update previous values
         self.leftStepsPrev = leftSteps
         self.rightStepsPrev = rightSteps
         self.startTime = self.endTime
 
-    def publish_odometry_without_encoders(self):
-        """Publish odometry based on commanded velocities when encoders are not available"""
+    def update_internal_odometry_without_encoders(self):
+        """Update internal odometry tracking without publishing when encoders are not available"""
         # Calculate time difference
         self.endTime = time.time()
         dt = self.endTime - self.startTime
@@ -417,62 +364,8 @@ class EPuckDriverROS2(Node):
             self.current_linear_vel = 0.0
             self.current_angular_vel = 0.0
         
-        # Publish odometry message
-        odom_msg = Odometry()
-        odom_msg.header.stamp = self.get_clock().now().to_msg()
-        odom_msg.header.frame_id = 'odom'
-        odom_msg.child_frame_id = f'{self._name}/base_link'
-        
-        # Position
-        odom_msg.pose.pose.position.x = self.x_pos
-        odom_msg.pose.pose.position.y = self.y_pos
-        odom_msg.pose.pose.position.z = 0.0
-        
-        # Orientation
-        cy = math.cos(self.theta * 0.5)
-        sy = math.sin(self.theta * 0.5)
-        odom_msg.pose.pose.orientation.x = 0.0
-        odom_msg.pose.pose.orientation.y = 0.0
-        odom_msg.pose.pose.orientation.z = sy
-        odom_msg.pose.pose.orientation.w = cy
-        
-        # Velocity (estimated from commanded speeds)
-        odom_msg.twist.twist.linear.x = self.current_linear_vel
-        odom_msg.twist.twist.linear.y = 0.0
-        odom_msg.twist.twist.linear.z = 0.0
-        odom_msg.twist.twist.angular.x = 0.0
-        odom_msg.twist.twist.angular.y = 0.0
-        odom_msg.twist.twist.angular.z = self.current_angular_vel
-        
-        # Higher covariance since we're estimating without encoder feedback
-        # Position covariance (x, y, z, roll, pitch, yaw)
-        odom_msg.pose.covariance = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0,   # x
-                                   0.0, 0.01, 0.0, 0.0, 0.0, 0.0,    # y  
-                                   0.0, 0.0, 0.01, 0.0, 0.0, 0.0,    # z
-                                   0.0, 0.0, 0.0, 0.01, 0.0, 0.0,    # roll
-                                   0.0, 0.0, 0.0, 0.0, 0.01, 0.0,    # pitch
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.1]     # yaw
-        
-        # Velocity covariance (higher uncertainty without encoders)
-        odom_msg.twist.covariance = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0,  # vx
-                                    0.0, 0.01, 0.0, 0.0, 0.0, 0.0,   # vy
-                                    0.0, 0.0, 0.01, 0.0, 0.0, 0.0,   # vz
-                                    0.0, 0.0, 0.0, 0.01, 0.0, 0.0,   # vroll
-                                    0.0, 0.0, 0.0, 0.0, 0.01, 0.0,   # vpitch
-                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.1]    # vyaw
-        
-        self.odom_publisher.publish(odom_msg)
-        
-        # Also publish transform
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'odom'
-        t.child_frame_id = f'{self._name}/base_link'
-        t.transform.translation.x = self.x_pos
-        t.transform.translation.y = self.y_pos
-        t.transform.translation.z = 0.0
-        t.transform.rotation = odom_msg.pose.pose.orientation
-        self.br.sendTransform(t)
+        # Don't publish odometry - camera node provides localization
+        # This is just internal tracking for velocity feedback
         
         # Periodic velocity feedback logging (every 100 updates ≈ 10 seconds at 10Hz)
         if hasattr(self, '_odom_fallback_log_count'):
@@ -481,10 +374,9 @@ class EPuckDriverROS2(Node):
             self._odom_fallback_log_count = 0
             
         if self._odom_fallback_log_count % 100 == 0:
-            self.get_logger().info(f'=== Velocity Feedback (Estimated) ===')
+            # self.get_logger().info(f'=== Velocity Feedback (E-puck Internal, Estimated) ===')
             self.get_logger().info(f'Estimated: linear={self.current_linear_vel:.3f} m/s, angular={self.current_angular_vel:.3f} rad/s')
-            self.get_logger().info(f'Position: x={self.x_pos:.3f} m, y={self.y_pos:.3f} m, theta={self.theta:.3f} rad')
-        
+            # self.get_logger().info(f'Internal Position: x={self.x_pos:.3f} m, y={self.y_pos:.3f} m, theta={self.theta:.3f} rad')
         self.startTime = self.endTime
 
     def handler_velocity(self, data):
@@ -508,10 +400,18 @@ class EPuckDriverROS2(Node):
         left_vel = wl * 1000. / (2 * math.pi)
         right_vel = wr * 1000. / (2 * math.pi)
         
+        # Store original calculated speeds for debugging
+        left_vel_orig = left_vel
+        right_vel_orig = right_vel
+        
         # Apply e-puck2 speed limits (max 1200 steps/s according to specs)
         MAX_STEPS_PER_SEC = 1200
         left_vel = max(-MAX_STEPS_PER_SEC, min(MAX_STEPS_PER_SEC, left_vel))
         right_vel = max(-MAX_STEPS_PER_SEC, min(MAX_STEPS_PER_SEC, right_vel))
+        
+        # Check if speeds were clamped
+        left_clamped = (abs(left_vel_orig) > MAX_STEPS_PER_SEC)
+        right_clamped = (abs(right_vel_orig) > MAX_STEPS_PER_SEC)
         
         # Store commanded speeds for velocity feedback
         self.commanded_left_speed = left_vel
@@ -519,6 +419,11 @@ class EPuckDriverROS2(Node):
         
         try:
             self._bridge.set_motors_speed(left_vel, right_vel)
+            
+            # Add immediate debugging for clamped commands
+            if left_clamped or right_clamped:
+                self.get_logger().warn(f'SPEED CLAMPING: Requested linear={linear:.3f} m/s, angular={angular:.3f} rad/s')
+                self.get_logger().warn(f'Original: left={left_vel_orig:.0f}, right={right_vel_orig:.0f} → Clamped: left={left_vel:.0f}, right={right_vel:.0f}')
             
             # Log velocity commands very occasionally (every 100 cycles ≈ 10 seconds at 10Hz)
             if hasattr(self, '_velocity_log_count'):
@@ -528,7 +433,14 @@ class EPuckDriverROS2(Node):
                 
             if self._velocity_log_count % 100 == 0:
                 self.get_logger().info(f'Commanded: linear={linear:.3f} m/s, angular={angular:.3f} rad/s')
-                self.get_logger().info(f'Motor speeds: left={left_vel:.0f}, right={right_vel:.0f} steps/s (max: {MAX_STEPS_PER_SEC})')
+                self.get_logger().info(f'Calculated speeds: left={left_vel_orig:.0f}, right={right_vel_orig:.0f} steps/s')
+                self.get_logger().info(f'Clamped speeds: left={left_vel:.0f}, right={right_vel:.0f} steps/s (max: {MAX_STEPS_PER_SEC})')
+                if left_clamped or right_clamped:
+                    self.get_logger().warn(f'Motor speeds were clamped! Original too high for hardware.')
+                    # Calculate achievable velocities
+                    max_linear = MAX_STEPS_PER_SEC * (wheel_diameter_m / 2.) * (2 * math.pi) / 1000.
+                    max_angular = 2 * MAX_STEPS_PER_SEC * (wheel_diameter_m / 2.) * (2 * math.pi) / (1000. * wheel_separation_m)
+                    self.get_logger().warn(f'Max achievable: linear={max_linear:.3f} m/s, angular={max_angular:.3f} rad/s')
                 
         except Exception as e:
             self.get_logger().error(f'Error setting motor speed: {str(e)}')

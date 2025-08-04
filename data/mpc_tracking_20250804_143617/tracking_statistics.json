@@ -1,0 +1,16 @@
+{
+  "mean_x_error": 0.04501696480639193,
+  "std_x_error": 0.0405659354034605,
+  "max_x_error": 0.09539697435677968,
+  "mean_y_error": 0.06419716559223965,
+  "std_y_error": 0.03211877593673134,
+  "max_y_error": 0.10248682248362478,
+  "mean_distance_error": 0.08951023439094774,
+  "std_distance_error": 0.008418117738129414,
+  "max_distance_error": 0.10426750830446262,
+  "mean_theta_error": 0.15794541097222145,
+  "std_theta_error": 0.2976309821474323,
+  "max_theta_error": 2.0044995340809013,
+  "total_trajectory_time": 26.109278678894043,
+  "num_data_points": 226
+}

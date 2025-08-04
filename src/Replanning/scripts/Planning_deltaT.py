@@ -31,13 +31,15 @@ from coordinate_transform import convert_pixel_positions_to_world_meters, conver
 
 # Get robot physical parameters from config
 robot_params = config.get_robot_physical_params()
-aw_max = robot_params['aw_max']  # the maximum angular acceleration
-w_max = robot_params['w_max']   # the maximum angular velocity
-r_limit = robot_params['r_limit']  # m
-r_w = robot_params['r_w']       # the radius of the wheel
-v_max = robot_params['v_max']   # m/s (pre-calculated in config)
-a_max = robot_params['a_max']   # (pre-calculated in config)
-l_r = robot_params['l_r']       # the wheel base
+# Get correct wheel parameters for differential drive calculations
+w_max = robot_params['wheel_w_max']    # the maximum wheel angular velocity (rad/s)
+aw_max = robot_params['wheel_aw_max']  # the maximum wheel angular acceleration (rad/s²)
+# Other robot parameters
+r_limit = robot_params['r_limit']  # m - minimum turning radius
+r_w = robot_params['r_w']       # the radius of the wheel (m)
+v_max = robot_params['v_max']   # m/s - maximum linear velocity (pre-calculated in config)
+a_max = robot_params['a_max']   # m/s² - maximum linear acceleration (pre-calculated in config)
+l_r = robot_params['l_r']       # the wheel base (m)
 mu = robot_params['mu']         # Coefficient of friction (typical for rubber on concrete)
 mu_f = robot_params['mu_f']     # Safety factor
 g = robot_params['g']           # Gravitational acceleration (m/s²)
@@ -879,7 +881,7 @@ if __name__ == '__main__':
         time_segments=time_segments,
         Flagb=Flagb,
         reeb_graph=reeb_graph,
-        dt=0.5,  # For comparison
+        dt=config.discrete_dt,  # Use discrete_dt from config
         save_dir=os.path.join(config.data_path, case) + '/'
     )
     
