@@ -19,7 +19,7 @@ import rclpy
 import casadi as ca
 import traceback
 import threading
-import tf_transformations
+import tf_transformations as tf  # Renamed for convenience
 import pyinotify  # For monitoring file system events
 from scipy.interpolate import CubicSpline
 from rclpy.node import Node
@@ -36,8 +36,10 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     """
     Wait behavior for pushing phase - waits for parcel to be near relay point.
     Success condition: 
-    1. Parcel is within distance threshold of relay point AND
+    1. Parcel is within distance threshold of relay point (from trajectory) AND
     2. For non-turtlebot0 robots: last robot is OUT of relay point range
+    
+    Note: Relay points are now loaded from trajectory files instead of subscribed topics.
     """
     
     def __init__(self, name, duration=60.0, robot_namespace="turtlebot0", distance_threshold=0.14):
@@ -54,6 +56,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.namespace_number = self.extract_namespace_number(robot_namespace)
         self.relay_number = self.namespace_number  # Relay point is tb{i} -> Relaypoint{i}
         
+        # Set default case name for trajectory files
+        self.case_name = "simple_maze"
+        
         # Determine last robot (previous robot in sequence)
         self.last_robot_number = self.namespace_number - 1 if self.namespace_number > 0 else None
         self.is_first_robot = (self.robot_namespace == "turtlebot0")
@@ -62,7 +67,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.node = None
         self.callback_group = None  # Add callback group for thread isolation
         self.robot_pose_sub = None
-        self.relay_pose_sub = None
+        # relay_pose_sub removed as we're now using trajectory points
         self.parcel_pose_sub = None
         self.last_robot_pose_sub = None
         
@@ -208,14 +213,18 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             callback_group=self.callback_group
         )
         
-        # Relay point pose subscription - 使用专属线程池处理
-        self.relay_pose_sub = self.node.create_subscription(
-            PoseStamped,
-            f'/Relaypoint{self.relay_number}/pose',
-            lambda msg: self.handle_callback_in_dedicated_pool(msg, 'relay_pose'),
-            10,
-            callback_group=self.callback_group
+        # Load relay point from trajectory file instead of subscription
+        success, relay_pose = load_relay_point_from_trajectory(
+            robot_namespace=self.robot_namespace,
+            node=self.node,
+            case_name=self.case_name
         )
+        
+        if success:
+            self.relay_pose = relay_pose
+            print(f"[{self.name}] ✅ Loaded relay point from trajectory")
+        else:
+            print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory, will try again later")
         
         # Last robot pose subscription (only for non-turtlebot0 robots) - 使用专属线程池处理
         self.last_robot_pose_sub = None
@@ -252,13 +261,15 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] DEBUG: Robot pose updated: ({self.robot_pose.position.x:.3f}, {self.robot_pose.position.y:.3f}), count: {self._robot_pose_count}")
     
     def relay_pose_callback(self, msg):
-        """Callback for relay point pose updates"""
-        # Check if behavior has been terminated
+        """Legacy callback for relay point pose updates (kept for compatibility)"""
+        # This method is kept for backward compatibility but should not be called anymore
+        print(f"[{self.name}] WARNING: relay_pose_callback called but relay points are now loaded from trajectory files")
+        
+        # If somehow this gets called, still update the relay_pose for safety
         if hasattr(self, '_terminated') and self._terminated:
             return
             
         self.relay_pose = msg
-        # print(f"[{self.name}] DEBUG: Relay{self.relay_number} pose updated: ({msg.position.x:.3f}, {msg.position.y:.3f})")
     
     def last_robot_pose_callback(self, msg):
         """Callback for last robot pose updates"""
@@ -367,10 +378,24 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] WARNING: Failed to setup parcel subscription, using default index 0")
             self.current_parcel_index = 0
         
+        # Ensure relay point is loaded from trajectory
+        if self.relay_pose is None:
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory during initialization")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory")
+            
         # Dynamic feedback message that includes current status
         self.feedback_message = f"[{self.robot_namespace}] PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
         print(f"[{self.name}] Starting PUSH wait for {self.duration}s...")
-        print(f"[{self.name}] Monitoring parcel{self.current_parcel_index} -> Relaypoint{self.relay_number}")
+        print(f"[{self.name}] Monitoring parcel{self.current_parcel_index} -> trajectory endpoint as relay point")
         if not self.is_first_robot:
             print(f"[{self.name}] Also monitoring that last robot (tb{self.last_robot_number}) is out of relay range")
         
@@ -446,12 +471,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             except Exception as e:
                 print(f"[{self.name}] ❌ Error destroying robot_pose_sub: {e}")
                 pass
-        if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub:
-            try:
-                self.node.destroy_subscription(self.relay_pose_sub)
-                self.relay_pose_sub = None
-            except:
-                pass
+                
+        # No need to destroy relay_pose_sub anymore - we're loading from trajectory files
+        
         if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub:
             try:
                 self.node.destroy_subscription(self.parcel_pose_sub)
@@ -521,8 +543,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         try:
             if callback_type == 'robot_pose':
                 self.robot_pose_callback(msg)
-            elif callback_type == 'relay_pose':
-                self.relay_pose_callback(msg)
             elif callback_type == 'last_robot_pose':
                 self.last_robot_pose_callback(msg)
             elif callback_type == 'parcel_pose':
@@ -816,11 +836,56 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be loaded from trajectory file
         self.parcel_pose = None
         self.current_parcel_index = 0
         
-        # Subscriptions
+        # Subscriptions - initialized in setup()
+        self.robot_pose_sub = None
+        self.parcel_index_sub = None
+        self.parcel_pose_sub = None
+        
+        # Case name for trajectory file
+        self.case_name = "simple_maze"  # Default case name
+        
+    def extract_namespace_number(self, namespace):
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
+        return int(match.group(1)) if match else 0
+    
+    def setup(self, **kwargs):
+        """Setup ROS node and subscriptions"""
+        try:
+            self.node = kwargs.get('node')
+            if self.node is None:
+                print(f"[{self.name}] No ROS node provided")
+                return False
+            
+            # Setup ROS subscriptions now that we have a node
+            self.setup_subscriptions()
+            
+            # Load relay point from trajectory file
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory, will try again later")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Setup failed: {e}")
+            return False
+    
+    def setup_subscriptions(self):
+        """Setup ROS subscriptions"""
+        # Subscribe to robot pose (Odometry)
         self.robot_pose_sub = self.node.create_subscription(
             Odometry,
             f'/turtlebot{self.namespace_number}/odom_map',
@@ -828,37 +893,27 @@ class WaitAction(py_trees.behaviour.Behaviour):
             10
         )
         
-        self.relay_pose_sub = self.node.create_subscription(
-            PoseStamped,
-            f'/Relaypoint{self.relay_number}/pose',
-            self.relay_pose_callback,
-            10
-        )
-        
+        # Subscribe to current parcel index
         self.parcel_index_sub = self.node.create_subscription(
             Int32,
-            f'/{robot_namespace}/current_parcel_index',
+            f'/{self.robot_namespace}/current_parcel_index',
             self.current_index_callback,
             10
         )
         
-        # Will be updated when parcel index is received
-        self.parcel_pose_sub = None
+        # Parcel subscription will be created in update_parcel_subscription
+        self.update_parcel_subscription()
         
-        # Parcel subscription will be created in initialise() when behavior starts
-        
-    def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
-        match = re.search(r'turtlebot(\d+)', namespace)
-        return int(match.group(1)) if match else 0
+        print(f"[{self.name}] ✅ Subscriptions set up for {self.robot_namespace}")
     
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates - handles Odometry message"""
         self.robot_pose = msg.pose.pose
     
     def relay_pose_callback(self, msg):
-        """Callback for relay point pose updates"""
-        self.relay_pose = msg
+        """Callback for relay point pose updates (compatibility stub)"""
+        print(f"[{self.name}] WARNING: relay_pose_callback called - this should not happen")
+        # We don't update self.relay_pose here anymore as it's loaded from trajectory
     
     def parcel_pose_callback(self, msg):
         """Callback for parcel pose updates"""
@@ -927,7 +982,21 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.start_time = time.time()
         self.feedback_message = f"[{self.robot_namespace}] Waiting for {self.duration}s and monitoring parcel proximity"
         print(f"[{self.name}] Starting wait for {self.duration}s with parcel monitoring...")
-        print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, relay: Relaypoint{self.relay_number}")
+        print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, using relay point from trajectory")
+        
+        # Load relay point from trajectory if not already loaded
+        if self.relay_pose is None:
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory during initialization")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory")
         
         # Create initial parcel subscription when behavior starts
         self.update_parcel_subscription()
@@ -939,7 +1008,7 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         # Check if parcel is in relay range (primary success condition)
         if self.check_parcel_in_relay_range():
-            print(f"[{self.name}] SUCCESS: parcel{self.current_parcel_index} is within range of Relaypoint{self.relay_number}!")
+            print(f"[{self.name}] SUCCESS: parcel{self.current_parcel_index} is within range of relay point!")
             return py_trees.common.Status.SUCCESS
         
         # Check timeout condition
@@ -949,20 +1018,20 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         # Still running - provide status update
         parcel_relay_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
-        print(f"[{self.name}] Waiting... {elapsed:.1f}/{self.duration}s | parcel{self.current_parcel_index} to Relay{self.relay_number} dist: {parcel_relay_dist:.3f}m (threshold: {self.distance_threshold}m)")
+        print(f"[{self.name}] Waiting... {elapsed:.1f}/{self.duration}s | parcel{self.current_parcel_index} to relay point dist: {parcel_relay_dist:.3f}m (threshold: {self.distance_threshold}m)")
         
         return py_trees.common.Status.RUNNING
     
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
         # Stop the robot
-        if self.cmd_vel_pub:
+        if hasattr(self, 'cmd_vel_pub') and self.cmd_vel_pub:
             cmd = Twist()
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
             self.cmd_vel_pub.publish(cmd)
         
-        self.feedback_message = f"ApproachObject terminated with status: {new_status}"
+        self.feedback_message = f"WaitAction terminated with status: {new_status}"
 
 
 class MobileRobotMPC:
@@ -1075,17 +1144,19 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         # ROS setup
         self.node = None
         self.robot_pose_sub = None
-        self.relay_pose_sub = None
         self.parcel_pose_sub = None
         
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be loaded from trajectory file
         self.parcel_pose = None
         self.current_parcel_index = 0
         
         # Thread safety
         self.lock = threading.Lock()
+        
+        # Case name for trajectory file
+        self.case_name = "simple_maze"  # Default case name
         
         # Setup blackboard access for current_parcel_index
         self.blackboard = self.attach_blackboard_client()
@@ -1115,13 +1186,18 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
                 10
             )
             
-            # Subscribe to relay point pose
-            self.relay_pose_sub = self.node.create_subscription(
-                PoseStamped,
-                f'/Relaypoint{self.relay_number}/pose',
-                self.relay_pose_callback,
-                10
+            # Load relay point from trajectory file
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
             )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory, will try again later")
             
             # Parcel subscription will be created in initialise() when behavior starts
             
@@ -1129,6 +1205,8 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
             return True
             
         except Exception as e:
+            print(f"[{self.name}] Setup failed: {e}")
+            return False
             print(f"[{self.name}] Setup failed: {e}")
             return False
     
@@ -1484,3 +1562,66 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             report_node_failure(self.name, error_msg, self.robot_namespace)
             print(f"[{self.name}] Error incrementing index: {e}")
             return py_trees.common.Status.FAILURE
+
+
+def load_relay_point_from_trajectory(robot_namespace, node=None, case_name="simple_maze"):
+    """Load relay point from trajectory file
+    
+    Args:
+        robot_namespace (str): The robot namespace (e.g., 'turtlebot0')
+        node (rclpy.node.Node, optional): ROS node for timestamp. Defaults to None.
+        case_name (str, optional): Case name for trajectory file path. Defaults to "simple_maze".
+        
+    Returns:
+        tuple: (success, relay_pose_msg) - where relay_pose_msg is a PoseStamped message or None if failed
+    """
+    try:
+        # Extract namespace number
+        match = re.search(r'turtlebot(\d+)', robot_namespace)
+        namespace_number = int(match.group(1)) if match else 0
+        
+        # Determine the trajectory file path
+        trajectory_file_path = f"/root/workspace/data/{case_name}/tb{namespace_number}_Trajectory.json"
+        
+        # Check if file exists
+        if not os.path.exists(trajectory_file_path):
+            print(f"[load_relay_point] WARNING: Trajectory file not found: {trajectory_file_path}")
+            return False, None
+            
+        # Load the trajectory data
+        with open(trajectory_file_path, 'r') as json_file:
+            data = json.load(json_file)
+            trajectory = data.get('Trajectory', [])
+            
+            if not trajectory:
+                print(f"[load_relay_point] WARNING: Empty trajectory in file: {trajectory_file_path}")
+                return False, None
+            
+            # Use the first point of the trajectory as the relay point
+            first_point = trajectory[0]
+
+            # Create a PoseStamped message for the relay point
+            relay_pose_msg = PoseStamped()
+            relay_pose_msg.header.frame_id = "map"
+            relay_pose_msg.header.stamp = node.get_clock().now().to_msg() if node else None
+            
+            # Set position from trajectory point
+            relay_pose_msg.pose.position.x = first_point[0]
+            relay_pose_msg.pose.position.y = first_point[1]
+
+            # Set orientation if available
+            if len(first_point) > 2:
+                # Convert heading to quaternion
+                quat = tf.quaternion_from_euler(0, 0, first_point[2])
+                relay_pose_msg.pose.orientation.x = quat[0]
+                relay_pose_msg.pose.orientation.y = quat[1]
+                relay_pose_msg.pose.orientation.z = quat[2]
+                relay_pose_msg.pose.orientation.w = quat[3]
+            
+            print(f"[load_relay_point] ✅ Successfully loaded relay point from trajectory: ({relay_pose_msg.pose.position.x:.3f}, {relay_pose_msg.pose.position.y:.3f})")
+            return True, relay_pose_msg
+            
+    except Exception as e:
+        print(f"[load_relay_point] ERROR: Failed to load relay point from trajectory: {str(e)}")
+        traceback.print_exc()
+        return False, None

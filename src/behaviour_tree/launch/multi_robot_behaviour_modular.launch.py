@@ -41,7 +41,7 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument(
         'num_robots',
-        default_value='3',
+        default_value='1',
         description='Number of robots to launch behavior trees for'))
     
     ld.add_action(DeclareLaunchArgument(

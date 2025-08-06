@@ -31,8 +31,8 @@ class RobotMotionPIController:
         # PI controller parameters
         self.kp = 0.8        # Proportional gain
         self.ki = 0.2        # Integral gain
-        self.dt = 0.5        # Control timestep (2Hz)
-        
+        self.dt = 0.2       # Control timestep (5Hz)
+
         # PI controller state variables
         self.error_integral = np.array([0.0, 0.0])  # Integral of position error [x, y]
         self.last_error = np.array([0.0, 0.0])      # Previous error for derivative (if needed later)
@@ -238,8 +238,8 @@ class EventDrivenApproachObject(py_trees.behaviour.Behaviour):
         self.controller = None
         
         # Control loop timer period for high-frequency control
-        self.dt = 0.5  # Control timestep (2Hz)
-        
+        self.dt = 0.2  # Control timestep (5Hz)
+
         # Replace threading with ROS timer for control
         self.control_timer = None
         self.control_active = False
@@ -1055,7 +1055,7 @@ class ApproachObject(EventDrivenApproachObject):
             # Create timer using shared callback group for unified execution
             if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
                 self.control_timer = self.node.create_timer(
-                    self.dt,  # 0.1s timer period for 10Hz control
+                    self.dt,  # 0.2s timer period for 5Hz control
                     self.control_loop_callback,
                     callback_group=self.control_callback_group  # Use shared callback group
                 )
@@ -1063,7 +1063,7 @@ class ApproachObject(EventDrivenApproachObject):
             else:
                 # Fallback: use default callback group
                 self.control_timer = self.node.create_timer(
-                    self.dt,  # 0.1s timer period
+                    self.dt,  # 0.2s timer period
                     self.control_loop_callback
                 )
                 print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用默认回调组)")

@@ -357,11 +357,11 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.reference_pub = None
         self.robot_pose_sub = None
         self.parcel_pose_sub = None
-        self.relay_pose_sub = None
+        # relay_pose_sub removed as we're now using trajectory points
         
         # Pose storage for success checking (will be reset in initialise)
         self.parcel_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be set from trajectory points
         self.current_parcel_index = 0
         
         # Path messages for visualization (will be reset in initialise)
@@ -595,20 +595,13 @@ class PushObject(py_trees.behaviour.Behaviour):
             pass
 
     def relay_pose_callback(self, msg):
-        """Update relay point pose from PoseStamped message - read once (static pose)"""
-        # 中继点位置是静态的，只需要读取一次
+        """Legacy method for compatibility - relay pose now comes from trajectory"""
+        # This method is kept for backward compatibility but should not be called
+        print(f"[{self.name}] WARNING: relay_pose_callback called, but relay pose is now derived from trajectory")
+        # We'll still update the relay_pose in case this is somehow called
         if self.relay_pose is None:
             with self.state_lock:
                 self.relay_pose = msg.pose
-            
-            # 读取一次后立即销毁订阅以节省资源
-            if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub is not None:
-                try:
-                    self.node.destroy_subscription(self.relay_pose_sub)
-                    self.relay_pose_sub = None
-                except Exception as e:
-                    pass
-        # 如果已经有中继点数据，忽略后续消息（不应该发生，因为订阅已销毁）
     
     def _calculate_distance(self, pose1, pose2):
         """Calculate Euclidean distance between two poses"""
@@ -1082,40 +1075,42 @@ class PushObject(py_trees.behaviour.Behaviour):
             return False
 
     def setup_relay_subscription(self):
-        """Set up relay subscription - one-shot for static pose, 使用ReentrantCallbackGroup"""
-        if self.node is None:
-            print(f"[{self.name}] WARNING: Cannot setup relay subscription - no ROS node")
+        """Set up relay point data from trajectory points instead of subscription"""
+        if not hasattr(self, 'ref_trajectory') or self.ref_trajectory is None:
+            print(f"[{self.name}] WARNING: Cannot setup relay pose - no trajectory data loaded")
             return False
             
         try:
-            # 如果已经有中继点数据，无需重新订阅
+            # If relay pose is already set, no need to do it again
             if self.relay_pose is not None:
-                print(f"[{self.name}] ✅ Relay point data already exists, skipping subscription")
+                print(f"[{self.name}] ✅ Relay point data already exists, no need to update")
                 return True
             
-            # Clean up existing subscription if it exists
-            if self.relay_pose_sub is not None:
-                self.node.destroy_subscription(self.relay_pose_sub)
-                self.relay_pose_sub = None
-            
-            # 🔧 使用共享回调组管理器 - 不再创建临时回调组
-            if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] ❌ ERROR: Shared callback group not properly set up, cannot create relay point subscription")
-                return False
-            
-            # Subscribe to relay point pose (一次性读取静态数据，使用可靠QoS)
+            # Create a relay point pose from the last point of the trajectory
             relay_number = self._extract_namespace_number() + 1  # Relaypoint{i+1}
-            relay_topic = f'/Relaypoint{relay_number}/pose'
-            reliable_qos = self._create_reliable_qos_profile()
-            self.relay_pose_sub = self.node.create_subscription(
-                PoseStamped, relay_topic,
-                self.relay_pose_callback, reliable_qos,
-                callback_group=self.pose_callback_group)
-            print(f"[{self.name}] ✅ Successfully subscribed to relay topic: {relay_topic} (relay point: {relay_number}) [one-time read, using ReentrantCallbackGroup, node: {self.node.get_name()}]")
+            
+            # Get the last point from trajectory
+            last_point = self.ref_trajectory[-1]
+            
+            # Create a Pose object for the relay point
+            self.relay_pose = Pose()
+            self.relay_pose.position.x = last_point[0]
+            self.relay_pose.position.y = last_point[1]
+            
+            # Create orientation from the trajectory heading if available
+            if len(last_point) > 2:
+                # Convert heading to quaternion
+                quat = tf.quaternion_from_euler(0, 0, last_point[2])
+                self.relay_pose.orientation.x = quat[0]
+                self.relay_pose.orientation.y = quat[1]
+                self.relay_pose.orientation.z = quat[2]
+                self.relay_pose.orientation.w = quat[3]
+            
+            print(f"[{self.name}] ✅ Successfully set relay point from trajectory end point: ({self.relay_pose.position.x}, {self.relay_pose.position.y}) [relay point: {relay_number}]")
             return True
             
         except Exception as e:
-            print(f"[{self.name}] ERROR: Failed to setup relay subscription: {e}")
+            print(f"[{self.name}] ERROR: Failed to setup relay point from trajectory: {e}")
             return False
 
     def setup_robot_subscription(self):
@@ -1199,15 +1194,16 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.P_HOR = self.mpc.N
         
         # 加载轨迹
+        # First load the trajectory and setup relay point from it
         self._load_trajectory()
         
         # Setup ROS subscriptions (using optimized callback groups and QoS)
         print(f"[{self.name}] Setting up ROS subscriptions...")
         robot_sub_ok = self.setup_robot_subscription()
         parcel_sub_ok = self.setup_parcel_subscription()
-        relay_sub_ok = self.setup_relay_subscription()
+        relay_setup_ok = self.setup_relay_subscription()  # Now sets relay_pose from trajectory
         
-        print(f"[{self.name}] Subscription status: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_sub_ok}")
+        print(f"[{self.name}] Subscription status: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_setup_ok}")
         
         # Critical: wait longer to ensure subscriptions are established and callbacks start receiving data
         print(f"[{self.name}] Waiting for subscriptions to establish and data reception...")
@@ -1265,8 +1261,8 @@ class PushObject(py_trees.behaviour.Behaviour):
         """验证话题数据流连通性（使用回调组避免阻塞）"""
         topics = [
             f'/turtlebot{self._extract_namespace_number()}/odom_map',
-            f'/parcel{self.current_parcel_index}/pose',
-            f'/Relaypoint{self._extract_namespace_number()+1}/pose'
+            f'/parcel{self.current_parcel_index}/pose'
+            # Removed relay point topic as we're using trajectory points instead
         ]
         
         print(f"[{self.name}] 📊 Topic connectivity check (node: {self.node.get_name() if self.node else 'None'})")
@@ -1299,7 +1295,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] 📊 Subscription object status:")
         print(f"   robot_pose_sub: {self.robot_pose_sub is not None}")
         print(f"   parcel_pose_sub: {self.parcel_pose_sub is not None}")
-        print(f"   relay_pose_sub: {self.relay_pose_sub is not None}")
+        print(f"   relay_pose: {self.relay_pose is not None} [from trajectory]")
         print(f"   callback_group: {hasattr(self, 'callback_group') and self.callback_group is not None}")
         
         # Force a topic list check to see what topics actually exist
@@ -1500,17 +1496,9 @@ class PushObject(py_trees.behaviour.Behaviour):
                 except Exception as e:
                     subscription_errors.append(f"parcel_pose_sub: {e}")
             
-            # Clean up relay point pose subscription (may have been auto-destroyed)
-            if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub is not None:
-                try:
-                    self.node.destroy_subscription(self.relay_pose_sub)
-                    self.relay_pose_sub = None
-                    print(f"[{self.name}] Relay point subscription cleaned up")
-                except Exception as e:
-                    subscription_errors.append(f"relay_pose_sub: {e}")
-            else:
-                # Relay point subscription may have been automatically destroyed after reading static data
-                print(f"[{self.name}] Relay point subscription already destroyed (normal case)")
+            # Clean up relay point pose (now from trajectory, not subscription)
+            # No need to destroy relay_pose_sub since we're not using it anymore
+            print(f"[{self.name}] Relay point data from trajectory cleaned up")
             
             if subscription_errors:
                 print(f"[{self.name}] Subscription cleanup warnings: {subscription_errors}")
