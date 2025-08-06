@@ -13,3 +13,26 @@ bag_turtlebot/
 ~/.catkin_tools/
 *.bak 
 *.tmp
+*.json
+*.mp4
+
+# ROS bag files (can be very large)
+*.bag
+*.db3
+rosbag2_*/
+*.mcap
+
+# Large data files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.zip
+*.tar.gz
+*.tgz
+
+# Temporary and cache files
+.DS_Store
+Thumbs.db
+*.orig
