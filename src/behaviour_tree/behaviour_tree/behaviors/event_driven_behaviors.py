@@ -68,8 +68,8 @@ class EventDrivenWaitForPush(WaitForPush):
     def parcel_pose_callback(self, msg):
         """Override callback to detect threshold-crossing changes in distance"""
         with self.state_lock:
-            # Store original pose first
-            self.parcel_pose = msg
+            # Store original pose first - extract pose from Odometry message
+            self.parcel_pose = msg.pose.pose
             
             # For non-first robots, skip costly calculations if previous robot hasn't finished pushing
             if not self.is_first_robot and not self.cached_previous_finished:
@@ -84,23 +84,6 @@ class EventDrivenWaitForPush(WaitForPush):
             
             # Use the unified distance event detection
             if self._check_distance_event(current_distance, "Parcel-relay"):
-                self.distance_changed = True
-    
-    def relay_pose_callback(self, msg):
-        """Override callback to detect threshold-crossing changes in distance"""
-        with self.state_lock:
-            # Store original pose first
-            self.relay_pose = msg
-            
-            # Check if parcel pose is available yet
-            if self.parcel_pose is None:
-                return
-            
-            # Calculate distance between parcel and relay point
-            current_distance = self.calculate_distance(self.parcel_pose, self.relay_pose)
-            
-            # Use the unified distance event detection
-            if self._check_distance_event(current_distance, "Relay-parcel"):
                 self.distance_changed = True
     
     def last_robot_pose_callback(self, msg):

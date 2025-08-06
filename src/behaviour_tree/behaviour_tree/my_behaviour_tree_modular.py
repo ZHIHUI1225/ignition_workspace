@@ -24,19 +24,22 @@ from .behaviors import create_root
 
 
 class SharedCallbackGroupManager:
-    """Shared callback group manager for all behaviors in a robot - FIXES CALLBACK GROUP PROLIFERATION"""
+    """Shared callback group manager for all behaviors in a robot - OPTIMAL CALLBACK GROUP ISOLATION"""
     def __init__(self, robot_id):
         self.robot_id = robot_id
         print(f"🔧 [{robot_id}] Creating SharedCallbackGroupManager...")
         
-        # Create ONLY 3 callback groups per robot (instead of 1 per behavior)
-        self.sensor_group = ReentrantCallbackGroup()
-        self.control_group = MutuallyExclusiveCallbackGroup() 
-        self.coordination_group = ReentrantCallbackGroup()
+        # BEST PRACTICE: Separate callback groups for different types of operations
+        # This prevents blocking between different execution flows
+        self.sensor_group = ReentrantCallbackGroup()        # For sensor data subscriptions
+        self.control_group = MutuallyExclusiveCallbackGroup()  # For control timer callbacks (isolated)
+        self.coordination_group = ReentrantCallbackGroup()  # For robot coordination
+        self.bt_group = MutuallyExclusiveCallbackGroup()    # For behavior tree operations (isolated)
         
-        print(f"   ✅ Sensor group: {id(self.sensor_group)}")
-        print(f"   ✅ Control group: {id(self.control_group)}")
-        print(f"   ✅ Coordination group: {id(self.coordination_group)}")
+        print(f"   ✅ Sensor group: {id(self.sensor_group)} (ReentrantCallbackGroup)")
+        print(f"   ✅ Control group: {id(self.control_group)} (MutuallyExclusiveCallbackGroup - isolated)")
+        print(f"   ✅ Coordination group: {id(self.coordination_group)} (ReentrantCallbackGroup)")
+        print(f"   ✅ BT group: {id(self.bt_group)} (MutuallyExclusiveCallbackGroup - isolated)")
     
     def get_group(self, group_type='sensor'):
         """Get callback group by type"""
@@ -44,6 +47,8 @@ class SharedCallbackGroupManager:
             return self.control_group
         elif group_type == 'coordination':
             return self.coordination_group
+        elif group_type == 'bt' or group_type == 'behavior_tree':
+            return self.bt_group
         else:
             return self.sensor_group
 
@@ -108,7 +113,7 @@ def create_managed_subscription(node, msg_type, topic, callback, qos_profile=10,
         topic: Topic name string
         callback: Callback function
         qos_profile: QoS profile (default 10)
-        callback_group_type: Type of callback group ('control', 'sensing', 'coordination', 'monitoring')
+        callback_group_type: Type of callback group ('control', 'sensing', 'coordination')
     
     Returns:
         subscription object or existing subscription if already exists
@@ -259,12 +264,13 @@ def main():
         # 🔧 CRITICAL FIX: Create shared callback group manager to prevent proliferation
         ros_node.shared_callback_manager = SharedCallbackGroupManager(robot_id)
         
-        # 🎯 创建标准化回调组池 - FIXED: Use shared groups instead of creating new ones
+        # 🎯 创建标准化回调组池 - OPTIMAL: Separate groups for different execution flows
         callback_group_pool = {
-            'control': ros_node.shared_callback_manager.control_group,
-            'sensing': ros_node.shared_callback_manager.sensor_group,
-            'coordination': ros_node.shared_callback_manager.coordination_group,
-            'monitoring': ros_node.shared_callback_manager.sensor_group  # Reuse sensor group
+            'control': ros_node.shared_callback_manager.control_group,      # Isolated MutuallyExclusiveCallbackGroup for control timers
+            'sensing': ros_node.shared_callback_manager.sensor_group,       # ReentrantCallbackGroup for sensor subscriptions
+            'sensor': ros_node.shared_callback_manager.sensor_group,        # Alias for 'sensing'
+            'coordination': ros_node.shared_callback_manager.coordination_group,  # ReentrantCallbackGroup for coordination
+            'bt': ros_node.shared_callback_manager.bt_group                 # Isolated MutuallyExclusiveCallbackGroup for BT operations
         }
         
         # 🔧 订阅管理器 - 统一管理订阅生命周期，避免重复创建/销毁
@@ -282,13 +288,13 @@ def main():
         # 🔧 CRITICAL FIX: Add robot_dedicated_callback_group for behaviors compatibility
         ros_node.robot_dedicated_callback_group = ros_node.shared_callback_manager.control_group
         
-        print(f"🎯 [{robot_namespace}] 创建标准化回调组池:")
-        print(f"   • Control CallbackGroup ID: {id(callback_group_pool['control'])}")
-        print(f"   • Sensing CallbackGroup ID: {id(callback_group_pool['sensing'])}")
-        print(f"   • Coordination CallbackGroup ID: {id(callback_group_pool['coordination'])}")
-        print(f"   • Monitoring CallbackGroup ID: {id(callback_group_pool['monitoring'])}")
+        print(f"🎯 [{robot_namespace}] 创建标准化回调组池 - OPTIMAL ISOLATION:")
+        print(f"   • Control CallbackGroup ID: {id(callback_group_pool['control'])} (MutuallyExclusive - isolated)")
+        print(f"   • Sensing CallbackGroup ID: {id(callback_group_pool['sensing'])} (Reentrant)")
+        print(f"   • Coordination CallbackGroup ID: {id(callback_group_pool['coordination'])} (Reentrant)")
+        print(f"   • BT CallbackGroup ID: {id(callback_group_pool['bt'])} (MutuallyExclusive - isolated)")
         print(f"   • 订阅注册器: {len(subscription_registry)} 组件")
-        print(f"   • 回调组池统一管理，避免behaviors重复创建")
+        print(f"   • 🛠️ 最佳实践：控制定时器与BT操作使用独立互斥组，避免阻塞")
         
         # Declare robot parameters to main node
         ros_node.declare_parameter('robot_id', robot_id)

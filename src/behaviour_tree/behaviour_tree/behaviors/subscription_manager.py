@@ -14,7 +14,7 @@ def create_managed_subscription(node, msg_type, topic, callback, qos_profile=10,
         topic: Topic name string
         callback: Callback function
         qos_profile: QoS profile (default 10)
-        callback_group_type: Type of callback group ('control', 'sensing', 'coordination', 'monitoring')
+        callback_group_type: Type of callback group ('control', 'sensing', 'coordination')
     
     Returns:
         subscription object or existing subscription if already exists

@@ -4,7 +4,7 @@ Launch file for multi-robot behavior trees using the modular structure.
 This launches separate behavior tree instances for each robot using the new modular behaviors.
 
 Usage examples:
-    # Launch with default case (simple_maze)
+    # Launch with default case (experi)
     ros2 launch behaviour_tree multi_robot_behaviour_modular.launch.py
     
     # Launch with specific case
@@ -28,7 +28,7 @@ def generate_launch_description():
     # Launch Arguments
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
     num_robots_config = LaunchConfiguration('num_robots', default='3')
-    case = LaunchConfiguration('case', default='simple_maze')
+    case = LaunchConfiguration('case', default='experi')
     
     # Launch description
     ld = LaunchDescription()
@@ -46,14 +46,14 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument(
         'case',
-        default_value='simple_maze',
+        default_value='experi',
         description='Case name for trajectory data and configuration'))
      # Direct robot node creation to avoid OpaqueFunction issues
     # Create behavior tree nodes for each robot with staggered startup
     from launch.actions import TimerAction
     
     # Default to 3 robots, can be adjusted by changing this value
-    num_robots = 3
+    num_robots = 1
     
     for i in range(num_robots):
         robot_namespace = f'robot{i}'

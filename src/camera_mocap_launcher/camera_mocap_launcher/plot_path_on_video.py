@@ -83,13 +83,14 @@ class PathPlotterNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to load waypoint flags: {e}")
 
-        # Load relay points (nodes) from Graph_new_experi.json
+            # Load relay points (nodes) from Graph_new_experi.json
         try:
             graph_file = '/root/workspace/data/Graph_new_experi.json'
             with open(graph_file, 'r') as f:
                 graph_data = json.load(f)
                 # Each node: [id, [x_pixel, y_pixel], null, false]
                 # Note: These coordinates are in world_pixel frame, need to convert to world_meter
+                relay_points_data = []  # Store all relay points data for saving
                 for node in graph_data['nodes']:
                     node_id = node[0]
                     world_px, world_py = node[1]
@@ -98,13 +99,36 @@ class PathPlotterNode(Node):
                     # 2. The last waypoint (regardless of flag), OR
                     # 3. In waypoint flags and have non-zero flags
                     if (node_id == self.first_waypoint) or (node_id == self.last_waypoint) or (node_id in self.waypoint_flags and self.waypoint_flags[node_id] != 0):
-                        # Convert world_pixel to world_meter coordinates for consistency
+                        # Store relay point in world_pixel coordinates
+                        relay_points_data.append({
+                            "id": node_id,
+                            "world_pixel": [world_px, world_py],
+                            "is_first": (node_id == self.first_waypoint),
+                            "is_last": (node_id == self.last_waypoint),
+                            "flag": self.waypoint_flags.get(node_id, 0)
+                        })
+                        
+                        # Convert world_pixel to world_meter coordinates for display
                         world_x, world_y = self.world_pixel_to_world_meter(world_px, world_py)
                         self.relay_points.append((node_id, world_x, world_y))
+                
+                # Save relay points to a dedicated file for easy loading by behavior tree
+                relay_points_file = '/root/workspace/data/relay_points.json'
+                try:
+                    with open(relay_points_file, 'w') as f:
+                        json.dump({
+                            "relay_points": relay_points_data,
+                            "pixel_to_meter_scale": 0.0023,  # Include scale factor for convenience
+                            "description": "Relay points in world_pixel coordinates for robot coordination"
+                        }, f, indent=2)
+                    self.get_logger().info(f"Saved {len(relay_points_data)} relay points to {relay_points_file}")
+                except Exception as save_err:
+                    self.get_logger().error(f"Failed to save relay points file: {save_err}")
+                    
             self.get_logger().info(f"Loaded {len(self.relay_points)} filtered relay points from graph")
         except Exception as e:
             self.get_logger().warn(f"Failed to load graph file: {e}")
-
+            
     def world_pixel_to_world_meter(self, world_px, world_py):
         """Convert world pixel coordinates to world meter coordinates"""
         # Convert world_pixel to world_meter using scale factor

@@ -1,0 +1,46 @@
+{
+  "relay_points": [
+    {
+      "id": 5,
+      "world_pixel": [
+        391.47058823529414,
+        106.66666666666666
+      ],
+      "is_first": false,
+      "is_last": false,
+      "flag": 1
+    },
+    {
+      "id": 6,
+      "world_pixel": [
+        835.3529411764706,
+        106.66666666666666
+      ],
+      "is_first": false,
+      "is_last": false,
+      "flag": 1
+    },
+    {
+      "id": 9,
+      "world_pixel": [
+        150.0,
+        540.0
+      ],
+      "is_first": true,
+      "is_last": false,
+      "flag": 0
+    },
+    {
+      "id": 10,
+      "world_pixel": [
+        980.0,
+        520.0
+      ],
+      "is_first": false,
+      "is_last": true,
+      "flag": 0
+    }
+  ],
+  "pixel_to_meter_scale": 0.0023,
+  "description": "Relay points in world_pixel coordinates for robot coordination"
+}

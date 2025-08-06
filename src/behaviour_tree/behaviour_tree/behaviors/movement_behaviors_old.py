@@ -8,10 +8,8 @@ import py_trees
 import rclpy
 import re
 import traceback
-from queue import Queue, Empty  # Event queue for thread-safe pose updates
-from threading import Lock, Event  # Simple threading for pose data protection
+from queue import Queue, Empty
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64
@@ -26,19 +24,6 @@ import numpy as np
 class RobotMotionPIController:
     """PI controller for robot approach - uses proportional-integral control for stable motion"""
     def __init__(self):
-        # Load control frequency from config_loader - USE SLOWER FREQUENCY FOR STABILITY
-        try:
-            import sys
-            import os
-            sys.path.append('/root/workspace/config')
-            from config_loader import config
-            # Use 2.5x slower frequency than discrete_dt for stable control
-            self.dt = config.discrete_dt * 2.5  # 0.2 * 2.5 = 0.5s (2Hz like old version)
-            print(f"[RobotMotionPIController] Using control dt={self.dt:.2f}s (frequency={1.0/self.dt:.1f}Hz) - slower than planning discrete_dt for stability")
-        except Exception as e:
-            print(f"[RobotMotionPIController] Warning: Could not load config_loader ({e}), using stable default dt=0.5s")
-            self.dt = 0.5  # Use same frequency as old working version
-        
         # Control constraints
         self.vx_max = 0.05   # m/s max velocity in x direction
         self.vy_max = 0.05   # m/s max velocity in y direction
@@ -46,6 +31,7 @@ class RobotMotionPIController:
         # PI controller parameters
         self.kp = 0.8        # Proportional gain
         self.ki = 0.2        # Integral gain
+        self.dt = 0.5        # Control timestep (2Hz)
         
         # PI controller state variables
         self.error_integral = np.array([0.0, 0.0])  # Integral of position error [x, y]
@@ -192,22 +178,23 @@ class RobotMotionPIController:
         }
 
 
-class ApproachObject(py_trees.behaviour.Behaviour):
+class EventDrivenApproachObject(py_trees.behaviour.Behaviour):
     """
-    Approach Object behavior - uses sequential position and orientation control.
+    Event-driven approach object behavior - uses sequential position and orientation control.
     Uses PI controller to make the robot approach the target with separate position and orientation phases.
+    Uses event queue for pose updates to eliminate lock contention.
     """
 
-    def __init__(self, name="ApproachObject", robot_namespace="robot0", approach_distance=0.14):
+    def __init__(self, name="EventDrivenApproachObject", robot_namespace="turtlebot0", approach_distance=0.14):
         """
-        Initialize the ApproachObject behavior.
+        Initialize the EventDrivenApproachObject behavior.
         
         Args:
             name: Name of the behavior node
-            robot_namespace: The robot namespace (e.g., 'robot0', 'turtlebot1')
+            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
             approach_distance: Distance to maintain from the parcel
         """
-        super(ApproachObject, self).__init__(name)
+        super(EventDrivenApproachObject, self).__init__(name)
         self.robot_namespace = robot_namespace
         self.approach_distance = approach_distance
         
@@ -237,7 +224,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self._robot_sub_destroying = False
         self._parcel_sub_destroying = False
         
-        # Event Queue for thread-safe event processing (restored from old version)
+        # Event Queue for thread-safe event processing (replaces locks)
         self._event_queue = Queue()
         self._processing_events = False
         self._last_processed_event_time = 0
@@ -250,27 +237,17 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # PI controller (will be initialized in initialise() method)
         self.controller = None
         
-        # Control loop timer period - load from config_loader for consistency
-        try:
-            import sys
-            import os
-            sys.path.append('/root/workspace/config')
-            from config_loader import config
-            # Use 2.5x slower frequency than discrete_dt for stable control (like old working version)
-            self.dt = config.discrete_dt * 2.5  # 0.2 * 2.5 = 0.5s (2Hz like old version)
-            print(f"[{self.name}][{self.robot_namespace}] Using control dt={self.dt:.2f}s (frequency={1.0/self.dt:.1f}Hz) - slower than planning discrete_dt for stability")
-        except Exception as e:
-            print(f"[{self.name}][{self.robot_namespace}] Warning: Could not load config_loader ({e}), using stable default dt=0.5s")
-            self.dt = 0.5  # Use same frequency as old working version
+        # Control loop timer period for high-frequency control
+        self.dt = 0.5  # Control timestep (2Hz)
         
-        # Control timer and state management
+        # Replace threading with ROS timer for control
         self.control_timer = None
         self.control_active = False
         
         # Thread-safe subscription lock (only used for subscription management)
         self._subscription_lock = Lock()  # Using Lock directly for subscription management only
         
-    # Event queue methods (restored from old working version)
+    # Event queue methods
     def _enqueue_event(self, event_type, data=None):
         """Add an event to the queue with timestamp"""
         event = {
@@ -338,7 +315,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         if msg is None:
             return
             
-        self.parcel_pose = msg.pose.pose
+        self.parcel_pose = msg.pose
         
     def _handle_parcel_index_change(self, new_index):
         """Handle parcel index change event"""
@@ -351,37 +328,52 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         
         # Update subscription after index change
         self.setup_parcel_subscription()
+
+# Keep the original class for backward compatibility but make it inherit from the new one
+class ApproachObject(EventDrivenApproachObject):
+    """
+    Approach Object behavior - uses sequential position and orientation control.
+    Uses PI controller to make the robot approach the target with separate position and orientation phases.
+    
+    This class now inherits from EventDrivenApproachObject for backward compatibility.
+    """
+
+    def __init__(self, name="ApproachObject", robot_namespace="turtlebot0", approach_distance=0.14):
+        """
+        Initialize the ApproachObject behavior.
+        
+        Args:
+            name: Name of the behavior node
+            robot_namespace: The robot namespace (e.g., 'turtlebot0', 'turtlebot1')
+            approach_distance: Distance to maintain from the parcel
+        """
+        super(ApproachObject, self).__init__(name=name, robot_namespace=robot_namespace, approach_distance=approach_distance)
+        print(f"[{name}] 注意: 使用事件驱动的ApproachObject实现以提高性能和稳定性")
+        
+        # For backward compatibility (if any code directly accesses this attribute)
+        self.lock = None
         
     def _stop_robot(self):
         """Helper method to stop the robot safely"""
         try:
-            # 🔧 EXECUTOR CONFLICT FIX: Use dedicated control publisher if available
-            stop_publisher = None
-            if hasattr(self, 'control_cmd_vel_pub') and self.control_cmd_vel_pub is not None:
-                stop_publisher = self.control_cmd_vel_pub
-                pub_source = "dedicated_control"
-            elif self.cmd_vel_pub:
-                stop_publisher = self.cmd_vel_pub
-                pub_source = "main_node"
-            
-            if stop_publisher:
+            if self.cmd_vel_pub:
                 cmd = Twist()
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.0
-                stop_publisher.publish(cmd)
+                self.cmd_vel_pub.publish(cmd)
                 # Debug output for stop commands - only occasionally
                 if not hasattr(self, '_stop_debug_counter'):
                     self._stop_debug_counter = 0
                 self._stop_debug_counter += 1
                 # Only print every 100th stop command to avoid spam
                 if self._stop_debug_counter % 100 == 1:
-                    print(f"[{self.name}][{self.robot_namespace}] 发布停止命令 #{self._stop_debug_counter} ({pub_source}): 线速度=0.0, 角速度=0.0")
+                    print(f"[{self.name}][{self.robot_namespace}] 发布停止命令 #{self._stop_debug_counter}: 线速度=0.0, 角速度=0.0")
         except Exception as e:
             print(f"[{self.name}][{self.robot_namespace}] 警告: 停止机器人时出错: {e}")
 
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
-        match = re.search(r'robot(\d+)', namespace)
+        """Extract number from namespace (e.g., 'turtlebot0' -> 0, 'turtlebot1' -> 1)"""
+        match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
         
     def setup(self, **kwargs):
@@ -395,30 +387,17 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         if 'node' in kwargs:
             self.node = kwargs['node']
             
-            # 🔧 STRICT MODE: Only accept proper shared callback groups
-            if not hasattr(self.node, 'shared_callback_manager'):
-                error_msg = f"[{self.name}] ❌ CRITICAL ERROR: No shared_callback_manager found! This behavior requires shared callback groups."
-                print(error_msg)
-                return False
-            
-            try:
+            # 🔧 CRITICAL FIX: Use shared callback groups to prevent proliferation
+            if hasattr(self.node, 'shared_callback_manager'):
                 self.callback_group = self.node.shared_callback_manager.get_group('sensor')
                 self.control_callback_group = self.node.shared_callback_manager.get_group('control')
-                
-                if self.callback_group is None:
-                    print(f"[{self.name}] ❌ ERROR: Could not get sensor callback group!")
-                    return False
-                    
-                if self.control_callback_group is None:
-                    print(f"[{self.name}] ❌ ERROR: Could not get control callback group!")
-                    return False
-                
-                print(f"[{self.name}] ✅ Using shared callback groups:")
-                print(f"[{self.name}] 🔧 SENSOR GROUP: {type(self.callback_group).__name__}")
-                print(f"[{self.name}] 🔧 CONTROL GROUP: {type(self.control_callback_group).__name__}")
-                
-            except Exception as callback_error:
-                print(f"[{self.name}] ❌ ERROR: Failed to get callback groups: {callback_error}")
+                print(f"[{self.name}] ✅ Using shared callback groups: sensor={id(self.callback_group)}, control={id(self.control_callback_group)}")
+            elif hasattr(self.node, 'robot_dedicated_callback_group'):
+                self.callback_group = self.node.robot_dedicated_callback_group
+                self.control_callback_group = self.node.robot_dedicated_callback_group
+                print(f"[{self.name}] ✅ 使用机器人专用回调组: {id(self.callback_group)}")
+            else:
+                print(f"[{self.name}] ❌ 错误：没有找到shared_callback_manager，无法使用共享回调组")
                 return False
             
             # Initialize state variables early to prevent callback race conditions
@@ -432,80 +411,98 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             self.pushing_estimated_time_pub = self.node.create_publisher(
                 Float64, f'/{self.robot_namespace}/pushing_estimated_time', 10)
             
-            print(f"[{self.name}] ✅ Setup complete: shared callback groups verified, publishers created")
-            print(f"[{self.name}] {self.robot_namespace} setup complete, subscriptions will be created in initialise")
+            print(f"[{self.name}] 回调组已创建，支持并行回调")
+            print(f"[{self.name}] {self.robot_namespace} 设置完成，订阅将在initialise中创建避免竞态条件")
             return True
         
-        error_msg = f"[{self.name}] ❌ CRITICAL ERROR: No ROS node provided in kwargs!"
-        print(error_msg)
         return False
 
     def setup_robot_subscription(self):
-        """Setup robot pose subscription using shared callback group"""
+        """设置机器人姿态订阅（使用非阻塞回调组避免回调阻塞）"""
         if self.node is None:
-            print(f"[{self.name}] WARNING: Cannot setup robot subscription - no ROS node")
+            print(f"[{self.name}] 警告: 无法设置机器人订阅 - 缺少ROS节点")
             return False
             
-        if self.callback_group is None:
-            print(f"[{self.name}] ERROR: Cannot setup robot subscription - no callback group")
-            return False
-            
-        try:
-            # Clean up existing subscription if it exists
-            if self.robot_pose_sub is not None:
-                self.node.destroy_subscription(self.robot_pose_sub)
-                self.robot_pose_sub = None
-            
-            # Create robot subscription using shared callback group
-            robot_odom_topic = f'/robot{self.namespace_number}/odom'
-            self.robot_pose_sub = self.node.create_subscription(
-                Odometry, robot_odom_topic, self.robot_pose_callback, 10,
-                callback_group=self.callback_group)
-            
-            print(f"[{self.name}] ✅ Robot subscription setup complete: {robot_odom_topic}")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] ERROR: Robot subscription setup failed: {e}")
-            return False
+        with self._subscription_lock:
+            try:
+                # Mark for safe destruction if exists
+                if self.robot_pose_sub is not None:
+                    self._robot_sub_destroying = True
+                    time.sleep(0.01)  # Give callbacks time to exit
+                    try:
+                        self.node.destroy_subscription(self.robot_pose_sub)
+                    except Exception as e:
+                        print(f"[{self.name}] 警告: 销毁机器人订阅时出错: {e}")
+                    finally:
+                        self.robot_pose_sub = None
+                        self._robot_sub_destroying = False
+                
+                # 使用回调组创建机器人里程计订阅，避免回调阻塞
+                robot_odom_topic = f'/turtlebot{self.namespace_number}/odom_map'
+                if self.callback_group is not None:
+                    self.robot_pose_sub = self.node.create_subscription(
+                        Odometry, robot_odom_topic, self.robot_pose_callback, 10,
+                        callback_group=self.callback_group)
+                    print(f"[{self.name}] ✓ 机器人订阅设置完成: {robot_odom_topic} (使用非阻塞回调组)")
+                else:
+                    self.robot_pose_sub = self.node.create_subscription(
+                        Odometry, robot_odom_topic, self.robot_pose_callback, 10)
+                    print(f"[{self.name}] ✓ 机器人订阅设置完成: {robot_odom_topic} (使用默认回调组)")
+                return True
+                
+            except Exception as e:
+                print(f"[{self.name}] 错误: 机器人订阅设置失败: {e}")
+                self._robot_sub_destroying = False
+                return False
 
     def setup_parcel_subscription(self):
-        """Setup parcel subscription using shared callback group"""
+        """设置包裹订阅（黑板就绪时使用回调组隔离）- 线程安全"""
         if self.node is None:
-            print(f"[{self.name}] WARNING: Cannot setup parcel subscription - no ROS node")
+            print(f"[{self.name}] 警告: 无法设置包裹订阅 - 缺少ROS节点")
             return False
             
-        if self.callback_group is None:
-            print(f"[{self.name}] ERROR: Cannot setup parcel subscription - no callback group")
-            return False
-            
-        try:
-            # Get current parcel index from blackboard
+        with self._subscription_lock:
             try:
-                current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
-            except Exception as bb_error:
-                print(f"[{self.name}] INFO: Blackboard keys not ready, using default parcel index 0: {bb_error}")
-                current_parcel_index = 0
-            
-            self.current_parcel_index = current_parcel_index
-            
-            # Clean up existing subscription if it exists
-            if self.parcel_pose_sub is not None:
-                self.node.destroy_subscription(self.parcel_pose_sub)
-                self.parcel_pose_sub = None
+                # 从黑板获取当前包裹索引（安全回退）- 修复blackboard访问
+                try:
+                    current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+                    print(f"[{self.name}] 调试: 从黑板获取包裹索引: {current_parcel_index}")
+                except Exception as bb_error:
+                    # 黑板键不存在时使用默认值
+                    print(f"[{self.name}] 信息: 黑板键尚未就绪，使用默认包裹索引0: {bb_error}")
+                    current_parcel_index = 0
                 
-            # Create parcel subscription using shared callback group
-            parcel_topic = f'/parcel{current_parcel_index}/odom'
-            self.parcel_pose_sub = self.node.create_subscription(
-                Odometry, parcel_topic, self.parcel_pose_callback, 10,
-                callback_group=self.callback_group)
-            
-            print(f"[{self.name}] ✅ Parcel subscription setup complete: {parcel_topic}")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] ERROR: Parcel subscription setup failed: {e}")
-            return False
+                self.current_parcel_index = current_parcel_index
+                
+                # Mark for safe destruction if exists
+                if self.parcel_pose_sub is not None:
+                    self._parcel_sub_destroying = True
+                    time.sleep(0.01)  # Give callbacks time to exit
+                    self.node.destroy_subscription(self.parcel_pose_sub)
+                    self.parcel_pose_sub = None
+                    self._parcel_sub_destroying = False
+                    print(f"[{self.name}] 调试: 已安全销毁现有包裹订阅")
+                    
+                # 使用回调组创建新的包裹订阅
+                parcel_topic = f'/parcel{current_parcel_index}/pose'
+                if self.callback_group is not None:
+                    self.parcel_pose_sub = self.node.create_subscription(
+                        PoseStamped, parcel_topic, self.parcel_pose_callback, 10,
+                        callback_group=self.callback_group)
+                    print(f"[{self.name}] ✓ 成功订阅 {parcel_topic} (使用回调组)")
+                else:
+                    self.parcel_pose_sub = self.node.create_subscription(
+                        PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+                    print(f"[{self.name}] ✓ 成功订阅 {parcel_topic} (无回调组)")
+                print(f"[{self.name}] 调试: 包裹订阅对象: {self.parcel_pose_sub}")
+                print(f"[{self.name}] 调试: 节点名称: {self.node.get_name()}")
+                return True
+                
+            except Exception as e:
+                print(f"[{self.name}] 错误: 包裹订阅设置失败: {e}")
+                traceback.print_exc()
+                self._parcel_sub_destroying = False
+                return False
 
     def update_parcel_subscription(self, new_parcel_index=None):
         """更新包裹订阅到正确话题（基于当前索引，始终使用黑板）"""
@@ -536,15 +533,15 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] 调试: 已销毁现有包裹订阅")
             
             # 始终使用当前黑板索引和回调组创建新订阅
-            parcel_topic = f'/parcel{parcel_index}/odom'
+            parcel_topic = f'/parcel{parcel_index}/pose'
             if self.callback_group is not None:
                 self.parcel_pose_sub = self.node.create_subscription(
-                    Odometry, parcel_topic, self.parcel_pose_callback, 10,
+                    PoseStamped, parcel_topic, self.parcel_pose_callback, 10,
                     callback_group=self.callback_group)
                 print(f"[{self.name}] ✓ 包裹订阅已更新: parcel{old_index} -> parcel{parcel_index} (话题: {parcel_topic}) 使用回调组")
             else:
                 self.parcel_pose_sub = self.node.create_subscription(
-                    Odometry, parcel_topic, self.parcel_pose_callback, 10)
+                    PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
                 print(f"[{self.name}] ✓ 包裹订阅已更新: parcel{old_index} -> parcel{parcel_index} (话题: {parcel_topic}) 无回调组")
             
             # Update current_parcel_index after subscription is created successfully
@@ -556,13 +553,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             return False
 
     def robot_pose_callback(self, msg):
-        """Callback for robot pose updates (Odometry message) - event-driven and non-blocking"""
+        """Callback for robot pose updates (Odometry message) - non-blocking and event-driven"""
         # Early exit if subscription is being destroyed
         if self._robot_sub_destroying:
             return
             
         try:
-            # Enqueue event with the message data (thread-safe)
+            # Enqueue event with the message data
             self._enqueue_event('robot_pose_update', msg)
         except Exception as e:
             # Silently handle exceptions during shutdown
@@ -570,13 +567,13 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}][{self.robot_namespace}] 警告: 机器人位姿回调异常: {e}")
 
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates (Odometry message) - event-driven and non-blocking"""
+        """Callback for parcel pose updates (PoseStamped message) - non-blocking and event-driven"""
         # Early exit if subscription is being destroyed
         if self._parcel_sub_destroying:
             return
             
         try:
-            # Enqueue event with the message data (thread-safe)
+            # Enqueue event with the message data
             self._enqueue_event('parcel_pose_update', msg)
         except Exception as e:
             # Silently handle exceptions during shutdown
@@ -594,32 +591,21 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         return euler[2]
 
     def control_loop_callback(self):
-        """Control loop callback for ROS timer - optimized for real-time performance with event processing"""
-        if not hasattr(self, '_callback_count'):
-            self._callback_count = 0
-        self._callback_count += 1
-        
-        # CRITICAL DEBUG: Always print first few callbacks to diagnose timer execution
-        print(f"[{self.name}][{self.robot_namespace}] 🚨 TIMER CALLBACK #{self._callback_count} EXECUTING! active={getattr(self, 'control_active', False)}")
-        
-        # Enhanced debug output - show timer is working
-        if self._callback_count <= 10:  # Increased from 5 to 10 for more debugging
-            print(f"[{self.name}][{self.robot_namespace}] 🎯 Control callback #{self._callback_count} (active: {getattr(self, 'control_active', False)})")
-        
+        """Control loop callback for ROS timer - replaces thread worker"""
         try:
             # Process any pending events first to ensure we have the latest state
             self._process_events()
             
             # Early exit if behavior is inactive
             if not self.control_active:
-                if self._callback_count <= 5:
-                    print(f"[{self.name}][{self.robot_namespace}] ⚠️ Control callback #{self._callback_count} skipped - control_active=False")
                 return
                 
-            # Fast data availability check
-            if self.robot_pose is None or self.parcel_pose is None:
-                if self._callback_count <= 5:
-                    print(f"[{self.name}][{self.robot_namespace}] ⚠️ Control callback #{self._callback_count} skipped - missing pose data (robot: {self.robot_pose is not None}, parcel: {self.parcel_pose is not None})")
+            # Check that required data is available
+            if self.robot_pose is None:
+                return
+                
+            # Check that parcel data is available
+            if self.parcel_pose is None:
                 return
                 
             # Run the control loop logic directly - no lock needed as we process events in the same thread
@@ -627,6 +613,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                 
         except Exception as e:
             print(f"[{self.name}][{self.robot_namespace}] 控制循环错误: {e}")
+            traceback.print_exc()
             try:
                 self._stop_robot()
             except:
@@ -655,7 +642,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             return
         self.target_state = target_state
         
-        # Calculate position and orientation errors using current state
+        # Calculate position and orientation errors
         pos_dist = np.sqrt((self.current_state[0] - self.target_state[0])**2 + 
                           (self.current_state[1] - self.target_state[1])**2)
         angle_diff = abs((self.current_state[2] - self.target_state[2] + np.pi) % (2 * np.pi) - np.pi)
@@ -680,28 +667,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             if self.controller is not None:
                 try:
                     u = self.controller.update_control(self.current_state, self.target_state, self.position_control_achieved)
-                    
-                    # Minimal debug output
-                    if not hasattr(self, '_control_output_debug_counter'):
-                        self._control_output_debug_counter = 0
-                    self._control_output_debug_counter += 1
-                    
-                    # Use dedicated control publisher to avoid node ownership conflicts
-                    control_publisher = None
-                    pub_source = "unknown"
-                    if hasattr(self, 'control_cmd_vel_pub') and self.control_cmd_vel_pub is not None:
-                        control_publisher = self.control_cmd_vel_pub
-                        pub_source = "dedicated_control"
-                    elif self.cmd_vel_pub is not None:
-                        control_publisher = self.cmd_vel_pub
-                        pub_source = "main_cmd_vel"
-                    
-                    # Debug output for first few iterations to diagnose publishing issues
-                    if self._control_output_debug_counter <= 5:
-                        print(f"[{self.name}][{self.robot_namespace}] 🎯 Control #{self._control_output_debug_counter}: "
-                              f"u={u}, publisher={pub_source}, available={control_publisher is not None}")
-                    
-                    if u is not None and control_publisher is not None:
+                    if u is not None and self.cmd_vel_pub:
                         cmd = Twist()
                         # Handle both 2D and 3D velocity commands
                         if len(u) == 3:  # True 2D movement: [vx, vy, angular_z]
@@ -711,28 +677,10 @@ class ApproachObject(py_trees.behaviour.Behaviour):
                         else:  # Differential drive: [linear_x, angular_z]
                             cmd.linear.x = float(u[0])
                             cmd.angular.z = float(u[1])
-                        
-                        control_publisher.publish(cmd)
-                        
-                        # Debug output for first few publishes
-                        if self._control_output_debug_counter <= 5:
-                            print(f"[{self.name}][{self.robot_namespace}] ✅ Published cmd_vel #{self._control_output_debug_counter}: "
-                                  f"linear.x={cmd.linear.x:.3f}, linear.y={cmd.linear.y:.3f}, angular.z={cmd.angular.z:.3f} via {pub_source}")
-                    else:
-                        if self._control_output_debug_counter <= 5:
-                            print(f"[{self.name}][{self.robot_namespace}] ❌ Cannot publish: u={u is not None}, publisher={control_publisher is not None}")
-                            if control_publisher is None:
-                                print(f"[{self.name}][{self.robot_namespace}] ❌ Publisher details: cmd_vel_pub={self.cmd_vel_pub is not None}")
-                        
+                        self.cmd_vel_pub.publish(cmd)
                 except Exception as e:
                     print(f"[{self.name}][{self.robot_namespace}] 错误: PI控制失败: {e}")
                     self._stop_robot()
-            else:
-                if not hasattr(self, '_control_output_debug_counter'):
-                    self._control_output_debug_counter = 0
-                self._control_output_debug_counter += 1
-                if self._control_output_debug_counter % 20 == 1:  # Reduce frequency
-                    print(f"[{self.name}][{self.robot_namespace}] 警告: PI控制器为None")
 
     def get_direction(self, robot_theta, parcel_theta):
         """Get optimal approach direction - from State_switch.py"""
@@ -787,19 +735,19 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         """Publish the pushing estimated time via ROS topic"""
         if self.pushing_estimated_time_pub:
             # Get the current pushing_estimated_time from blackboard, default to 45.0
-            estimated_time = 50.0 # Default estimated time for robot0
+            estimated_time = 50.0 # Default estimated time for turtlebot0
             msg = Float64()
             msg.data = estimated_time
             self.pushing_estimated_time_pub.publish(msg)
 
     def initialise(self):
         """Initialize the behavior when it starts running"""
-        print(f"[{self.name}][{self.robot_namespace}] Starting approach behavior initialization...")
+        print(f"[{self.name}][{self.robot_namespace}] =================== INITIALISE START ===================")
         
         # Reset state variables every time behavior launches
         self.current_state = np.array([0.0, 0.0, 0.0])  # [x, y, theta]
         self.target_state = np.array([0.0, 0.0, 0.0])   # [x, y, theta]
-        # Note: control_active will be set to True after timer creation
+        self.control_active = False
         
         # Control flags
         self.position_control_achieved = False
@@ -825,61 +773,86 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         self._processing_events = False
         self._last_processed_event_time = time.time()
         
-        self.feedback_message = f"[{self.robot_namespace}] Initializing approach behavior"
+        self.feedback_message = f"[{self.robot_namespace}] 初始化事件驱动型接近行为"
         
         # Set default pushing estimated time
         setattr(self.blackboard, f"{self.robot_namespace}/pushing_estimated_time", 45.0)
         
         # Create new PI controller
         self.controller = RobotMotionPIController()
+        
+        # Reset PI controller state for new approach
         self.controller.reset_pi_controller()
         
-        # Setup ROS subscriptions using shared callback groups
+        # 如果节点可用则设置ROS组件
         if self.node:
-            print(f"[{self.name}] Setting up ROS subscriptions...")
-            robot_sub_ok = self.setup_robot_subscription()
-            parcel_sub_ok = self.setup_parcel_subscription()
+            # 停止现有控制线程
+            self.stop_control_thread()
             
-            print(f"[{self.name}] Subscription status: robot={robot_sub_ok}, parcel={parcel_sub_ok}")
+            # 🔧 修复：优雅地销毁现有订阅并等待完成
+            print(f"[{self.name}][{self.robot_namespace}] 第一步：清理现有订阅...")
+            if self.robot_pose_sub is not None:
+                print(f"[{self.name}][{self.robot_namespace}] 销毁现有机器人订阅...")
+                try:
+                    self.node.destroy_subscription(self.robot_pose_sub)
+                    print(f"[{self.name}][{self.robot_namespace}] ✓ 机器人订阅已销毁")
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 销毁机器人订阅时出错: {e}")
+                self.robot_pose_sub = None
+                time.sleep(0.1)  # 等待销毁完成
+                
+            if self.parcel_pose_sub is not None:
+                print(f"[{self.name}][{self.robot_namespace}] 销毁现有包裹订阅...")
+                try:
+                    self.node.destroy_subscription(self.parcel_pose_sub)
+                    print(f"[{self.name}][{self.robot_namespace}] ✓ 包裹订阅已销毁")
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 销毁包裹订阅时出错: {e}")
+                self.parcel_pose_sub = None
+                time.sleep(0.1)  # 等待销毁完成
             
-            # Wait for subscriptions to establish
-            print(f"[{self.name}] Waiting for subscriptions to establish...")
-            time.sleep(0.5)
+            # 🔧 修复：验证订阅设置成功
+            print(f"[{self.name}][{self.robot_namespace}] 第二步：创建新订阅...")
+            success_robot = self.setup_robot_subscription()
+            success_parcel = self.setup_parcel_subscription()
             
-            # Check initial data availability
+            print(f"[{self.name}][{self.robot_namespace}] 订阅创建结果: robot={success_robot}, parcel={success_parcel}")
+            
+            if not success_robot:
+                print(f"[{self.name}][{self.robot_namespace}] ❌ 机器人订阅设置失败")
+            if not success_parcel:
+                print(f"[{self.name}][{self.robot_namespace}] ❌ 包裹订阅设置失败")
+            
+            # 🔧 修复：给ROS更多时间建立订阅连接
+            print(f"[{self.name}][{self.robot_namespace}] 第三步：等待订阅建立连接...")
+            time.sleep(0.8)  # 增加到800ms让订阅完全建立
+            
+            # 🔧 新增：验证话题连通性
+            self.verify_topic_connectivity()
+            
+            # 🔧 新增：再次等待数据开始到达
+            print(f"[{self.name}][{self.robot_namespace}] 第四步：等待数据开始到达...")
+            time.sleep(0.5)  # 再等待500ms让数据开始流动
+            
+            # 🔧 新增：检查初始数据状态
             robot_has_data = self.robot_pose is not None
             parcel_has_data = self.parcel_pose is not None
-            print(f"[{self.name}] Initial data check: robot_data={robot_has_data}, parcel_data={parcel_has_data}")
+            print(f"[{self.name}][{self.robot_namespace}] 初始数据检查: robot_data={robot_has_data}, parcel_data={parcel_has_data}")
             
-            # Start control timer using shared callback group
-            if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
-                self.control_timer = self.node.create_timer(
-                    self.dt,
-                    self.control_loop_callback,
-                    callback_group=self.control_callback_group
-                )
-                print(f"[{self.name}] ✅ Control timer started (period: {self.dt}s, using shared callback group)")
-            else:
-                # Fallback: use default callback group
-                self.control_timer = self.node.create_timer(
-                    self.dt,
-                    self.control_loop_callback
-                )
-                print(f"[{self.name}] ✅ Control timer started (period: {self.dt}s, using default callback group)")
-            
-            # 🔧 CRITICAL FIX: Activate control immediately after timer creation
-            self.control_active = True
-            print(f"[{self.name}] ✅ Control loop activated - timer callbacks will now execute")
+        # 启动专用控制线程而不是ROS定时器
+        print(f"[{self.name}][{self.robot_namespace}] 第五步：启动专用10Hz控制线程...")
+        self.start_control_thread()
         
-        print(f"[{self.name}] Approach behavior initialization complete")
+        print(f"[{self.name}][{self.robot_namespace}] =================== INITIALISE COMPLETE ===================")
+        print(f"[{self.name}][{self.robot_namespace}] 初始化完成，开始等待话题数据...")
     
     def verify_topic_connectivity(self):
         """验证话题连通性和发布者状态"""
         if not self.node:
             return
             
-        robot_topic = f'/robot{self.namespace_number}/odom'
-        parcel_topic = f'/parcel{self.current_parcel_index}/odom'
+        robot_topic = f'/turtlebot{self.namespace_number}/odom_map'
+        parcel_topic = f'/parcel{self.current_parcel_index}/pose'
         
         print(f"[{self.name}][{self.robot_namespace}] 🔍 话题连通性验证:")
         
@@ -955,52 +928,20 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         parcel_pose_available = self.parcel_pose is not None
         
         if not robot_pose_available or not parcel_pose_available:
-            # 🔧 CRITICAL FIX: Add cooldown to prevent constant subscription recreation
-            # Only recreate subscriptions if enough time has passed since last creation
-            current_time = time.time()
-            
-            # Initialize cooldown tracking
-            if not hasattr(self, '_last_subscription_recreation_time'):
-                self._last_subscription_recreation_time = 0
+            # Check if we need to recreate subscriptions
+            if hasattr(self.node, 'count_publishers'):
+                robot_topic = f'/turtlebot{self.namespace_number}/odom_map'
+                parcel_topic = f'/parcel{self.current_parcel_index}/pose'
                 
-            subscription_recreation_cooldown = 3.0  # 3 seconds between recreations
-            time_since_last_recreation = current_time - self._last_subscription_recreation_time
-            
-            # Only attempt subscription recreation if cooldown has passed
-            if time_since_last_recreation >= subscription_recreation_cooldown:
-                if hasattr(self.node, 'count_publishers'):
-                    robot_topic = f'/robot{self.namespace_number}/odom'
-                    parcel_topic = f'/parcel{self.current_parcel_index}/odom'
-
-                    robot_pub_count = self.node.count_publishers(robot_topic)
-                    parcel_pub_count = self.node.count_publishers(parcel_topic)
+                robot_pub_count = self.node.count_publishers(robot_topic)
+                parcel_pub_count = self.node.count_publishers(parcel_topic)
+                
+                # If publishers exist but we have no data, try recreating subscriptions
+                if not robot_pose_available and robot_pub_count > 0:
+                    self.setup_robot_subscription()
                     
-                    # If publishers exist but we have no data and no active subscription, recreate
-                    should_recreate_robot = (not robot_pose_available and robot_pub_count > 0 and 
-                                           self.robot_pose_sub is None)
-                    should_recreate_parcel = (not parcel_pose_available and parcel_pub_count > 0 and 
-                                            self.parcel_pose_sub is None)
-                    
-                    if should_recreate_robot:
-                        print(f"[{self.name}][{self.robot_namespace}] 🔄 重新创建机器人订阅 (冷却期后)")
-                        self.setup_robot_subscription()
-                        self._last_subscription_recreation_time = current_time
-                        
-                    if should_recreate_parcel:
-                        print(f"[{self.name}][{self.robot_namespace}] 🔄 重新创建包裹订阅 (冷却期后)")
-                        self.setup_parcel_subscription()
-                        self._last_subscription_recreation_time = current_time
-            else:
-                # Still in cooldown - just wait
-                remaining_cooldown = subscription_recreation_cooldown - time_since_last_recreation
-                if hasattr(self, '_cooldown_debug_counter'):
-                    self._cooldown_debug_counter += 1
-                else:
-                    self._cooldown_debug_counter = 1
-                    
-                # Only print cooldown message occasionally to avoid spam
-                if self._cooldown_debug_counter % 20 == 1:  # Every 20 ticks
-                    print(f"[{self.name}][{self.robot_namespace}] ⏳ 订阅重建冷却中: {remaining_cooldown:.1f}s 剩余")
+                if not parcel_pose_available and parcel_pub_count > 0:
+                    self.setup_parcel_subscription()
             
             self.feedback_message = f"[{self.robot_namespace}] 等待话题数据... (机器人: {robot_pose_available}, 包裹: {parcel_pose_available})"
             return py_trees.common.Status.RUNNING
@@ -1033,10 +974,10 @@ class ApproachObject(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.RUNNING
                 
     def terminate(self, new_status):
-        """Clean up when behavior terminates - with thread-safe cleanup"""
-        print(f"[{self.name}][{self.robot_namespace}] Starting approach behavior termination, status: {new_status}")
+        """Clean up when behavior terminates - with safe subscription cleanup"""
+        print(f"[{self.name}][{self.robot_namespace}] 开始终止行为，状态: {new_status}")
         
-        # Step 1: Stop control and mark as inactive
+        # Step 1: Stop control and mark as inactive FIRST
         self.control_active = False
         
         # Step 2: Reset control flags
@@ -1045,16 +986,10 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         
         # Step 3: Stop the robot immediately
         self._stop_robot()
+        print(f"[{self.name}][{self.robot_namespace}] 调试: 机器人已停止")
         
-        # Step 4: Stop control timer
-        if hasattr(self, 'control_timer') and self.control_timer is not None:
-            try:
-                self.node.destroy_timer(self.control_timer)
-                self.control_timer = None
-                print(f"[{self.name}][{self.robot_namespace}] Control timer destroyed")
-            except Exception as e:
-                print(f"[{self.name}][{self.robot_namespace}] WARNING: Error destroying timer: {e}")
-                self.control_timer = None
+        # Step 4: Stop the dedicated control thread
+        self.stop_control_thread()
         
         # Step 5: Process any remaining events in the queue
         self._process_events()
@@ -1070,32 +1005,99 @@ class ApproachObject(py_trees.behaviour.Behaviour):
         # Give a moment for events to be fully processed
         time.sleep(0.05)  # 50ms delay to allow thread to complete
         
-        # Step 7: Clean up subscriptions
-        subscription_errors = []
-        
-        if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub is not None:
-            try:
-                self.node.destroy_subscription(self.robot_pose_sub)
-                self.robot_pose_sub = None
-            except Exception as e:
-                subscription_errors.append(f"robot_pose_sub: {e}")
-        
-        if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub is not None:
-            try:
-                self.node.destroy_subscription(self.parcel_pose_sub)
-                self.parcel_pose_sub = None
-            except Exception as e:
-                subscription_errors.append(f"parcel_pose_sub: {e}")
-        
-        if subscription_errors:
-            print(f"[{self.name}][{self.robot_namespace}] Subscription cleanup warnings: {subscription_errors}")
+        # Step 7: Clean up subscriptions with safe destruction
+        with self._subscription_lock:
+            if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub is not None:
+                try:
+                    print(f"[{self.name}][{self.robot_namespace}] 调试: 开始安全销毁机器人订阅...")
+                    self._robot_sub_destroying = True
+                    time.sleep(0.02)  # Give callbacks time to exit gracefully
+                    
+                    if self.node:  # Simple node existence check
+                        self.node.destroy_subscription(self.robot_pose_sub)
+                        print(f"[{self.name}][{self.robot_namespace}] 调试: 机器人姿态订阅已安全销毁")
+                    self.robot_pose_sub = None
+                    self._robot_sub_destroying = False
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 机器人订阅销毁错误: {e}")
+                    self.robot_pose_sub = None
+                    self._robot_sub_destroying = False
+            
+            if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub is not None:
+                try:
+                    print(f"[{self.name}][{self.robot_namespace}] 调试: 开始安全销毁包裹订阅...")
+                    self._parcel_sub_destroying = True
+                    time.sleep(0.02)  # Give callbacks time to exit gracefully
+                    
+                    if self.node:  # Simple node existence check
+                        self.node.destroy_subscription(self.parcel_pose_sub)
+                        print(f"[{self.name}][{self.robot_namespace}] 调试: 包裹姿态订阅已安全销毁")
+                    self.parcel_pose_sub = None
+                    self._parcel_sub_destroying = False
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 包裹订阅销毁错误: {e}")
+                    self.parcel_pose_sub = None
+                    self._parcel_sub_destroying = False
         
         # Step 8: Clear pose data
         self.robot_pose = None
         self.parcel_pose = None
         
-        print(f"[{self.name}][{self.robot_namespace}] Approach behavior termination complete, status: {new_status}")
+        self.feedback_message = f"[{self.robot_namespace}] {self.name} 已终止，状态: {new_status}"
+        print(f"[{self.name}][{self.robot_namespace}] {self.name} 终止完成，状态: {new_status}")
 
+    def start_control_thread(self):
+        """Start control timer (replacing thread with ROS timer) - uses shared callback group"""
+        try:
+            # Stop any existing timer first
+            self.stop_control_thread()
+            
+            # Create timer using shared callback group for unified execution
+            if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
+                self.control_timer = self.node.create_timer(
+                    self.dt,  # 0.1s timer period for 10Hz control
+                    self.control_loop_callback,
+                    callback_group=self.control_callback_group  # Use shared callback group
+                )
+                print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用共享回调组)")
+            else:
+                # Fallback: use default callback group
+                self.control_timer = self.node.create_timer(
+                    self.dt,  # 0.1s timer period
+                    self.control_loop_callback
+                )
+                print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已启动 (周期: {self.dt}s，使用默认回调组)")
+                
+            self.control_active = True
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}][{self.robot_namespace}] 错误: 启动控制定时器失败: {e}")
+            return False
+
+    def stop_control_thread(self):
+        """Stop control timer (replacing thread cleanup with timer cleanup) - thread-safe"""
+        try:
+            # Mark control as inactive first
+            self.control_active = False
+            
+            # Destroy timer if it exists
+            if hasattr(self, 'control_timer') and self.control_timer is not None:
+                try:
+                    self.node.destroy_timer(self.control_timer)
+                    self.control_timer = None
+                    print(f"[{self.name}][{self.robot_namespace}] ✅ 控制定时器已停止")
+                except Exception as e:
+                    print(f"[{self.name}][{self.robot_namespace}] 警告: 停止控制定时器时出错: {e}")
+                    self.control_timer = None
+            
+            # Stop robot immediately
+            self._stop_robot()
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}][{self.robot_namespace}] 错误: 停止控制定时器失败: {e}")
+            return False
 
 class MoveBackward(py_trees.behaviour.Behaviour):
     """Move backward behavior - using event-driven velocity control"""
@@ -1109,8 +1111,8 @@ class MoveBackward(py_trees.behaviour.Behaviour):
         self.robot_pose_sub = None
         self.start_pose = None
         self.current_pose = None
-        self.move_speed = -0.04  # negative for backward movement (reduced from -0.1 for safety)
-        self.robot_namespace = "robot0"  # Default, will be updated from parameters
+        self.move_speed = -0.1  # negative for backward movement
+        self.robot_namespace = "turtlebot0"  # Default, will be updated from parameters
         
         # Event queue for thread-safe pose updates
         self._event_queue = Queue()
@@ -1129,28 +1131,15 @@ class MoveBackward(py_trees.behaviour.Behaviour):
             # Process all available events
             while not self._event_queue.empty():
                 try:
-                    event = self._event_queue.get_nowait()
-                    if event['type'] == 'pose_update':
-                        self.current_pose = event['data']
+                    event_type, data = self._event_queue.get_nowait()
+                    if event_type == 'pose_update':
+                        self.current_pose = data  # Thread-safe update in main thread
                     self._event_queue.task_done()
                     events_processed += 1
                 except Empty:
                     break
         finally:
             self._processing_events = False
-            
-    def robot_pose_callback(self, msg):
-        """Thread-safe callback for robot pose updates using event queue"""
-        # Early exit if subscription is being destroyed
-        if hasattr(self, '_sub_destroying') and self._sub_destroying:
-            return
-            
-        try:
-            # Enqueue pose update event
-            self._event_queue.put({'type': 'pose_update', 'data': msg.pose.pose})
-        except Exception as e:
-            if not self._sub_destroying:
-                print(f"[{self.name}] Warning: Robot pose callback error: {e}")
             
     def setup(self, **kwargs):
         """Setup ROS connections"""
@@ -1160,7 +1149,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
             try:
                 self.robot_namespace = self.ros_node.get_parameter('robot_namespace').get_parameter_value().string_value
             except:
-                self.robot_namespace = "robot0"
+                self.robot_namespace = "turtlebot0"
             
             # Publisher for cmd_vel
             self.cmd_vel_pub = self.ros_node.create_publisher(
@@ -1172,7 +1161,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
                 callback_group = self.ros_node.shared_callback_manager.get_group('sensor')
             
             # Subscriber for robot pose - with callback group if available
-            topic = f'/robot{self.robot_namespace[-1]}/odom'
+            topic = f'/turtlebot{self.robot_namespace[-1]}/odom_map'
             if callback_group:
                 self.robot_pose_sub = self.ros_node.create_subscription(
                     Odometry, topic, self.robot_pose_callback, 10,
@@ -1183,6 +1172,19 @@ class MoveBackward(py_trees.behaviour.Behaviour):
             
             print(f"[{self.name}] Setup complete: subscribed to {topic}")
     
+    def robot_pose_callback(self, msg):
+        """Thread-safe callback for robot pose updates using event queue"""
+        # Early exit if subscription is being destroyed
+        if hasattr(self, '_sub_destroying') and self._sub_destroying:
+            return
+            
+        try:
+            # Enqueue pose update event
+            self._event_queue.put(('pose_update', msg.pose.pose))
+        except Exception as e:
+            if not self._sub_destroying:
+                print(f"[{self.name}] Warning: Robot pose callback error: {e}")
+        
     def calculate_distance_moved(self):
         if self.start_pose is None or self.current_pose is None:
             return 0.0
@@ -1196,6 +1198,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
         while not self._event_queue.empty():
             try:
                 self._event_queue.get_nowait()
+                self._event_queue.task_done()
             except Empty:
                 break
         
@@ -1262,7 +1265,7 @@ class MoveBackward(py_trees.behaviour.Behaviour):
                 self.cmd_vel_pub.publish(stop_cmd)
             from .tree_builder import report_node_failure
             error_msg = f"MoveBackward timeout after {elapsed:.1f}s - failed to reach target distance"
-            report_node_failure(self.name, error_msg, "robot0")  # MoveBackward doesn't have robot_namespace
+            report_node_failure(self.name, error_msg, "turtlebot0")  # MoveBackward doesn't have robot_namespace
             print(f"[{self.name}] Move backward timed out")
             return py_trees.common.Status.FAILURE
         
@@ -1288,6 +1291,14 @@ class MoveBackward(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] Warning: Error destroying subscription: {e}")
             finally:
                 self._sub_destroying = False
+                
+        # Clear event queue
+        while not self._event_queue.empty():
+            try:
+                self._event_queue.get_nowait()
+                self._event_queue.task_done()
+            except Empty:
+                break
                 
         self.feedback_message = f"[{self.robot_namespace}] MoveBackward terminated with status: {new_status}"
         print(f"[{self.name}] MoveBackward terminated with status: {new_status} - robot stopped")

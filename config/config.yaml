@@ -91,10 +91,18 @@ mpc_controller:
   max_angular_velocity: 0.4    # rad/s - consistent with operational limits (23 deg/s)
   min_angular_velocity: -0.4   # rad/s - consistent with operational limits
   
-  # Control frequency and horizon
-  prediction_horizon: 5        # MPC prediction steps
+  # Control frequency and horizon from mobile_robot_mpc.py
+  prediction_horizon: 5        # MPC prediction steps - reduced from 10 to 5 for faster computation
   
-  # PI Controller fallback parameters (when MPC fails)
+  # MPC cost weights from mobile_robot_mpc.py
+  position_weight: 200.0       # Higher position weight (200.0) for better tracking
+  orientation_weight: 3.0      # Lower orientation weight (3.0) to reduce angular sensitivity
+  velocity_weight: 0.2         # Lower velocity weight (0.2)
+  omega_weight: 0.2            # Lower omega weight (0.2)
+  control_linear_weight: 0.05  # Linear control weight (0.05) for more responsive control
+  control_angular_weight: 0.3  # Angular control weight (0.3) for smoother turning
+  
+  # PI Controller fallback parameters from mobile_robot_mpc.py
   pi_controller:
     kp_position: 0.3           # Position proportional gain - further reduced
     ki_position: 0.01          # Position integral gain - further reduced

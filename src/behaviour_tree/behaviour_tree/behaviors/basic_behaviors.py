@@ -29,6 +29,8 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Int32, Float64, Bool
 from std_srvs.srv import Trigger
 
+# Simple relay point loading - no additional utility needed
+
 
 
 
@@ -62,13 +64,15 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.node = None
         self.callback_group = None  # Add callback group for thread isolation
         self.robot_pose_sub = None
-        self.relay_pose_sub = None
         self.parcel_pose_sub = None
         self.last_robot_pose_sub = None
         
+        # Load relay point information from JSON file instead of subscribing to topics
+        self.relay_points_file = '/root/workspace/data/relay_points.json'
+        
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be loaded from relay_points.json
         self.parcel_pose = None
         self.last_robot_pose = None  # New: track last robot position
         self.current_parcel_index = 0
@@ -90,8 +94,13 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.pushing_estimated_time = 45.0
         
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
         import re
+        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
+        match = re.search(r'robot(\d+)', namespace)
+        if match:
+            return int(match.group(1))
+        # Fallback to turtlebot pattern
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
 
@@ -101,7 +110,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         if current_number <= 0:
             return None  # robot0 has no previous robot
         previous_number = current_number - 1
-        return f"turtlebot{previous_number}"
+        return f"robot{previous_number}"
 
     def check_previous_robot_finished(self):
         """Check if the previous robot has finished pushing via ROS topic"""
@@ -202,27 +211,21 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         # Robot pose subscription - 使用专属线程池处理
         self.robot_pose_sub = self.node.create_subscription(
             Odometry,
-            f'/turtlebot{self.namespace_number}/odom_map',
+            f'/robot{self.namespace_number}/odom',
             lambda msg: self.handle_callback_in_dedicated_pool(msg, 'robot_pose'),
             10,
             callback_group=self.callback_group
         )
         
-        # Relay point pose subscription - 使用专属线程池处理
-        self.relay_pose_sub = self.node.create_subscription(
-            PoseStamped,
-            f'/Relaypoint{self.relay_number}/pose',
-            lambda msg: self.handle_callback_in_dedicated_pool(msg, 'relay_pose'),
-            10,
-            callback_group=self.callback_group
-        )
+        # Load relay point from JSON file instead of subscribing to topic
+        self.load_relay_point()
         
         # Last robot pose subscription (only for non-robot0 robots) - 使用专属线程池处理
         self.last_robot_pose_sub = None
         if not self.is_first_robot and self.last_robot_number is not None:
             self.last_robot_pose_sub = self.node.create_subscription(
                 Odometry,
-                f'/turtlebot{self.last_robot_number}/odom_map',
+                f'/robot{self.last_robot_number}/odom',
                 lambda msg: self.handle_callback_in_dedicated_pool(msg, 'last_robot_pose'),
                 10,
                 callback_group=self.callback_group
@@ -235,6 +238,75 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.parcel_pose_sub = None
         print(f"[{self.name}] DEBUG: Subscriptions created with dedicated threadpool for {self.robot_namespace}")
         print(f"[{self.name}] DEBUG: Parcel subscription will be created in initialise() when blackboard is ready")
+    
+    def load_relay_point(self):
+        """Load relay point information from JSON file"""
+        try:
+            # Load relay points from JSON file
+            with open(self.relay_points_file, 'r') as f:
+                relay_data = json.load(f)
+            
+            # Get relay points list and scale factor
+            relay_points = relay_data.get('relay_points', [])
+            pixel_to_meter_scale = relay_data.get('pixel_to_meter_scale', 0.0023)
+            
+            # Find the appropriate relay point based on robot sequence and flags
+            selected_relay_point = None
+            
+            if self.namespace_number == 0:
+                # Robot0 gets the first relay point (is_first: true)
+                for relay_point in relay_points:
+                    if relay_point.get('is_first', False):
+                        selected_relay_point = relay_point
+                        break
+            else:
+                # For other robots, use sequential order among non-first points
+                non_first_points = [rp for rp in relay_points if not rp.get('is_first', False)]
+                non_first_points.sort(key=lambda x: x.get('id', 0))  # Sort by id for consistent order
+                
+                # Robot1 gets first non-first point, Robot2 gets second non-first point, etc.
+                relay_index = self.namespace_number - 1  # robot1->index 0, robot2->index 1, etc.
+                if relay_index < len(non_first_points):
+                    selected_relay_point = non_first_points[relay_index]
+            
+            if selected_relay_point is not None:
+                # Convert pixel coordinates to world coordinates (meters)
+                world_pixel = selected_relay_point['world_pixel']
+                x_meters = world_pixel[0] * pixel_to_meter_scale
+                y_meters = world_pixel[1] * pixel_to_meter_scale
+                
+                # Create PoseStamped message
+                from geometry_msgs.msg import PoseStamped, Point, Quaternion
+                from std_msgs.msg import Header
+                
+                self.relay_pose = PoseStamped()
+                self.relay_pose.header = Header()
+                self.relay_pose.header.frame_id = "map"
+                self.relay_pose.header.stamp.sec = 0
+                
+                self.relay_pose.pose.position = Point()
+                self.relay_pose.pose.position.x = float(x_meters)
+                self.relay_pose.pose.position.y = float(y_meters)
+                self.relay_pose.pose.position.z = 0.0
+                
+                # Default orientation (no rotation)
+                self.relay_pose.pose.orientation = Quaternion()
+                self.relay_pose.pose.orientation.x = 0.0
+                self.relay_pose.pose.orientation.y = 0.0
+                self.relay_pose.pose.orientation.z = 0.0
+                self.relay_pose.pose.orientation.w = 1.0
+                
+                print(f"[{self.name}] ✅ Loaded relay point ID {selected_relay_point['id']} for {self.robot_namespace}: "
+                      f"({x_meters:.3f}, {y_meters:.3f}) [is_first: {selected_relay_point.get('is_first', False)}, "
+                      f"is_last: {selected_relay_point.get('is_last', False)}]")
+            else:
+                print(f"[{self.name}] ❌ ERROR: Could not find appropriate relay point for {self.robot_namespace} "
+                      f"(namespace_number: {self.namespace_number})")
+                self.relay_pose = None
+                    
+        except Exception as e:
+            print(f"[{self.name}] ❌ ERROR: Failed to load relay point from JSON: {e}")
+            self.relay_pose = None
     
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates"""
@@ -251,15 +323,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         if self._robot_pose_count % 50 == 1:  # Print every 50 callbacks
             print(f"[{self.name}] DEBUG: Robot pose updated: ({self.robot_pose.position.x:.3f}, {self.robot_pose.position.y:.3f}), count: {self._robot_pose_count}")
     
-    def relay_pose_callback(self, msg):
-        """Callback for relay point pose updates"""
-        # Check if behavior has been terminated
-        if hasattr(self, '_terminated') and self._terminated:
-            return
-            
-        self.relay_pose = msg
-        # print(f"[{self.name}] DEBUG: Relay{self.relay_number} pose updated: ({msg.position.x:.3f}, {msg.position.y:.3f})")
-    
     def last_robot_pose_callback(self, msg):
         """Callback for last robot pose updates"""
         # Check if behavior has been terminated
@@ -269,13 +332,13 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.last_robot_pose = msg.pose.pose
     
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates"""
+        """Callback for parcel pose updates - handles Odometry message"""
         # Check if behavior has been terminated
         if hasattr(self, '_terminated') and self._terminated:
             return
             
-        self.parcel_pose = msg
-        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}, z={msg.pose.position.z:.3f}")
+        self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
+        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.pose.position.x:.3f}, y={msg.pose.pose.position.y:.3f}, z={msg.pose.pose.position.z:.3f}")
     
     def setup_parcel_subscription(self):
         """Set up parcel subscription when blackboard is ready"""
@@ -295,9 +358,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
                 print(f"[{self.name}] DEBUG: Destroyed existing parcel subscription")
                 
             # Create new parcel subscription with dedicated threadpool for thread isolation
-            parcel_topic = f'/parcel{current_parcel_index}/pose'
+            parcel_topic = f'/parcel{current_parcel_index}/odom'
             self.parcel_pose_sub = self.node.create_subscription(
-                PoseStamped,
+                Odometry,
                 parcel_topic,
                 lambda msg: self.handle_callback_in_dedicated_pool(msg, 'parcel_pose'),
                 10,
@@ -446,10 +509,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             except Exception as e:
                 print(f"[{self.name}] ❌ Error destroying robot_pose_sub: {e}")
                 pass
-        if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub:
-            try:
-                self.node.destroy_subscription(self.relay_pose_sub)
-                self.relay_pose_sub = None
             except:
                 pass
         if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub:
@@ -557,7 +616,7 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         self.last_robot_number = self.namespace_number - 1 if not self.is_first_robot else None
         
         # File-based coordination instead of ROS messages
-        self.case_name = "simple_maze"  # Default case name
+        self.case_name = "experi"  # Default case name
         self._file_exists = True if self.is_first_robot else False  # Internal state, use property access
         
         # File monitoring components
@@ -576,9 +635,12 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         return self._file_exists
     
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
-        match = re.search(r'turtlebot(\d+)', namespace)
-        return int(match.group(1)) if match else 0
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
+        import re
+        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
+        match = re.search(r'robot(\d+)', namespace)
+        if match:
+            return int(match.group(1))
     
     def check_replanned_file_exists(self):
         """Initial check if the replanned trajectory file exists from the last robot"""
@@ -814,41 +876,28 @@ class WaitAction(py_trees.behaviour.Behaviour):
         # Creating separate nodes causes thread proliferation (9 threads per node)
         self.node = None  # Will be set in setup()
         
+        # Load relay point information from JSON file instead of subscribing to topics
+        self.relay_points_file = '/root/workspace/data/relay_points.json'
+        
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be loaded from relay_points.json
         self.parcel_pose = None
         self.current_parcel_index = 0
         
-        # Subscriptions
-        self.robot_pose_sub = self.node.create_subscription(
-            Odometry,
-            f'/turtlebot{self.namespace_number}/odom_map',
-            self.robot_pose_callback,
-            10
-        )
-        
-        self.relay_pose_sub = self.node.create_subscription(
-            PoseStamped,
-            f'/Relaypoint{self.relay_number}/pose',
-            self.relay_pose_callback,
-            10
-        )
-        
-        self.parcel_index_sub = self.node.create_subscription(
-            Int32,
-            f'/{robot_namespace}/current_parcel_index',
-            self.current_index_callback,
-            10
-        )
-        
-        # Will be updated when parcel index is received
+        # Subscriptions (will be created in setup() when node is available)
+        self.robot_pose_sub = None
+        self.parcel_index_sub = None
         self.parcel_pose_sub = None
         
-        # Parcel subscription will be created in initialise() when behavior starts
-        
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
+        import re
+        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
+        match = re.search(r'robot(\d+)', namespace)
+        if match:
+            return int(match.group(1))
+        # Fallback to turtlebot pattern
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
@@ -856,14 +905,79 @@ class WaitAction(py_trees.behaviour.Behaviour):
         """Callback for robot pose updates - handles Odometry message"""
         self.robot_pose = msg.pose.pose
     
-    def relay_pose_callback(self, msg):
-        """Callback for relay point pose updates"""
-        self.relay_pose = msg
+    def load_relay_point(self):
+        """Load relay point information from JSON file"""
+        try:
+            # Load relay points from JSON file
+            with open(self.relay_points_file, 'r') as f:
+                relay_data = json.load(f)
+            
+            # Get relay points list and scale factor
+            relay_points = relay_data.get('relay_points', [])
+            pixel_to_meter_scale = relay_data.get('pixel_to_meter_scale', 0.0023)
+            
+            # Find the appropriate relay point based on robot sequence and flags
+            selected_relay_point = None
+            
+            if self.namespace_number == 0:
+                # Robot0 gets the first relay point (is_first: true)
+                for relay_point in relay_points:
+                    if relay_point.get('is_first', False):
+                        selected_relay_point = relay_point
+                        break
+            else:
+                # For other robots, use sequential order among non-first points
+                non_first_points = [rp for rp in relay_points if not rp.get('is_first', False)]
+                non_first_points.sort(key=lambda x: x.get('id', 0))  # Sort by id for consistent order
+                
+                # Robot1 gets first non-first point, Robot2 gets second non-first point, etc.
+                relay_index = self.namespace_number - 1  # robot1->index 0, robot2->index 1, etc.
+                if relay_index < len(non_first_points):
+                    selected_relay_point = non_first_points[relay_index]
+            
+            if selected_relay_point is not None:
+                # Convert pixel coordinates to world coordinates (meters)
+                world_pixel = selected_relay_point['world_pixel']
+                x_meters = world_pixel[0] * pixel_to_meter_scale
+                y_meters = world_pixel[1] * pixel_to_meter_scale
+                
+                # Create PoseStamped message
+                from geometry_msgs.msg import PoseStamped, Point, Quaternion
+                from std_msgs.msg import Header
+                
+                self.relay_pose = PoseStamped()
+                self.relay_pose.header = Header()
+                self.relay_pose.header.frame_id = "map"
+                self.relay_pose.header.stamp.sec = 0
+                
+                self.relay_pose.pose.position = Point()
+                self.relay_pose.pose.position.x = float(x_meters)
+                self.relay_pose.pose.position.y = float(y_meters)
+                self.relay_pose.pose.position.z = 0.0
+                
+                # Default orientation (no rotation)
+                self.relay_pose.pose.orientation = Quaternion()
+                self.relay_pose.pose.orientation.x = 0.0
+                self.relay_pose.pose.orientation.y = 0.0
+                self.relay_pose.pose.orientation.z = 0.0
+                self.relay_pose.pose.orientation.w = 1.0
+                
+                print(f"[{self.name}] ✅ Loaded relay point ID {selected_relay_point['id']} for {self.robot_namespace}: "
+                      f"({x_meters:.3f}, {y_meters:.3f}) [is_first: {selected_relay_point.get('is_first', False)}, "
+                      f"is_last: {selected_relay_point.get('is_last', False)}]")
+            else:
+                print(f"[{self.name}] ❌ ERROR: Could not find appropriate relay point for {self.robot_namespace} "
+                      f"(namespace_number: {self.namespace_number})")
+                self.relay_pose = None
+                    
+        except Exception as e:
+            print(f"[{self.name}] ❌ ERROR: Failed to load relay point from JSON: {e}")
+            self.relay_pose = None
     
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates"""
-        self.parcel_pose = msg
-        print(f"[{self.name}] Received parcel{self.current_parcel_index} pose: x={msg.pose.position.x:.3f}, y={msg.pose.position.y:.3f}")
+        """Callback for parcel pose updates - handles Odometry message"""
+        self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
+        print(f"[{self.name}] Received parcel{self.current_parcel_index} pose: x={msg.pose.pose.position.x:.3f}, y={msg.pose.pose.position.y:.3f}")
     
     def current_index_callback(self, msg):
         """Callback for current parcel index updates"""
@@ -882,8 +996,8 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         # Create new subscription for current parcel
         self.parcel_pose_sub = self.node.create_subscription(
-            PoseStamped,
-            f'/parcel{self.current_parcel_index}/pose',
+            Odometry,
+            f'/parcel{self.current_parcel_index}/odom',
             self.parcel_pose_callback,
             10
         )
@@ -928,6 +1042,9 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.feedback_message = f"[{self.robot_namespace}] Waiting for {self.duration}s and monitoring parcel proximity"
         print(f"[{self.name}] Starting wait for {self.duration}s with parcel monitoring...")
         print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, relay: Relaypoint{self.relay_number}")
+        
+        # Load relay point from JSON file
+        self.load_relay_point()
         
         # Create initial parcel subscription when behavior starts
         self.update_parcel_subscription()
@@ -1075,8 +1192,10 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         # ROS setup
         self.node = None
         self.robot_pose_sub = None
-        self.relay_pose_sub = None
         self.parcel_pose_sub = None
+        
+        # Load relay point information from JSON file instead of subscribing to topics
+        self.relay_points_file = '/root/workspace/data/relay_points.json'
         
         # Pose storage
         self.robot_pose = None
@@ -1095,7 +1214,13 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         )
     
     def extract_namespace_number(self, namespace):
-        """Extract number from namespace (e.g., 'robot0' -> 0, 'turtlebot1' -> 1)"""
+        """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
+        import re
+        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
+        match = re.search(r'robot(\d+)', namespace)
+        if match:
+            return int(match.group(1))
+        # Fallback to turtlebot pattern
         match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
@@ -1110,18 +1235,13 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
             # Subscribe to robot pose (Odometry)
             self.robot_pose_sub = self.node.create_subscription(
                 Odometry,
-                f'/turtlebot{self.namespace_number}/odom_map',
+                f'/robot{self.namespace_number}/odom',
                 self.robot_pose_callback,
                 10
             )
             
-            # Subscribe to relay point pose
-            self.relay_pose_sub = self.node.create_subscription(
-                PoseStamped,
-                f'/Relaypoint{self.relay_number}/pose',
-                self.relay_pose_callback,
-                10
-            )
+            # Load relay point from JSON file instead of subscribing to topic
+            self.load_relay_point()
             
             # Parcel subscription will be created in initialise() when behavior starts
             
@@ -1142,9 +1262,9 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
             self.node.destroy_subscription(self.parcel_pose_sub)
         
         # Subscribe to current parcel topic
-        parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+        parcel_topic = f'/parcel{self.current_parcel_index}/odom'
         self.parcel_pose_sub = self.node.create_subscription(
-            PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+            Odometry, parcel_topic, self.parcel_pose_callback, 10)
         
         self.node.get_logger().info(f'[{self.name}] Updated parcel subscription to: {parcel_topic}')
     
@@ -1153,15 +1273,79 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         with self.lock:
             self.robot_pose = msg.pose.pose
     
-    def relay_pose_callback(self, msg):
-        """Callback for relay point pose updates"""
-        with self.lock:
-            self.relay_pose = msg
+    def load_relay_point(self):
+        """Load relay point information from JSON file"""
+        try:
+            # Load relay points from JSON file
+            with open(self.relay_points_file, 'r') as f:
+                relay_data = json.load(f)
+            
+            # Get relay points list and scale factor
+            relay_points = relay_data.get('relay_points', [])
+            pixel_to_meter_scale = relay_data.get('pixel_to_meter_scale', 0.0023)
+            
+            # Find the appropriate relay point based on robot sequence and flags
+            selected_relay_point = None
+            
+            if self.namespace_number == 0:
+                # Robot0 gets the first relay point (is_first: true)
+                for relay_point in relay_points:
+                    if relay_point.get('is_first', False):
+                        selected_relay_point = relay_point
+                        break
+            else:
+                # For other robots, use sequential order among non-first points
+                non_first_points = [rp for rp in relay_points if not rp.get('is_first', False)]
+                non_first_points.sort(key=lambda x: x.get('id', 0))  # Sort by id for consistent order
+                
+                # Robot1 gets first non-first point, Robot2 gets second non-first point, etc.
+                relay_index = self.namespace_number - 1  # robot1->index 0, robot2->index 1, etc.
+                if relay_index < len(non_first_points):
+                    selected_relay_point = non_first_points[relay_index]
+            
+            if selected_relay_point is not None:
+                # Convert pixel coordinates to world coordinates (meters)
+                world_pixel = selected_relay_point['world_pixel']
+                x_meters = world_pixel[0] * pixel_to_meter_scale
+                y_meters = world_pixel[1] * pixel_to_meter_scale
+                
+                # Create PoseStamped message
+                from geometry_msgs.msg import PoseStamped, Point, Quaternion
+                from std_msgs.msg import Header
+                
+                self.relay_pose = PoseStamped()
+                self.relay_pose.header = Header()
+                self.relay_pose.header.frame_id = "map"
+                self.relay_pose.header.stamp.sec = 0
+                
+                self.relay_pose.pose.position = Point()
+                self.relay_pose.pose.position.x = float(x_meters)
+                self.relay_pose.pose.position.y = float(y_meters)
+                self.relay_pose.pose.position.z = 0.0
+                
+                # Default orientation (no rotation)
+                self.relay_pose.pose.orientation = Quaternion()
+                self.relay_pose.pose.orientation.x = 0.0
+                self.relay_pose.pose.orientation.y = 0.0
+                self.relay_pose.pose.orientation.z = 0.0
+                self.relay_pose.pose.orientation.w = 1.0
+                
+                print(f"[{self.name}] ✅ Loaded relay point ID {selected_relay_point['id']} for {self.robot_namespace}: "
+                      f"({x_meters:.3f}, {y_meters:.3f}) [is_first: {selected_relay_point.get('is_first', False)}, "
+                      f"is_last: {selected_relay_point.get('is_last', False)}]")
+            else:
+                print(f"[{self.name}] ❌ ERROR: Could not find appropriate relay point for {self.robot_namespace} "
+                      f"(namespace_number: {self.namespace_number})")
+                self.relay_pose = None
+                    
+        except Exception as e:
+            print(f"[{self.name}] ❌ ERROR: Failed to load relay point from JSON: {e}")
+            self.relay_pose = None
     
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates"""
+        """Callback for parcel pose updates - handles Odometry message"""
         with self.lock:
-            self.parcel_pose = msg
+            self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
     
     def update_parcel_subscription(self):
         """Update subscription to the correct parcel topic based on current index from blackboard"""
@@ -1184,9 +1368,9 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
                 self.node.destroy_subscription(self.parcel_pose_sub)
             
             # Subscribe to current parcel topic
-            parcel_topic = f'/parcel{self.current_parcel_index}/pose'
+            parcel_topic = f'/parcel{self.current_parcel_index}/odom'
             self.parcel_pose_sub = self.node.create_subscription(
-                PoseStamped, parcel_topic, self.parcel_pose_callback, 10)
+                Odometry, parcel_topic, self.parcel_pose_callback, 10)
             
             self.node.get_logger().info(f'[{self.name}] Updated parcel subscription: {old_index} -> {self.current_parcel_index}')
     

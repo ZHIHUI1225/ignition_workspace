@@ -17,8 +17,6 @@ from .movement_behaviors import ApproachObject, MoveBackward
 from .manipulation_behaviors import PushObject
 from .Pickup import PickObject
 
-# Control frequency for all behaviors (in seconds)
-CONTROL_DT = 0.5  # 2Hz control frequency
 
 
 def report_node_failure(node_name, error_info, robot_namespace, blackboard_client=None):
@@ -161,11 +159,13 @@ class GlobalExceptionHandler(py_trees.behaviour.Behaviour):
 
 
 
-def create_root(robot_namespace="robot0", case="simple_maze", control_dt=None):
+def create_root(robot_namespace="robot0", case="experi", control_dt=None):
     """Create behavior tree root node with optimized Selector+LoopCondition control and parallel blackboard init"""
-    # Use provided control_dt or fall back to global default
+    # Validate that control_dt is provided
     if control_dt is None:
-        control_dt = CONTROL_DT
+        error_msg = f"[ERROR] control_dt parameter is required but was None for robot {robot_namespace}"
+        print(error_msg)
+        raise ValueError(error_msg)
     
     root = py_trees.composites.Sequence(name="MainSequence", memory=True)
     
