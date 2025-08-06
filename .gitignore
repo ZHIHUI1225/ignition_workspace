@@ -36,3 +36,17 @@ rosbag2_*/
 .DS_Store
 Thumbs.db
 *.orig
+
+# VS Code files
+.vscode/
+*.vc.db
+
+# Large compiled objects and libraries
+*.o
+*.a
+*.so
+*.dylib
+
+# Git pack files and temporary files
+.git/objects/pack/pack-*.pack
+.git/objects/pack/tmp_pack_*
