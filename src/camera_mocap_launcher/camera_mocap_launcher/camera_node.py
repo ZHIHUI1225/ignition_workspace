@@ -117,13 +117,7 @@ class CameraNode(Node):
         # Setup display window (no mouse tracking needed)
         cv2.namedWindow('Camera Feed')
         
-        # Setup video recording
-        self.video_output_path = '/root/workspace/camera_recording.mp4'
-        self.fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.video_fps = 30
-        self.video_writer = None  # Will be initialized on first frame
-        self.is_recording = True  # Flag to control recording
-        self.get_logger().info(f"Video will be saved to: {self.video_output_path}")
+        # Video recording removed
         
         # ROI tracking for consecutive frames
         self.previous_markers = {}  # Store previous marker positions {marker_id: (center_x, center_y)}
@@ -142,15 +136,15 @@ class CameraNode(Node):
         
         self.get_logger().info('Pose prediction system initialized for robust tracking')
         
-        # Log coordinate frame information
-        try:
-            frame_info = get_frame_info()
-            self.get_logger().info("=== Coordinate Frame Configuration ===")
-            for frame_name, frame_data in frame_info.items():
-                self.get_logger().info(f"{frame_data['name']}: Units={frame_data['units']}")
-            self.get_logger().info("Publishing robot poses in world frame (origin: left-lower corner, Y-up, meters)")
-        except Exception as e:
-            self.get_logger().warn(f"Could not load coordinate frame info: {e}")
+        # # Log coordinate frame information
+        # try:
+        #     frame_info = get_frame_info()
+        #     # self.get_logger().info("=== Coordinate Frame Configuration ===")
+        #     for frame_name, frame_data in frame_info.items():
+        #         self.get_logger().info(f"{frame_data['name']}: Units={frame_data['units']}")
+        #     self.get_logger().info("Publishing robot poses in world frame (origin: left-lower corner, Y-up, meters)")
+        # except Exception as e:
+        #     self.get_logger().warn(f"Could not load coordinate frame info: {e}")
 
     def create_roi_mask(self, img_shape):
         """Create ROI mask based on previous marker detections"""
@@ -382,15 +376,15 @@ class CameraNode(Node):
                 if marker_id == 0:
                     self.robot0_publisher.publish(odom_msg)
                     
-                    # Enhanced logging for robot0 with prediction status
-                    if pose_type == 'detected':
-                        print(f"[ROBOT0_POSITION] === DETECTED Position ===")
-                    else:
-                        print(f"[ROBOT0_POSITION] === PREDICTED Position ===")
-                    print(f"[ROBOT0_POSITION] World_meter: x={world_x:.4f}m, y={world_y:.4f}m")
-                    print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {np.degrees(world_angle_rad):.2f} deg")
-                    print(f"[ROBOT0_POSITION] Pose type: {pose_type.upper()}")
-                    print(f"[ROBOT0_POSITION] =====================================")
+                    # # Enhanced logging for robot0 with prediction status
+                    # if pose_type == 'detected':
+                    #     print(f"[ROBOT0_POSITION] === DETECTED Position ===")
+                    # else:
+                    #     print(f"[ROBOT0_POSITION] === PREDICTED Position ===")
+                    # print(f"[ROBOT0_POSITION] World_meter: x={world_x:.4f}m, y={world_y:.4f}m")
+                    # print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {np.degrees(world_angle_rad):.2f} deg")
+                    # print(f"[ROBOT0_POSITION] Pose type: {pose_type.upper()}")
+                    # print(f"[ROBOT0_POSITION] =====================================")
                     success = True
                 elif marker_id == 1:
                     self.robot1_publisher.publish(odom_msg)
@@ -442,11 +436,11 @@ class CameraNode(Node):
                 camera_pixel_x = int(round(center_x))
                 camera_pixel_y = int(round(center_y))
                 yaw_deg = np.degrees(world_angle_rad)
-                print(f"[ROBOT0_POSITION] === Position in different frames ===")
-                print(f"[ROBOT0_POSITION] World_meter: x={world_x:.4f}m, y={world_y:.4f}m")
-                print(f"[ROBOT0_POSITION] Camera_pixel: x={camera_pixel_x}px, y={camera_pixel_y}px (image: 1100x600)")
-                print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {yaw_deg:.2f} deg")
-                print(f"[ROBOT0_POSITION] =====================================")
+                # print(f"[ROBOT0_POSITION] === Position in different frames ===")
+                # print(f"[ROBOT0_POSITION] World_meter: x={world_x:.4f}m, y={world_y:.4f}m")
+                # print(f"[ROBOT0_POSITION] Camera_pixel: x={camera_pixel_x}px, y={camera_pixel_y}px (image: 1100x600)")
+                # print(f"[ROBOT0_POSITION] Orientation: {world_angle_rad:.4f} rad = {yaw_deg:.2f} deg")
+                # print(f"[ROBOT0_POSITION] =====================================")
                 
         except Exception as e:
             self.get_logger().error(f"Error in publish_aruco_pose_simple for marker {marker_id}: {e}")
@@ -473,15 +467,15 @@ class CameraNode(Node):
         clean_img = img.copy()
         
         # Initialize video writer if not already done
-        if self.is_recording and self.video_writer is None:
-            h, w = clean_img.shape[:2]
-            self.video_writer = cv2.VideoWriter(
-                self.video_output_path, 
-                self.fourcc, 
-                self.video_fps, 
-                (w, h)
-            )
-            self.get_logger().info(f"Video recording started: {w}x{h} @ {self.video_fps}fps")
+        # if self.is_recording and self.video_writer is None:
+        #     h, w = clean_img.shape[:2]
+        #     self.video_writer = cv2.VideoWriter(
+        #         self.video_output_path, 
+        #         self.fourcc, 
+        #         self.video_fps, 
+        #         (w, h)
+        #     )
+        #     self.get_logger().info(f"Video recording started: {w}x{h} @ {self.video_fps}fps")
         
         # Publish the clean processed image via ROS2 topic (before ArUco detection)
         try:
@@ -614,10 +608,10 @@ class CameraNode(Node):
         cv2.imshow('Camera Feed', img)
         cv2.waitKey(1)
         
-        # Save frame to video file
-        if self.is_recording and self.video_writer is not None:
-            # Write the frame with ArUco markers and annotations
-            self.video_writer.write(img)
+        # # Save frame to video file
+        # if self.is_recording and self.video_writer is not None:
+        #     # Write the frame with ArUco markers and annotations
+        #     self.video_writer.write(img)
 
     def check_system_health(self):
         """Periodic health check for pose publishing system"""
@@ -629,10 +623,10 @@ class CameraNode(Node):
             else:
                 self.get_logger().info("No markers currently detected")
             
-            # Report video recording status if recording
-            if hasattr(self, 'video_writer') and self.video_writer is not None and self.is_recording:
-                elapsed_time = (self.get_clock().now().nanoseconds / 1e9) - (self.timer.timer_period_ns * self.frame_count / 1e9)
-                self.get_logger().info(f"Video recording in progress: {elapsed_time:.1f} seconds recorded")
+            # # Report video recording status if recording
+            # if hasattr(self, 'video_writer') and self.video_writer is not None and self.is_recording:
+            #     elapsed_time = (self.get_clock().now().nanoseconds / 1e9) - (self.timer.timer_period_ns * self.frame_count / 1e9)
+            #     self.get_logger().info(f"Video recording in progress: {elapsed_time:.1f} seconds recorded")
                 
         except Exception as e:
             self.get_logger().error(f"Error in system health check: {e}")
@@ -653,10 +647,10 @@ class CameraNode(Node):
                 self.cap.release()
                 self.get_logger().info("Camera released")
             
-            # Finalize video recording
-            if hasattr(self, 'video_writer') and self.video_writer is not None:
-                self.video_writer.release()
-                self.get_logger().info(f"Video saved to: {self.video_output_path}")
+            # # Finalize video recording
+            # if hasattr(self, 'video_writer') and self.video_writer is not None:
+            #     self.video_writer.release()
+            #     self.get_logger().info(f"Video saved to: {self.video_output_path}")
             
             # Destroy OpenCV windows
             cv2.destroyAllWindows()
@@ -675,16 +669,13 @@ def main(args=None):
     
     try:
         camera_node = CameraNode()
-        print("Camera node started - press Ctrl+C to stop recording and save the video")
+        print("Camera node started - press Ctrl+C to stop.")
         rclpy.spin(camera_node)
     except KeyboardInterrupt:
         pass
     finally:
         if 'camera_node' in locals():
-            print("Finalizing video recording...")
             camera_node.destroy_node()
-            if hasattr(camera_node, 'video_output_path'):
-                print(f"Video saved to: {camera_node.video_output_path}")
         rclpy.shutdown()
         print("Camera node shutdown complete")
 

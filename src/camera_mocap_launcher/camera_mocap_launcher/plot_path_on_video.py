@@ -47,6 +47,13 @@ class PathPlotterNode(Node):
         cv2.namedWindow(self.window_name)
         self.get_logger().info('PathPlotterNode started.')
 
+        # Video recording setup
+        self.video_output_path = '/root/workspace/camera_ploted.mp4'
+        self.fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.video_fps = 20
+        self.video_writer = None  # Will be initialized on first frame
+        self.is_recording = True  # Set to True to enable recording
+
         # Load trajectory files for each robot
         import os, json
         base_path = '/root/workspace/data/experi'
@@ -296,6 +303,19 @@ class PathPlotterNode(Node):
         cv2.imshow(self.window_name, frame)
         cv2.waitKey(1)
 
+        # Video recording: initialize writer if needed and write frame
+        if self.is_recording:
+            if self.video_writer is None:
+                h, w = frame.shape[:2]
+                self.video_writer = cv2.VideoWriter(
+                    self.video_output_path,
+                    self.fourcc,
+                    self.video_fps,
+                    (w, h)
+                )
+                self.get_logger().info(f"Video recording started: {w}x{h} @ {self.video_fps}fps, saving to {self.video_output_path}")
+            self.video_writer.write(frame)
+
     def world_to_image_coords(self, x, y, img_shape):
         # Convert world coordinates (meters) to camera pixel coordinates using the coordinate transformation function
         try:
@@ -333,6 +353,10 @@ class PathPlotterNode(Node):
             return (camera_px, camera_py)
 
     def destroy_node(self):
+        # Release video writer if recording
+        if hasattr(self, 'video_writer') and self.video_writer is not None:
+            self.video_writer.release()
+            self.get_logger().info(f"Video saved to: {self.video_output_path}")
         cv2.destroyAllWindows()
         super().destroy_node()
 

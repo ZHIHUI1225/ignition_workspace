@@ -14,19 +14,17 @@ import threading
 # Import from existing behaviors
 from .basic_behaviors import WaitForPush
 
+# Add missing ROS message imports
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
+
 
 class EventDrivenWaitForPush(WaitForPush):
     """
-    Event-driven version of WaitForPush behavior.
+    Event-driven version of WaitForPush behavior with threading locks and event queues.
     
-    This version only performs full condition checks when:
-    1. The distance between parcel and relay point changes relative to the threshold
-       (crosses the threshold boundary in either direction)
-    2. The pushing_finished status of the previous robot changes
-    3. For non-robot0 robots: Last robot's position relative to relay point changes
-    
-    Instead of checking on every behavior tree tick (2Hz polling),
-    it only updates when these critical conditions change.
+    This version only checks when the parcel is within range of the relay point.
+    Uses event-driven approach with proper thread safety but simplified logic.
     """
     
     def __init__(self, name, duration=60.0, robot_namespace="robot0", 
@@ -40,23 +38,22 @@ class EventDrivenWaitForPush(WaitForPush):
         # Initialize event-driven state variables
         self._init_event_driven_state()
         
-        print(f"[{self.name}] Event-driven WaitForPush created")
+        # Set case name for trajectory files
+        self.case_name = "experi"  # Default case name
+        
+        print(f"[{self.name}] Event-driven WaitForPush created with threading")
         
     def _init_event_driven_state(self):
         """Initialize state variables for event-driven behavior"""
         # Event flags to track condition changes
         self.distance_changed = False
-        self.status_changed = False
         
         # Cache for distance calculations
         self.prev_parcel_relay_distance = float('inf')
-        self.prev_last_robot_relay_distance = float('inf')
         self.last_distance_to_threshold = float('inf')
         
         # Cached condition checks to avoid recalculation when nothing changed
         self.cached_parcel_in_range = False
-        self.cached_last_robot_out = True  # Default to True for robot0
-        self.cached_previous_finished = True if self.is_first_robot else False
         
         # Track last check time for rate limiting
         self.last_check_time = 0.0
@@ -68,99 +65,56 @@ class EventDrivenWaitForPush(WaitForPush):
     def parcel_pose_callback(self, msg):
         """Override callback to detect threshold-crossing changes in distance"""
         with self.state_lock:
-            # Store original pose first - extract pose from Odometry message
-            self.parcel_pose = msg.pose.pose
+            # Store original pose first
+            previous_pose = self.parcel_pose
             
-            # For non-first robots, skip costly calculations if previous robot hasn't finished pushing
-            if not self.is_first_robot and not self.cached_previous_finished:
-                return
+            # Convert Odometry message to a simple pose for compatibility
+            self.parcel_pose = msg  # Store the full Odometry message
+            
+            # Log first receipt of data
+            if previous_pose is None:
+                try:
+                    print(f"[{self.name}] ✅ Received first parcel pose data: ({msg.pose.pose.position.x:.2f}, {msg.pose.pose.position.y:.2f})")
+                except AttributeError as e:
+                    print(f"[{self.name}] ✅ Received first parcel pose data (error accessing position: {e})")
+                    print(f"[{self.name}] DEBUG: Message type: {type(msg)}, attributes: {dir(msg)}")
             
             # Check if relay pose is available yet
             if self.relay_pose is None:
+                print(f"[{self.name}] DEBUG: Relay pose not available yet, skipping distance calculation")
                 return
                 
             # Calculate distance between parcel and relay point
-            current_distance = self.calculate_distance(self.parcel_pose, self.relay_pose)
-            
-            # Use the unified distance event detection
-            if self._check_distance_event(current_distance, "Parcel-relay"):
-                self.distance_changed = True
-    
-    def last_robot_pose_callback(self, msg):
-        """Override callback to detect if last robot has moved far enough from parcel"""
-        with self.state_lock:
-            # Skip if this is robot0 (no previous robot)
-            if self.is_first_robot:
-                return
+            try:
+                current_distance = self.calculate_distance(self.parcel_pose, self.relay_pose)
+                print(f"[{self.name}] DEBUG: Calculated parcel-relay distance: {current_distance:.3f}m")
                 
-            # Store original pose first 
-            self.last_robot_pose = msg.pose.pose
-            
-            # Skip costly calculations if previous robot hasn't finished pushing
-            if not self.cached_previous_finished:
-                return
-                
-            # Check if parcel pose is available yet
-            if self.parcel_pose is None:
-                return
-            
-            # Calculate distance between last robot and parcel
-            current_distance = self.calculate_distance(self.last_robot_pose, self.parcel_pose)
-            
-            # Special handling for last robot (we care about far/near status specifically)
-            if self.prev_last_robot_relay_distance != float('inf'):
-                was_far = self.prev_last_robot_relay_distance > self.distance_threshold
-                is_far = current_distance > self.distance_threshold
-                
-                # If far/near status changed, flag for check
-                if was_far != is_far:
-                    status = "FAR from" if is_far else "NEAR"
-                    self._trigger_event(f"Last robot moved {status} parcel",
-                                      f"Distance: {current_distance:.3f}m, Threshold: {self.distance_threshold:.3f}m")
+                # Use the unified distance event detection
+                if self._check_distance_event(current_distance, "Parcel-relay"):
                     self.distance_changed = True
-            
-            # Update previous distance (reusing the same variable)
-            self.prev_last_robot_relay_distance = current_distance
-    
-    def previous_robot_pushing_finished_callback(self, msg):
-        """Override callback for previous robot's pushing finished status to detect changes"""
-        with self.state_lock:
-            old_value = self.previous_robot_pushing_finished
-            # Update value from parent class method
-            super().previous_robot_pushing_finished_callback(msg)
-            
-            # Detect status change
-            if old_value != self.previous_robot_pushing_finished:
-                previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
-                self._trigger_event(f"{previous_robot_namespace}/pushing_finished changed to {msg.data}")
-                self.status_changed = True
-    
+                    print(f"[{self.name}] DEBUG: Distance change event triggered")
+            except Exception as e:
+                print(f"[{self.name}] ERROR: Failed to calculate distance in callback: {e}")
+                import traceback
+                traceback.print_exc()
+
     def should_check_conditions(self):
         """Determine if conditions should be checked based on event triggers"""
         current_time = time.time()
         time_since_last_check = current_time - self.last_check_time
         
         with self.state_lock:
-            # For non-first robots waiting for previous robot, reduce check frequency significantly
-            if not self.is_first_robot and not self.cached_previous_finished:
-                # Check much less frequently if waiting for previous robot (5 seconds)
-                forced_check = time_since_last_check > 5.0
-                # Only check when status changes (previous robot finished)
-                should_check = (self.status_changed and time_since_last_check > 0.5) or forced_check
-            else:
-                # Normal check frequency for first robot or when previous robot is finished
-                forced_check = time_since_last_check > 3.0
-                # Increase minimum interval to reduce checking frequency
-                min_interval = 0.3  # Increased to 300ms
-                
-                # Check if distance relationship or status changed and minimum interval passed
-                should_check = ((self.distance_changed or self.status_changed) and 
-                                time_since_last_check > min_interval) or forced_check
+            # Simple check frequency - check when distance changed or forced check
+            forced_check = time_since_last_check > 3.0
+            min_interval = 0.3  # 300ms minimum interval
+            
+            # Check if distance changed and minimum interval passed
+            should_check = ((self.distance_changed) and 
+                            time_since_last_check > min_interval) or forced_check
             
             # Reset flags if we're going to check
             if should_check:
                 self.distance_changed = False
-                self.status_changed = False
                 self.last_check_time = current_time
             
             return should_check
@@ -168,7 +122,7 @@ class EventDrivenWaitForPush(WaitForPush):
     def update(self) -> py_trees.common.Status:
         """
         Event-driven update implementation.
-        Only performs full condition check when positions or statuses have changed.
+        Only performs full condition check when positions have changed.
         """
         if self._check_timeout():
             return py_trees.common.Status.FAILURE
@@ -183,119 +137,93 @@ class EventDrivenWaitForPush(WaitForPush):
         elapsed = time.time() - self.start_time
         if elapsed >= self.duration:
             from .tree_builder import report_node_failure
-            error_msg = f"WaitForPush timeout after {elapsed:.1f}s - previous robot coordination failed"
+            error_msg = f"WaitForPush timeout after {elapsed:.1f}s - parcel never reached relay point"
             report_node_failure(self.name, error_msg, self.robot_namespace)
             print(f"[{self.name}] FAILURE: {error_msg}")
             return True
         return False
     
+    def _format_position(self, pose):
+        """Format a pose object for debug output"""
+        if pose is None:
+            return "Unknown"
+        
+        try:
+            # Handle different message types
+            if hasattr(pose, 'pose'):
+                # Could be Odometry message
+                if hasattr(pose.pose, 'pose'):
+                    return f"({pose.pose.pose.position.x:.2f}, {pose.pose.pose.position.y:.2f})"
+                # Could be PoseStamped message
+                elif hasattr(pose.pose, 'position'):
+                    return f"({pose.pose.position.x:.2f}, {pose.pose.position.y:.2f})"
+            # Direct pose object
+            elif hasattr(pose, 'position'):
+                return f"({pose.position.x:.2f}, {pose.position.y:.2f})"
+            else:
+                return f"Unknown pose type: {type(pose)}"
+        except AttributeError as e:
+            return f"Error: {e}"
+        
+    def _get_distance_info(self):
+        """Get formatted distance information for debug output"""
+        if self.parcel_pose is None or self.relay_pose is None:
+            return "Distance: Unknown"
+        
+        distance = self.calculate_distance(self.parcel_pose, self.relay_pose)
+        return f"Distance: {distance:.3f}m (threshold: {self.distance_threshold:.3f}m)"
+    
     def _get_cached_status(self):
         """Return status based on cached values without full recalculation"""
-        # If no initial distance data yet
-        if self.prev_parcel_relay_distance == float('inf'):
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for initial distance data..."
-            print(f"[{self.name}] Waiting for initial data...")
-            return py_trees.common.Status.RUNNING
+        with self.state_lock:
+            # If no initial distance data yet
+            if self.prev_parcel_relay_distance == float('inf'):
+                self.feedback_message = f"[{self.robot_namespace}] Waiting for initial distance data..."
+                
+                # Add diagnostic info every ~5 seconds
+                elapsed = time.time() - self.start_time
+                if int(elapsed) % 5 == 0:
+                    print(f"[{self.name}] Waiting for initial data, elapsed time: {elapsed:.1f}s")
+                return py_trees.common.Status.RUNNING
+                
+            # If we've already determined success, return that
+            if self.previous_success_state:
+                return py_trees.common.Status.SUCCESS
+                
+            # Otherwise provide feedback with position information
+            parcel_pos = self._format_position(self.parcel_pose)
+            relay_pos = self._format_position(self.relay_pose)
+            distance_info = self._get_distance_info()
             
-        # Use cached results for feedback
-        previous_finished = self.cached_previous_finished
-        last_robot_far_enough = self.cached_last_robot_out  # Same variable, new meaning
-        
-        # If we've already determined success, return that
-        if self.previous_success_state:
-            return py_trees.common.Status.SUCCESS
-            
-        # Otherwise provide appropriate feedback message based on what we're waiting for
-        if not previous_finished:
-            previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for {previous_robot_namespace} to finish pushing..."
-        elif not self.is_first_robot and not last_robot_far_enough:
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for tb{self.last_robot_number} to move away from parcel..."
-        else:
-            self.feedback_message = f"[{self.robot_namespace}] PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}..."
+            self.feedback_message = (
+                f"[{self.robot_namespace}] PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}...\n"
+                f"Parcel pos: {parcel_pos}, Relay pos: {relay_pos}, {distance_info}"
+            )
         
         return py_trees.common.Status.RUNNING
         
     def _perform_full_check(self):
         """Perform a full condition check when events trigger a reevaluation"""
-        elapsed = time.time() - self.start_time
-        
-        # Only log condition checks every ~5 seconds to reduce CPU usage
-        if int(elapsed) % 5 == 0:
-            print(f"[{self.name}] ⚡ Performing event-driven condition check at elapsed: {elapsed:.1f}s")
-        
-        # Add periodic debug information much less frequently (every 60 seconds)
-        if int(elapsed) % 60 == 0:
-            self.debug_coordination_status()
-        
-        # Check conditions in order of priority
-        
-        # 1. Check if previous robot has finished pushing (highest priority)
-        # For non-first robots, this is the gatekeeper check - don't proceed to position checks until this is true
-        if not self._check_previous_robot_status():
-            # If we've been waiting for more than 60 seconds, print debug info
-            if elapsed > 60 and int(elapsed) % 30 == 0:  # Every 30 seconds after first minute
-                print(f"[{self.name}] ⚠️ Still waiting for previous robot after {elapsed:.1f}s, printing debug info:")
-                self.debug_coordination_status()
-            return py_trees.common.Status.RUNNING
-        
-        if self.is_first_robot:
-            # For first robot (robot0), just check if parcel is within range of relay point
-            if not self._check_parcel_position():
-                return py_trees.common.Status.RUNNING
-        else:
-            # For non-robot0 robots, only check these positions AFTER previous robot has finished pushing
-            # This avoids unnecessary calculations when waiting for previous robot
-            
-            # Check if last robot is far enough from parcel
-            if not self._check_last_robot_position():
-                return py_trees.common.Status.RUNNING
-                
-            # And also check if parcel is within range of relay point
-            if not self._check_parcel_position():
-                return py_trees.common.Status.RUNNING
-        
-        # All conditions met - success!
-        print(f"[{self.name}] ⚡ Check result: All conditions satisfied, returning SUCCESS")
-        print(f"[{self.name}] SUCCESS: Ready to proceed with pushing!")
-        self.previous_success_state = True
-        return py_trees.common.Status.SUCCESS
-        
-    def _check_previous_robot_status(self):
-        """Check if previous robot has finished pushing"""
-        previous_finished = self.check_previous_robot_finished()
-        self.cached_previous_finished = previous_finished
-        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
-        
-        if not previous_finished:
-            # Only log every ~10 seconds to reduce CPU usage
+        with self.state_lock:
             elapsed = time.time() - self.start_time
-            if int(elapsed) % 10 == 0:
-                print(f"[{self.name}] ⚡ Check result: Still waiting for {previous_robot_namespace} to finish pushing")
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for {previous_robot_namespace} to finish pushing..."
-            self.previous_success_state = False
-            return False
-        return True
-        
-    def _check_last_robot_position(self):
-        """Check if last robot is far enough from parcel"""
-        # Use our dedicated method for this check
-        last_robot_far_enough = self.check_last_robot_far_from_parcel()
-        self.cached_last_robot_out = last_robot_far_enough  # Reuse the same cache variable
-        
-        # Only log every ~10 seconds to reduce CPU usage
-        elapsed = time.time() - self.start_time
-        log_now = int(elapsed) % 10 == 0
-        
-        if not last_robot_far_enough:
-            if log_now:
-                print(f"[{self.name}] ⚡ Check result: Still waiting for last robot (tb{self.last_robot_number}) to move away from parcel")
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for tb{self.last_robot_number} to move away from parcel..."
-            self.previous_success_state = False
-            return False
-        elif log_now:
-            print(f"[{self.name}] ⚡ Check result: Last robot (tb{self.last_robot_number}) is far enough from parcel")
-        return True
+            
+            # Only log condition checks every ~5 seconds to reduce CPU usage
+            if int(elapsed) % 5 == 0:
+                print(f"[{self.name}] ⚡ Performing event-driven condition check at elapsed: {elapsed:.1f}s")
+            
+            # Simple check: is parcel within range of relay point?
+            if not self._check_parcel_position():
+                return py_trees.common.Status.RUNNING
+            
+            # Success! Parcel is in range
+            print(f"[{self.name}] ⚡ Check result: Parcel is within range, returning SUCCESS")
+            print(f"[{self.name}] SUCCESS: Ready to proceed with pushing!")
+            self.previous_success_state = True
+            
+            # Immediately start cleanup when success is determined
+            self._cleanup_on_success()
+            
+            return py_trees.common.Status.SUCCESS
         
     def _check_parcel_position(self):
         """Check if parcel is within range of relay point"""
@@ -309,40 +237,36 @@ class EventDrivenWaitForPush(WaitForPush):
         if not parcel_in_range:
             if log_now:
                 print(f"[{self.name}] ⚡ Check result: Still waiting for parcel to move within range of relay point")
-            self.feedback_message = f"[{self.robot_namespace}] Waiting for parcel to move within range of relay point..."
             self.previous_success_state = False
             return False
         return True
     
-    def _trigger_event(self, event_description, additional_info=""):
-        """
-        Unified method for triggering events with consistent logging
+    def _cleanup_on_success(self):
+        """Perform immediate cleanup when behavior succeeds to release resources"""
+        print(f"[{self.name}] 🧹 Starting immediate cleanup on success...")
         
-        Args:
-            event_description (str): Description of the event that occurred
-            additional_info (str): Any additional information to include in the log
-        """
-        # Only log events every ~5 seconds to reduce CPU usage
-        elapsed = time.time() - self.start_time
-        if int(elapsed) % 5 == 0:
-            if additional_info:
-                print(f"[{self.name}] ⚡ Event: {event_description}. {additional_info}")
-            else:
-                print(f"[{self.name}] ⚡ Event: {event_description}")
-    
-    def check_last_robot_far_from_parcel(self):
-        """Check if last robot is far enough from parcel"""
-        # For robot0 (first robot), this condition is always satisfied
-        if self.is_first_robot:
-            return True
+        # Mark as terminated to prevent further callbacks
+        self._terminated = True
         
-        # For other robots, check if last robot is far enough from parcel
-        if self.last_robot_pose is None or self.parcel_pose is None:
-            return False  # If we can't determine, assume not satisfied
+        # Stop all event processing
+        self.distance_changed = False
         
-        distance = self.calculate_distance(self.last_robot_pose, self.parcel_pose)
-        is_far_enough = distance > self.distance_threshold
-        return is_far_enough
+        try:
+            # Clean up subscriptions immediately
+            if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub:
+                self.node.destroy_subscription(self.robot_pose_sub)
+                self.robot_pose_sub = None
+                print(f"[{self.name}] ✅ Robot pose subscription cleaned up")
+                
+            if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                self.parcel_pose_sub = None
+                print(f"[{self.name}] ✅ Parcel pose subscription cleaned up")
+                
+        except Exception as e:
+            print(f"[{self.name}] ⚠️ Warning during cleanup: {e}")
+            
+        print(f"[{self.name}] 🧹 Immediate cleanup completed")
     
     def _check_distance_event(self, current_distance, position_label):
         """
@@ -365,10 +289,10 @@ class EventDrivenWaitForPush(WaitForPush):
                 threshold_crossed = (distance_to_threshold * self.last_distance_to_threshold) <= 0  # Sign change
                 
                 if threshold_crossed:
-                    self._trigger_event(
-                        f"{position_label} distance threshold crossing detected",
-                        f"Distance: {current_distance:.3f}m, Threshold: {self.distance_threshold:.3f}m"
-                    )
+                    elapsed = time.time() - self.start_time
+                    if int(elapsed) % 5 == 0:  # Only log every 5 seconds
+                        print(f"[{self.name}] ⚡ Event: {position_label} distance threshold crossing detected, "
+                              f"Distance: {current_distance:.3f}m, Threshold: {self.distance_threshold:.3f}m")
                     
                     # Update cached values
                     self.prev_parcel_relay_distance = current_distance
@@ -379,55 +303,215 @@ class EventDrivenWaitForPush(WaitForPush):
             self.prev_parcel_relay_distance = current_distance
             self.last_distance_to_threshold = distance_to_threshold
             return False
-            
-    # Keeping this for backward compatibility, now just calls the unified method
-    def _check_distance_threshold(self, current_distance, position_label):
-        """
-        Backward compatibility wrapper for _check_distance_event
-        """
-        return self._check_distance_event(current_distance, position_label)
     
-    def debug_coordination_status(self):
-        """Debug method to check the current status of robot coordination"""
-        # Get previous robot namespace if it exists
-        previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace) if not self.is_first_robot else None
+    def terminate(self, new_status):
+        """Clean up when behavior terminates"""
+        print(f"[{self.name}] 🔧 TERMINATING: Cleaning up subscriptions, status: {new_status}")
         
-        print(f"\n[{self.name}] 🔍 COORDINATION DEBUG INFO:")
-        print(f"[{self.name}] Robot namespace: {self.robot_namespace}")
-        print(f"[{self.name}] Is first robot: {self.is_first_robot}")
-        print(f"[{self.name}] Previous robot namespace: {previous_robot_namespace}")
-        print(f"[{self.name}] Previous robot finished status: {self.previous_robot_pushing_finished}")
-        
-        # Check if we have subscribers
-        if hasattr(self, 'pushing_finished_sub') and self.pushing_finished_sub:
-            print(f"[{self.name}] ✅ Subscribed to {previous_robot_namespace}/pushing_finished topic")
-        else:
-            print(f"[{self.name}] ❌ No subscription to previous robot's pushing_finished topic")
-        
-        # Check publisher
-        if hasattr(self, 'pushing_finished_pub') and self.pushing_finished_pub:
-            print(f"[{self.name}] ✅ Publishing to /{self.robot_namespace}/pushing_finished topic")
+        with self.state_lock:
+            # Mark as terminated to prevent further callbacks
+            self._terminated = True
             
-            # Send a test message
-            from std_msgs.msg import Bool
-            test_msg = Bool()
-            test_msg.data = False  # Just a test, don't interfere with actual state
-            self.pushing_finished_pub.publish(test_msg)
-            print(f"[{self.name}] 📤 Sent test message to /{self.robot_namespace}/pushing_finished")
+            # If we haven't already cleaned up on success, do it now
+            if new_status == py_trees.common.Status.SUCCESS:
+                print(f"[{self.name}] 🎯 SUCCESS termination - ensuring cleanup is complete")
+                
+            # Comprehensive cleanup (idempotent - safe to call multiple times)
+            try:
+                if hasattr(self, 'robot_pose_sub') and self.robot_pose_sub:
+                    self.node.destroy_subscription(self.robot_pose_sub)
+                    self.robot_pose_sub = None
+                    
+                if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub:
+                    self.node.destroy_subscription(self.parcel_pose_sub)
+                    self.parcel_pose_sub = None
+                    
+            except Exception as e:
+                print(f"[{self.name}] ⚠️ Warning during termination cleanup: {e}")
+        
+        # Call parent terminate
+        super().terminate(new_status)
+        
+        print(f"[{self.name}] ✅ Termination complete")
+
+    def setup(self, **kwargs):
+        """
+        Setup ROS2 components using shared node from behavior tree.
+        This method is called when the behavior tree is initialized.
+        """
+        # Get the shared ROS node from kwargs or create one if needed
+        if 'node' in kwargs:
+            self.node = kwargs['node']
         else:
-            print(f"[{self.name}] ❌ No publisher for this robot's pushing_finished topic")
+            print(f"[{self.name}] ❌ ERROR: No shared ROS node provided! Behaviors must use shared node to prevent thread proliferation.")
+            return False
         
-        # Print topic communication layout
-        if not self.is_first_robot:
-            print(f"[{self.name}] Expected communication:")
-            print(f"[{self.name}] {previous_robot_namespace} --[/{previous_robot_namespace}/pushing_finished]--> {self.robot_namespace}")
+        # 🔧 CRITICAL FIX: Use shared callback groups to prevent proliferation
+        if hasattr(self.node, 'shared_callback_manager'):
+            self.callback_group = self.node.shared_callback_manager.get_group('coordination')
+            print(f"[{self.name}] ✅ Using shared coordination callback group: {id(self.callback_group)}")
+        elif hasattr(self.node, 'robot_dedicated_callback_group'):
+            self.callback_group = self.node.robot_dedicated_callback_group
+            print(f"[{self.name}] ✅ Using robot dedicated callback group: {id(self.callback_group)}")
+        else:
+            print(f"[{self.name}] ❌ ERROR: No shared callback manager found, cannot use shared callback groups")
+            return False
         
-        print(f"[{self.name}] Current cached values:")
-        print(f"[{self.name}]  - Previous robot finished: {self.cached_previous_finished}")
-        print(f"[{self.name}]  - Last robot far from parcel: {self.cached_last_robot_out}")
-        print(f"[{self.name}]  - Parcel in relay range: {self.cached_parcel_in_range}")
-        print(f"[{self.name}] 🔍 END DEBUG INFO\n")
+        # Setup ROS subscriptions now that we have a node
+        self.setup_subscriptions()
+        
+        # 🔧 NEW: Load relay point from trajectory file immediately during setup
+        self.load_relay_point_from_trajectory()
+        
+        # Call parent setup
+        return super().setup(**kwargs)
     
+    def load_relay_point_from_trajectory(self):
+        """Load relay point from trajectory file"""
+        try:
+            # Use the function from basic_behaviors
+            from .basic_behaviors import load_relay_point_from_trajectory
+            
+            success, relay_pose_msg = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success and relay_pose_msg:
+                self.relay_pose = relay_pose_msg
+                print(f"[{self.name}] ✅ Successfully loaded relay point: ({relay_pose_msg.pose.position.x:.3f}, {relay_pose_msg.pose.position.y:.3f})")
+                return True
+            else:
+                print(f"[{self.name}] ❌ Failed to load relay point from trajectory")
+                return False
+                
+        except Exception as e:
+            print(f"[{self.name}] ❌ Error loading relay point: {e}")
+            return False
+    
+    def setup_parcel_subscription(self):
+        """Set up parcel subscription when blackboard is ready"""
+        if self.node is None:
+            print(f"[{self.name}] WARNING: Cannot setup parcel subscription - no ROS node")
+            return False
+            
+        try:
+            # Get current parcel index from blackboard (with safe fallback)
+            try:
+                current_parcel_index = getattr(self.blackboard, f'{self.robot_namespace}/current_parcel_index', 0)
+                print(f"[{self.name}] Retrieved parcel index from blackboard: {current_parcel_index}")
+            except Exception as bb_error:
+                # Blackboard key doesn't exist yet - use default
+                print(f"[{self.name}] INFO: Blackboard key not ready, using default parcel index 0: {bb_error}")
+                current_parcel_index = 0
+            
+            self.current_parcel_index = current_parcel_index
+            
+            # Clean up existing subscription if it exists
+            if self.parcel_pose_sub is not None:
+                self.node.destroy_subscription(self.parcel_pose_sub)
+                print(f"[{self.name}] Destroyed existing parcel subscription")
+                
+            # Create new parcel subscription with callback group for thread isolation
+            parcel_topic = f'/parcel{current_parcel_index}/odom'
+            if self.callback_group is not None:
+                self.parcel_pose_sub = self.node.create_subscription(
+                    Odometry,  # Now properly imported
+                    parcel_topic,
+                    self.parcel_pose_callback,
+                    10,
+                    callback_group=self.callback_group
+                )
+                print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic} with callback group")
+            else:
+                self.parcel_pose_sub = self.node.create_subscription(
+                    Odometry,  # Now properly imported
+                    parcel_topic,
+                    self.parcel_pose_callback,
+                    10
+                )
+                print(f"[{self.name}] ✓ Successfully subscribed to {parcel_topic} without callback group")
+                
+            # Verify subscription was created successfully
+            if self.parcel_pose_sub is None:
+                print(f"[{self.name}] ❌ ERROR: Failed to create parcel subscription!")
+                return False
+                
+            print(f"[{self.name}] ✅ Parcel subscription verification: topic={parcel_topic}, sub_obj={self.parcel_pose_sub is not None}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] ERROR: Failed to setup parcel subscription: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def initialise(self):
+        """Initialize the behavior when it starts running"""
+        print(f"[{self.name}] =================== INITIALISE START ===================")
+        
+        # Reset state variables every time behavior launches
+        self.start_time = time.time()
+        self._init_event_driven_state()
+        
+        # 🔧 CRITICAL: Ensure relay point is loaded
+        if self.relay_pose is None:
+            print(f"[{self.name}] Relay pose not loaded, attempting to load from trajectory...")
+            if not self.load_relay_point_from_trajectory():
+                print(f"[{self.name}] ❌ CRITICAL: Failed to load relay point from trajectory!")
+            else:
+                print(f"[{self.name}] ✅ Relay point loaded successfully during initialization")
+        
+        # 🔧 CRITICAL: Set up parcel subscription now that blackboard should be ready
+        if not self.setup_parcel_subscription():
+            print(f"[{self.name}] ❌ WARNING: Failed to setup parcel subscription")
+        else:
+            # Verify the subscription is working
+            self._verify_parcel_subscription()
+        
+        self.feedback_message = f"[{self.robot_namespace}] Event-driven PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
+        
+        print(f"[{self.name}] =================== INITIALISE COMPLETE ===================")
+        print(f"[{self.name}] Starting event-driven PUSH wait...")
+        print(f"[{self.name}] Monitoring: parcel{self.current_parcel_index} -> relay{self.relay_number}")
+        print(f"[{self.name}] Relay point available: {self.relay_pose is not None}")
+        print(f"[{self.name}] Parcel subscription active: {self.parcel_pose_sub is not None}")
+
+    def _verify_parcel_subscription(self):
+        """Verify that the parcel subscription is properly set up"""
+        if not self.node:
+            return
+            
+        parcel_topic = f'/parcel{self.current_parcel_index}/odom'
+        
+        try:
+            # Check if topic exists
+            topic_names_and_types = self.node.get_topic_names_and_types()
+            available_topics = [name for name, _ in topic_names_and_types]
+            
+            topic_exists = parcel_topic in available_topics
+            pub_count = self.node.count_publishers(parcel_topic) if topic_exists else 0
+            sub_count = self.node.count_subscribers(parcel_topic) if topic_exists else 0
+            
+            print(f"[{self.name}] 🔍 Parcel subscription verification:")
+            print(f"[{self.name}]   - Topic: {parcel_topic}")
+            print(f"[{self.name}]   - Topic exists: {topic_exists}")
+            print(f"[{self.name}]   - Publishers: {pub_count}")
+            print(f"[{self.name}]   - Subscribers: {sub_count}")
+            print(f"[{self.name}]   - Our subscription object: {self.parcel_pose_sub is not None}")
+            
+            if not topic_exists:
+                print(f"[{self.name}] ❌ ERROR: Parcel topic {parcel_topic} does not exist!")
+            elif pub_count == 0:
+                print(f"[{self.name}] ❌ ERROR: No publishers for {parcel_topic}!")
+            elif self.parcel_pose_sub is None:
+                print(f"[{self.name}] ❌ ERROR: Our subscription object is None!")
+            else:
+                print(f"[{self.name}] ✅ Parcel subscription looks good")
+                
+        except Exception as e:
+            print(f"[{self.name}] ❌ ERROR: Failed to verify parcel subscription: {e}")
 
 def create_event_driven_wait_for_push(name, duration=60.0, robot_namespace="robot0", 
                                      distance_threshold=0.14):

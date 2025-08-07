@@ -24,22 +24,19 @@ from .behaviors import create_root
 
 
 class SharedCallbackGroupManager:
-    """Shared callback group manager for all behaviors in a robot - OPTIMAL CALLBACK GROUP ISOLATION"""
+    """Shared callback group manager for all behaviors in a robot - FIXES CALLBACK GROUP PROLIFERATION"""
     def __init__(self, robot_id):
         self.robot_id = robot_id
         print(f"🔧 [{robot_id}] Creating SharedCallbackGroupManager...")
         
-        # BEST PRACTICE: Separate callback groups for different types of operations
-        # This prevents blocking between different execution flows
-        self.sensor_group = ReentrantCallbackGroup()        # For sensor data subscriptions
-        self.control_group = MutuallyExclusiveCallbackGroup()  # For control timer callbacks (isolated)
-        self.coordination_group = ReentrantCallbackGroup()  # For robot coordination
-        self.bt_group = MutuallyExclusiveCallbackGroup()    # For behavior tree operations (isolated)
+        # Create ONLY 3 callback groups per robot (instead of 1 per behavior)
+        self.sensor_group = ReentrantCallbackGroup()
+        self.control_group = MutuallyExclusiveCallbackGroup() 
+        self.coordination_group = ReentrantCallbackGroup()
         
-        print(f"   ✅ Sensor group: {id(self.sensor_group)} (ReentrantCallbackGroup)")
-        print(f"   ✅ Control group: {id(self.control_group)} (MutuallyExclusiveCallbackGroup - isolated)")
-        print(f"   ✅ Coordination group: {id(self.coordination_group)} (ReentrantCallbackGroup)")
-        print(f"   ✅ BT group: {id(self.bt_group)} (MutuallyExclusiveCallbackGroup - isolated)")
+        print(f"   ✅ Sensor group: {id(self.sensor_group)}")
+        print(f"   ✅ Control group: {id(self.control_group)}")
+        print(f"   ✅ Coordination group: {id(self.coordination_group)}")
     
     def get_group(self, group_type='sensor'):
         """Get callback group by type"""
@@ -47,8 +44,6 @@ class SharedCallbackGroupManager:
             return self.control_group
         elif group_type == 'coordination':
             return self.coordination_group
-        elif group_type == 'bt' or group_type == 'behavior_tree':
-            return self.bt_group
         else:
             return self.sensor_group
 
@@ -65,13 +60,12 @@ def setup_snapshot_streams(node, robot_namespace=""):
         pass
     
     # Build snapshot stream topic name
-    if robot_namespace:
-        snapshot_topic = f"/{robot_namespace}/tree/snapshot_streams"
-    else:
-        snapshot_topic = "/tree/snapshot_streams"
+    # When creating the ROS node, we set the namespace to "robot{i}", so this ensures 
+    # that topics are published under that namespace
+    snapshot_topic = "tree/snapshot_streams"  # Will be prefixed with namespace
     
     node.get_logger().info("Snapshot streams configured for PyTrees Viewer")
-    node.get_logger().info(f"Connect PyTrees Viewer to: {snapshot_topic}")
+    node.get_logger().info(f"Connect PyTrees Viewer to: /{robot_namespace}/{snapshot_topic}")
     
     return snapshot_topic
 
@@ -113,7 +107,7 @@ def create_managed_subscription(node, msg_type, topic, callback, qos_profile=10,
         topic: Topic name string
         callback: Callback function
         qos_profile: QoS profile (default 10)
-        callback_group_type: Type of callback group ('control', 'sensing', 'coordination')
+        callback_group_type: Type of callback group ('control', 'sensing', 'coordination', 'monitoring')
     
     Returns:
         subscription object or existing subscription if already exists
@@ -236,9 +230,9 @@ def main():
         # Declare and get parameters
         try:
             temp_node.declare_parameter('robot_id', 0)
-            temp_node.declare_parameter('robot_namespace', 'turtlebot0')
-            temp_node.declare_parameter('case', 'simple_maze')
-            temp_node.declare_parameter('CONTROL_DT', 0.5)
+            temp_node.declare_parameter('robot_namespace', 'robot0')
+            temp_node.declare_parameter('case', 'experi')
+            temp_node.declare_parameter('CONTROL_DT', 0.2)
             robot_id = temp_node.get_parameter('robot_id').get_parameter_value().integer_value
             robot_namespace = temp_node.get_parameter('robot_namespace').get_parameter_value().string_value
             case = temp_node.get_parameter('case').get_parameter_value().string_value
@@ -246,9 +240,9 @@ def main():
         except Exception as e:
             print(f"Warning: Could not get robot parameters: {e}")
             robot_id = 0
-            robot_namespace = "turtlebot0"
-            case = "simple_maze"
-            control_dt = 0.5
+            robot_namespace = "robot0"
+            case = "experi"
+            control_dt = 0.2
         
         # Destroy temporary node
         temp_node.destroy_node()
@@ -256,21 +250,24 @@ def main():
         # Create ROS node for executor and snapshot publishing 
         # 🔧 关键修复：为每个机器人创建唯一的节点名称避免冲突
         unique_node_name = f"tree_{robot_id}"
-        ros_node = rclpy.create_node(unique_node_name)
-        
+        # Create the node with proper namespace to ensure topics are published in the robot's namespace
+        # This ensures topics appear as /robot{i}/... instead of /robot{i}/...
+        ros_node = rclpy.create_node(
+            unique_node_name,
+            namespace=f"robot{robot_id}"  # Explicitly set namespace to match robot{i} format
+        )
         # 🔧 关键优化：为每个机器人BT节点创建标准化回调组池
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
         
         # 🔧 CRITICAL FIX: Create shared callback group manager to prevent proliferation
         ros_node.shared_callback_manager = SharedCallbackGroupManager(robot_id)
         
-        # 🎯 创建标准化回调组池 - OPTIMAL: Separate groups for different execution flows
+        # 🎯 创建标准化回调组池 - FIXED: Use shared groups instead of creating new ones
         callback_group_pool = {
-            'control': ros_node.shared_callback_manager.control_group,      # Isolated MutuallyExclusiveCallbackGroup for control timers
-            'sensing': ros_node.shared_callback_manager.sensor_group,       # ReentrantCallbackGroup for sensor subscriptions
-            'sensor': ros_node.shared_callback_manager.sensor_group,        # Alias for 'sensing'
-            'coordination': ros_node.shared_callback_manager.coordination_group,  # ReentrantCallbackGroup for coordination
-            'bt': ros_node.shared_callback_manager.bt_group                 # Isolated MutuallyExclusiveCallbackGroup for BT operations
+            'control': ros_node.shared_callback_manager.control_group,
+            'sensing': ros_node.shared_callback_manager.sensor_group,
+            'coordination': ros_node.shared_callback_manager.coordination_group,
+            'monitoring': ros_node.shared_callback_manager.sensor_group  # Reuse sensor group
         }
         
         # 🔧 订阅管理器 - 统一管理订阅生命周期，避免重复创建/销毁
@@ -288,13 +285,13 @@ def main():
         # 🔧 CRITICAL FIX: Add robot_dedicated_callback_group for behaviors compatibility
         ros_node.robot_dedicated_callback_group = ros_node.shared_callback_manager.control_group
         
-        print(f"🎯 [{robot_namespace}] 创建标准化回调组池 - OPTIMAL ISOLATION:")
-        print(f"   • Control CallbackGroup ID: {id(callback_group_pool['control'])} (MutuallyExclusive - isolated)")
-        print(f"   • Sensing CallbackGroup ID: {id(callback_group_pool['sensing'])} (Reentrant)")
-        print(f"   • Coordination CallbackGroup ID: {id(callback_group_pool['coordination'])} (Reentrant)")
-        print(f"   • BT CallbackGroup ID: {id(callback_group_pool['bt'])} (MutuallyExclusive - isolated)")
+        print(f"🎯 [{robot_namespace}] 创建标准化回调组池:")
+        print(f"   • Control CallbackGroup ID: {id(callback_group_pool['control'])}")
+        print(f"   • Sensing CallbackGroup ID: {id(callback_group_pool['sensing'])}")
+        print(f"   • Coordination CallbackGroup ID: {id(callback_group_pool['coordination'])}")
+        print(f"   • Monitoring CallbackGroup ID: {id(callback_group_pool['monitoring'])}")
         print(f"   • 订阅注册器: {len(subscription_registry)} 组件")
-        print(f"   • 🛠️ 最佳实践：控制定时器与BT操作使用独立互斥组，避免阻塞")
+        print(f"   • 回调组池统一管理，避免behaviors重复创建")
         
         # Declare robot parameters to main node
         ros_node.declare_parameter('robot_id', robot_id)
@@ -309,7 +306,7 @@ def main():
         print(f"="*80)
         
         # Create behavior tree
-        # Use robot_namespace directly since we now use "turtlebot{i}" format throughout
+        # Use robot_namespace directly since we now use "robot{i}" format throughout
         # Use case parameter from launch file and control_dt parameter
         root = create_root(robot_namespace, case=case, control_dt=control_dt)
         
@@ -340,6 +337,7 @@ def main():
         print(f"  - /{robot_namespace}/tree_log")
         print(f"  - /{robot_namespace}/tree_snapshot")  
         print(f"  - /{robot_namespace}/tree_updates")
+        print(f"  - /{robot_namespace}/tree/snapshot_streams")  # Add this topic too
         print("="*80)
         
         # Use py_trees_ros.trees.BehaviourTree to create ROS-integrated behavior tree

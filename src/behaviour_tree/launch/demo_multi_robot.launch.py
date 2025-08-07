@@ -25,8 +25,8 @@ def generate_launch_description():
     
     # Launch behavior trees for 2 robots only (for demo)
     robot_configs = [
-        {'id': 0, 'namespace': 'turtlebot0'},
-        {'id': 1, 'namespace': 'turtlebot1'}
+        {'id': 0, 'namespace': 'robot0'},
+        {'id': 1, 'namespace': 'robot1'}
     ]
     
     for robot in robot_configs:

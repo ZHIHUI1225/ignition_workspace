@@ -49,6 +49,7 @@ __all__ = [
     'CheckPairComplete',
     'IncrementIndex',
     'PrintMessage',
+    'PlanningConfig',
     
     # Movement behaviors
     'ApproachObject',

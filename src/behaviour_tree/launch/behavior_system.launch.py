@@ -38,8 +38,8 @@ def generate_launch_description():
     
     # Launch Follow controllers for each robot
     for i in range(5):  # tb0 to tb4
-        namespace = f'turtlebot{i}'
-        robot_name = f'turtlebot{i}'
+        namespace = f'robot{i}'
+        robot_name = f'robot{i}'
         
         # Follow controller for this robot
         follow_controller = Node(

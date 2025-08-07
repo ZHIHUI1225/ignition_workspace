@@ -23,7 +23,7 @@ import math
 
 def extract_namespace_number(namespace):
     """Extract numerical index from robot namespace"""
-    match = re.search(r'turtlebot(\d+)', namespace)
+    match = re.search(r'robot(\d+)', namespace)
     return int(match.group(1)) if match else 0
 
 def report_node_failure(node_name, error_info, robot_namespace):
@@ -250,7 +250,7 @@ class MobileRobotMPC:
 class PickObject(py_trees.behaviour.Behaviour):
     """Pick object behavior using MPC controller for trajectory following"""
     
-    def __init__(self, name, robot_namespace="robot0", timeout=100.0, estimated_time=55.0, dt=0.5, case="simple_maze"):
+    def __init__(self, name, robot_namespace="robot0", timeout=100.0, estimated_time=55.0, dt=0.5, case="experi"):
         super().__init__(name)
         self.start_time = None
         self.picking_active = False
@@ -491,7 +491,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             try:
                 self.case = self.node.get_parameter('case').get_parameter_value().string_value
             except:
-                self.case = "simple_maze"
+                self.case = "experi"
             
             # Setup ROS publishers and subscribers for MPC control
             # Note: Subscriptions will be created in initialise(), not here
@@ -552,7 +552,7 @@ class PickObject(py_trees.behaviour.Behaviour):
             # Create new subscription with shared callback group
             self.robot_pose_sub = self.node.create_subscription(
                 Odometry,
-                f'/{self.robot_namespace}/odom_map',
+                f'/{self.robot_namespace}/odom',
                 self._robot_pose_callback,
                 10,
                 callback_group=self.pose_callback_group  # Use shared callback group
@@ -948,8 +948,7 @@ class PickObject(py_trees.behaviour.Behaviour):
     def check_topic_connectivity(self):
         """Verify topic data flow connectivity (non-blocking)."""
         topics = [
-            f'/{self.robot_namespace}/odom_map',
-            f'/Relaypoint{self.number}/pose'
+            f'/{self.robot_namespace}/odom',
         ]
         
         print(f"[{self.name}] 📊 Topic Connectivity Check (Node: {self.node.get_name() if self.node else 'None'})")
@@ -960,26 +959,19 @@ class PickObject(py_trees.behaviour.Behaviour):
                 subscribers = self.node.count_subscribers(topic)
                 if publishers == 0:
                     print(f"⚠️ Topic {topic} has no publishers!")
-                else:
-                    if "Relaypoint" in topic:
-                        if self.relay_pose is not None:
-                            print(f"✅ Relay data acquired {topic} (Pubs: {publishers}, Subs: {subscribers}) [Static]")
-                        else:
-                            print(f"✅ Connected to {topic} (Pubs: {publishers}, Subs: {subscribers}) [Waiting for static data]")
-                    else:
-                        print(f"✅ Connected to {topic} (Pubs: {publishers}, Subs: {subscribers})")
+
             except Exception as e:
                 print(f"❌ Topic check failed for {topic}: {str(e)}")
                 
         # Additional debug: Check if callbacks are actually being triggered
         print(f"[{self.name}] 📊 Callback Status Check:")
         print(f"   Robot State: {self.current_state is not None and not np.allclose(self.current_state, [0.0, 0.0, 0.0])} (Callbacks: {getattr(self, '_robot_callback_count', 0)})")
-        print(f"   Relay Pose: {self.relay_pose is not None}")
+
         
         # Check subscription objects
         print(f"[{self.name}] 📊 Subscription Object Status:")
         print(f"   robot_pose_sub: {self.robot_pose_sub is not None}")
-        print(f"   relay_pose_sub: {self.relay_pose_sub is not None}")
+
         
         # Force a topic list check to see what topics actually exist
         try:

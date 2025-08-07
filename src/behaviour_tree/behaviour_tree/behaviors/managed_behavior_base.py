@@ -49,7 +49,7 @@ class ManagedBehavior(py_trees.behaviour.Behaviour):
         Get standardized callback group from the node's pool.
         
         Args:
-            callback_type: 'control', 'sensing', 'coordination'
+            callback_type: 'control', 'sensing', 'coordination', or 'monitoring'
         
         Returns:
             Appropriate callback group from the shared pool

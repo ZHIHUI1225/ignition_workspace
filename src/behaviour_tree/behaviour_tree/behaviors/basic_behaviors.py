@@ -19,7 +19,7 @@ import rclpy
 import casadi as ca
 import traceback
 import threading
-import tf_transformations
+import tf_transformations as tf  # Renamed for convenience
 import pyinotify  # For monitoring file system events
 from scipy.interpolate import CubicSpline
 from rclpy.node import Node
@@ -29,8 +29,6 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Int32, Float64, Bool
 from std_srvs.srv import Trigger
 
-# Simple relay point loading - no additional utility needed
-
 
 
 
@@ -38,8 +36,10 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     """
     Wait behavior for pushing phase - waits for parcel to be near relay point.
     Success condition: 
-    1. Parcel is within distance threshold of relay point AND
+    1. Parcel is within distance threshold of relay point (from trajectory) AND
     2. For non-robot0 robots: last robot is OUT of relay point range
+    
+    Note: Relay points are now loaded from trajectory files instead of subscribed topics.
     """
     
     def __init__(self, name, duration=60.0, robot_namespace="robot0", distance_threshold=0.14):
@@ -56,6 +56,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.namespace_number = self.extract_namespace_number(robot_namespace)
         self.relay_number = self.namespace_number  # Relay point is tb{i} -> Relaypoint{i}
         
+        # Set default case name for trajectory files
+        self.case_name = "experi"
+        
         # Determine last robot (previous robot in sequence)
         self.last_robot_number = self.namespace_number - 1 if self.namespace_number > 0 else None
         self.is_first_robot = (self.robot_namespace == "robot0")
@@ -64,15 +67,13 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.node = None
         self.callback_group = None  # Add callback group for thread isolation
         self.robot_pose_sub = None
+        # relay_pose_sub removed as we're now using trajectory points
         self.parcel_pose_sub = None
         self.last_robot_pose_sub = None
         
-        # Load relay point information from JSON file instead of subscribing to topics
-        self.relay_points_file = '/root/workspace/data/relay_points.json'
-        
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None  # Will be loaded from relay_points.json
+        self.relay_pose = None
         self.parcel_pose = None
         self.last_robot_pose = None  # New: track last robot position
         self.current_parcel_index = 0
@@ -96,12 +97,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
         import re
-        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
         match = re.search(r'robot(\d+)', namespace)
-        if match:
-            return int(match.group(1))
-        # Fallback to turtlebot pattern
-        match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
 
     def get_previous_robot_namespace(self, current_namespace):
@@ -217,9 +213,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             callback_group=self.callback_group
         )
         
-        # Load relay point from JSON file instead of subscribing to topic
-        self.load_relay_point()
-        
         # Last robot pose subscription (only for non-robot0 robots) - 使用专属线程池处理
         self.last_robot_pose_sub = None
         if not self.is_first_robot and self.last_robot_number is not None:
@@ -239,75 +232,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] DEBUG: Subscriptions created with dedicated threadpool for {self.robot_namespace}")
         print(f"[{self.name}] DEBUG: Parcel subscription will be created in initialise() when blackboard is ready")
     
-    def load_relay_point(self):
-        """Load relay point information from JSON file"""
-        try:
-            # Load relay points from JSON file
-            with open(self.relay_points_file, 'r') as f:
-                relay_data = json.load(f)
-            
-            # Get relay points list and scale factor
-            relay_points = relay_data.get('relay_points', [])
-            pixel_to_meter_scale = relay_data.get('pixel_to_meter_scale', 0.0023)
-            
-            # Find the appropriate relay point based on robot sequence and flags
-            selected_relay_point = None
-            
-            if self.namespace_number == 0:
-                # Robot0 gets the first relay point (is_first: true)
-                for relay_point in relay_points:
-                    if relay_point.get('is_first', False):
-                        selected_relay_point = relay_point
-                        break
-            else:
-                # For other robots, use sequential order among non-first points
-                non_first_points = [rp for rp in relay_points if not rp.get('is_first', False)]
-                non_first_points.sort(key=lambda x: x.get('id', 0))  # Sort by id for consistent order
-                
-                # Robot1 gets first non-first point, Robot2 gets second non-first point, etc.
-                relay_index = self.namespace_number - 1  # robot1->index 0, robot2->index 1, etc.
-                if relay_index < len(non_first_points):
-                    selected_relay_point = non_first_points[relay_index]
-            
-            if selected_relay_point is not None:
-                # Convert pixel coordinates to world coordinates (meters)
-                world_pixel = selected_relay_point['world_pixel']
-                x_meters = world_pixel[0] * pixel_to_meter_scale
-                y_meters = world_pixel[1] * pixel_to_meter_scale
-                
-                # Create PoseStamped message
-                from geometry_msgs.msg import PoseStamped, Point, Quaternion
-                from std_msgs.msg import Header
-                
-                self.relay_pose = PoseStamped()
-                self.relay_pose.header = Header()
-                self.relay_pose.header.frame_id = "map"
-                self.relay_pose.header.stamp.sec = 0
-                
-                self.relay_pose.pose.position = Point()
-                self.relay_pose.pose.position.x = float(x_meters)
-                self.relay_pose.pose.position.y = float(y_meters)
-                self.relay_pose.pose.position.z = 0.0
-                
-                # Default orientation (no rotation)
-                self.relay_pose.pose.orientation = Quaternion()
-                self.relay_pose.pose.orientation.x = 0.0
-                self.relay_pose.pose.orientation.y = 0.0
-                self.relay_pose.pose.orientation.z = 0.0
-                self.relay_pose.pose.orientation.w = 1.0
-                
-                print(f"[{self.name}] ✅ Loaded relay point ID {selected_relay_point['id']} for {self.robot_namespace}: "
-                      f"({x_meters:.3f}, {y_meters:.3f}) [is_first: {selected_relay_point.get('is_first', False)}, "
-                      f"is_last: {selected_relay_point.get('is_last', False)}]")
-            else:
-                print(f"[{self.name}] ❌ ERROR: Could not find appropriate relay point for {self.robot_namespace} "
-                      f"(namespace_number: {self.namespace_number})")
-                self.relay_pose = None
-                    
-        except Exception as e:
-            print(f"[{self.name}] ❌ ERROR: Failed to load relay point from JSON: {e}")
-            self.relay_pose = None
-    
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates"""
         # Check if behavior status indicates it should be terminated
@@ -322,6 +246,8 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self._robot_pose_count += 1
         if self._robot_pose_count % 50 == 1:  # Print every 50 callbacks
             print(f"[{self.name}] DEBUG: Robot pose updated: ({self.robot_pose.position.x:.3f}, {self.robot_pose.position.y:.3f}), count: {self._robot_pose_count}")
+
+    
     
     def last_robot_pose_callback(self, msg):
         """Callback for last robot pose updates"""
@@ -332,13 +258,18 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self.last_robot_pose = msg.pose.pose
     
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates - handles Odometry message"""
+        """Callback for parcel pose updates"""
         # Check if behavior has been terminated
         if hasattr(self, '_terminated') and self._terminated:
             return
             
-        self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
-        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={msg.pose.pose.position.x:.3f}, y={msg.pose.pose.position.y:.3f}, z={msg.pose.pose.position.z:.3f}")
+        # Create a simple Pose object from the Odometry message
+        from geometry_msgs.msg import Pose
+        pose = Pose()
+        pose.position = msg.pose.pose.position
+        pose.orientation = msg.pose.pose.orientation
+        self.parcel_pose = pose
+        # print(f"[{self.name}] DEBUG: Received parcel{self.current_parcel_index} pose: x={pose.position.x:.3f}, y={pose.position.y:.3f}, z={pose.position.z:.3f}")
     
     def setup_parcel_subscription(self):
         """Set up parcel subscription when blackboard is ready"""
@@ -380,12 +311,26 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         
         # Handle different pose message types
         if hasattr(pose1, 'pose'):
-            pos1 = pose1.pose.position
+            # Could be a PoseStamped message
+            if hasattr(pose1.pose, 'position'):
+                pos1 = pose1.pose.position
+            # Could be PoseWithCovariance (from Odometry.pose)
+            elif hasattr(pose1.pose, 'pose'):
+                pos1 = pose1.pose.pose.position
+            else:
+                pos1 = pose1.pose
         else:
             pos1 = pose1.position
             
         if hasattr(pose2, 'pose'):
-            pos2 = pose2.pose.position
+            # Could be a PoseStamped message
+            if hasattr(pose2.pose, 'position'):
+                pos2 = pose2.pose.position
+            # Could be PoseWithCovariance (from Odometry.pose)
+            elif hasattr(pose2.pose, 'pose'):
+                pos2 = pose2.pose.pose.position
+            else:
+                pos2 = pose2.pose
         else:
             pos2 = pose2.position
         
@@ -430,11 +375,25 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] WARNING: Failed to setup parcel subscription, using default index 0")
             self.current_parcel_index = 0
         
+        # Ensure relay point is loaded from trajectory
+        if self.relay_pose is None:
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory during initialization")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory")
+            
         # Dynamic feedback message that includes current status
         self.feedback_message = f"[{self.robot_namespace}] PUSH wait for parcel{self.current_parcel_index} -> relay{self.relay_number}"
         print(f"[{self.name}] Starting PUSH wait for {self.duration}s...")
-        print(f"[{self.name}] Monitoring parcel{self.current_parcel_index} -> Relaypoint{self.relay_number}")
-        if not self.is_first_robot:
+        print(f"[{self.name}] Monitoring parcel{self.current_parcel_index} -> trajectory endpoint as relay point")
+        if not self.is_first_robot and self.last_robot_number is not None:
             print(f"[{self.name}] Also monitoring that last robot (tb{self.last_robot_number}) is out of relay range")
         
         # Check current conditions at initialization
@@ -455,9 +414,13 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             print(f"[{self.name}] FAILURE: {error_msg}")
             return py_trees.common.Status.FAILURE
         
-        # First check if previous robot has finished pushing
-        previous_finished = self.check_previous_robot_finished()
+        # First check if previous robot has finished pushing - robot0 should skip this check
+        previous_finished = True
         previous_robot_namespace = self.get_previous_robot_namespace(self.robot_namespace)
+        
+        # Only check previous robot for non-robot0 robots
+        if not self.is_first_robot and previous_robot_namespace is not None:
+            previous_finished = self.check_previous_robot_finished()
         
         # Only print status occasionally to reduce CPU load
         if not hasattr(self, '_status_print_count'):
@@ -465,7 +428,10 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         self._status_print_count += 1
         
         if self._status_print_count % 10 == 0:  # Print only every 10 cycles
-            print(f"[{self.name}] DEBUG: Elapsed: {elapsed:.1f}s, Previous robot finished: {previous_finished}")
+            if self.is_first_robot:
+                print(f"[{self.name}] DEBUG: Elapsed: {elapsed:.1f}s, First robot (no previous robot check needed)")
+            else:
+                print(f"[{self.name}] DEBUG: Elapsed: {elapsed:.1f}s, Previous robot finished: {previous_finished}")
         
         if not previous_finished:
             if self._status_print_count % 10 == 0:  # Print only every 10 cycles
@@ -480,7 +446,7 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             if self._status_print_count % 10 == 0:  # Print only every 10 cycles
                 print(f"[{self.name}] DEBUG: Last robot out of relay range: {last_robot_out}")
             
-            if not last_robot_out:
+            if not last_robot_out and self.last_robot_number is not None:
                 if self._status_print_count % 10 == 0:  # Print only every 10 cycles
                     print(f"[{self.name}] DEBUG: Still waiting for last robot (tb{self.last_robot_number}) to move out of relay range")
                 self.feedback_message = f"[{self.robot_namespace}] Waiting for tb{self.last_robot_number} to move out of relay range..."
@@ -509,8 +475,9 @@ class WaitForPush(py_trees.behaviour.Behaviour):
             except Exception as e:
                 print(f"[{self.name}] ❌ Error destroying robot_pose_sub: {e}")
                 pass
-            except:
-                pass
+                
+        # No need to destroy relay_pose_sub anymore - we're loading from trajectory files
+        
         if hasattr(self, 'parcel_pose_sub') and self.parcel_pose_sub:
             try:
                 self.node.destroy_subscription(self.parcel_pose_sub)
@@ -580,8 +547,6 @@ class WaitForPush(py_trees.behaviour.Behaviour):
         try:
             if callback_type == 'robot_pose':
                 self.robot_pose_callback(msg)
-            elif callback_type == 'relay_pose':
-                self.relay_pose_callback(msg)
             elif callback_type == 'last_robot_pose':
                 self.last_robot_pose_callback(msg)
             elif callback_type == 'parcel_pose':
@@ -624,7 +589,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         self.notifier = None
         self.watch_descriptor = None
         self.watch_path = f"/root/workspace/data/{self.case_name}"
-        self.target_file = f"tb{self.last_robot_number}_Trajectory_replanned.json"
+        # Set default target file name - or use "none" placeholder for first robot
+        self.target_file = "none_placeholder.json" if self.last_robot_number is None else f"tb{self.last_robot_number}_Trajectory_replanned.json"
         
         # No ROS node needed for file-based coordination
         self.node = None
@@ -636,11 +602,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
     
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
-        import re
-        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
         match = re.search(r'robot(\d+)', namespace)
-        if match:
-            return int(match.group(1))
+        return int(match.group(1)) if match else 0
     
     def check_replanned_file_exists(self):
         """Initial check if the replanned trajectory file exists from the last robot"""
@@ -649,7 +612,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
         
         # Construct the expected file path for the last robot's replanned trajectory
         import os
-        replanned_file_path = f"/root/workspace/data/{self.case_name}/tb{self.last_robot_number}_Trajectory_replanned.json"
+        # For first robot, use placeholder path; otherwise use actual replanned file path
+        replanned_file_path = "/root/workspace/data/none_placeholder.json" if self.last_robot_number is None else f"/root/workspace/data/{self.case_name}/tb{self.last_robot_number}_Trajectory_replanned.json"
         
         file_exists = os.path.exists(replanned_file_path)
         if file_exists and not self._file_exists:
@@ -769,7 +733,10 @@ class WaitForPick(py_trees.behaviour.Behaviour):
             if not self.setup_file_watcher():
                 print(f"[{self.name}] ERROR: Failed to set up file watcher - file detection may not work!")
             
-            print(f"[{self.name}] tb{self.namespace_number}: Waiting for replanned file from tb{self.last_robot_number}")
+            if self.last_robot_number is not None:
+                print(f"[{self.name}] tb{self.namespace_number}: Waiting for replanned file from tb{self.last_robot_number}")
+            else:
+                print(f"[{self.name}] tb{self.namespace_number}: First robot - no previous robot file needed")
     
     def update(self) -> py_trees.common.Status:
         """Main update method - fully event-driven, no polling"""
@@ -782,7 +749,8 @@ class WaitForPick(py_trees.behaviour.Behaviour):
             if self.is_first_robot:
                 print(f"[{self.name}] SUCCESS: robot0 ready for PICK!")
             else:
-                print(f"[{self.name}] SUCCESS: Replanned file found from tb{self.last_robot_number}, ready for PICK!")
+                robot_identifier = f"tb{self.last_robot_number}" if self.last_robot_number is not None else "previous robot"
+                print(f"[{self.name}] SUCCESS: Replanned file found from {robot_identifier}, ready for PICK!")
             return py_trees.common.Status.SUCCESS
         
         # Check and attempt to restore inotify watcher if needed (every 5 seconds)
@@ -812,9 +780,13 @@ class WaitForPick(py_trees.behaviour.Behaviour):
                 return py_trees.common.Status.SUCCESS
             else:
                 from .tree_builder import report_node_failure
-                error_msg = f"WaitForPick timeout after {elapsed:.1f}s - replanned file not found from tb{self.last_robot_number}"
+                # Safer error message that handles None case
+                robot_identifier = f"tb{self.last_robot_number}" if self.last_robot_number is not None else "previous robot"
+                error_msg = f"WaitForPick timeout after {elapsed:.1f}s - replanned file not found from {robot_identifier}"
                 report_node_failure(self.name, error_msg, self.robot_namespace)
-                print(f"[{self.name}] TIMEOUT: PICK wait FAILED - replanned file not found from tb{self.last_robot_number}")
+                # Safer error message that handles None case
+                robot_identifier = f"tb{self.last_robot_number}" if self.last_robot_number is not None else "previous robot"
+                print(f"[{self.name}] TIMEOUT: PICK wait FAILED - replanned file not found from {robot_identifier}")
                 return py_trees.common.Status.FAILURE
         
         # Status update every second
@@ -876,106 +848,89 @@ class WaitAction(py_trees.behaviour.Behaviour):
         # Creating separate nodes causes thread proliferation (9 threads per node)
         self.node = None  # Will be set in setup()
         
-        # Load relay point information from JSON file instead of subscribing to topics
-        self.relay_points_file = '/root/workspace/data/relay_points.json'
-        
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None  # Will be loaded from relay_points.json
+        self.relay_pose = None  # Will be loaded from trajectory file
         self.parcel_pose = None
         self.current_parcel_index = 0
         
-        # Subscriptions (will be created in setup() when node is available)
+        # Subscriptions - initialized in setup()
         self.robot_pose_sub = None
         self.parcel_index_sub = None
         self.parcel_pose_sub = None
         
+        # Case name for trajectory file
+        self.case_name = "experi"  # Default case name
+        
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
-        import re
-        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
         match = re.search(r'robot(\d+)', namespace)
-        if match:
-            return int(match.group(1))
-        # Fallback to turtlebot pattern
-        match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
+    
+    def setup(self, **kwargs):
+        """Setup ROS node and subscriptions"""
+        try:
+            self.node = kwargs.get('node')
+            if self.node is None:
+                print(f"[{self.name}] No ROS node provided")
+                return False
+            
+            # Setup ROS subscriptions now that we have a node
+            self.setup_subscriptions()
+            
+            # Load relay point from trajectory file
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory, will try again later")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[{self.name}] Setup failed: {e}")
+            return False
+    
+    def setup_subscriptions(self):
+        """Setup ROS subscriptions"""
+        # Subscribe to robot pose (Odometry)
+        self.robot_pose_sub = self.node.create_subscription(
+            Odometry,
+            f'/robot{self.namespace_number}/odom',
+            self.robot_pose_callback,
+            10
+        )
+        
+        # Subscribe to current parcel index
+        self.parcel_index_sub = self.node.create_subscription(
+            Int32,
+            f'/{self.robot_namespace}/current_parcel_index',
+            self.current_index_callback,
+            10
+        )
+        
+        # Parcel subscription will be created in update_parcel_subscription
+        self.update_parcel_subscription()
+        
+        print(f"[{self.name}] ✅ Subscriptions set up for {self.robot_namespace}")
     
     def robot_pose_callback(self, msg):
         """Callback for robot pose updates - handles Odometry message"""
         self.robot_pose = msg.pose.pose
     
-    def load_relay_point(self):
-        """Load relay point information from JSON file"""
-        try:
-            # Load relay points from JSON file
-            with open(self.relay_points_file, 'r') as f:
-                relay_data = json.load(f)
-            
-            # Get relay points list and scale factor
-            relay_points = relay_data.get('relay_points', [])
-            pixel_to_meter_scale = relay_data.get('pixel_to_meter_scale', 0.0023)
-            
-            # Find the appropriate relay point based on robot sequence and flags
-            selected_relay_point = None
-            
-            if self.namespace_number == 0:
-                # Robot0 gets the first relay point (is_first: true)
-                for relay_point in relay_points:
-                    if relay_point.get('is_first', False):
-                        selected_relay_point = relay_point
-                        break
-            else:
-                # For other robots, use sequential order among non-first points
-                non_first_points = [rp for rp in relay_points if not rp.get('is_first', False)]
-                non_first_points.sort(key=lambda x: x.get('id', 0))  # Sort by id for consistent order
-                
-                # Robot1 gets first non-first point, Robot2 gets second non-first point, etc.
-                relay_index = self.namespace_number - 1  # robot1->index 0, robot2->index 1, etc.
-                if relay_index < len(non_first_points):
-                    selected_relay_point = non_first_points[relay_index]
-            
-            if selected_relay_point is not None:
-                # Convert pixel coordinates to world coordinates (meters)
-                world_pixel = selected_relay_point['world_pixel']
-                x_meters = world_pixel[0] * pixel_to_meter_scale
-                y_meters = world_pixel[1] * pixel_to_meter_scale
-                
-                # Create PoseStamped message
-                from geometry_msgs.msg import PoseStamped, Point, Quaternion
-                from std_msgs.msg import Header
-                
-                self.relay_pose = PoseStamped()
-                self.relay_pose.header = Header()
-                self.relay_pose.header.frame_id = "map"
-                self.relay_pose.header.stamp.sec = 0
-                
-                self.relay_pose.pose.position = Point()
-                self.relay_pose.pose.position.x = float(x_meters)
-                self.relay_pose.pose.position.y = float(y_meters)
-                self.relay_pose.pose.position.z = 0.0
-                
-                # Default orientation (no rotation)
-                self.relay_pose.pose.orientation = Quaternion()
-                self.relay_pose.pose.orientation.x = 0.0
-                self.relay_pose.pose.orientation.y = 0.0
-                self.relay_pose.pose.orientation.z = 0.0
-                self.relay_pose.pose.orientation.w = 1.0
-                
-                print(f"[{self.name}] ✅ Loaded relay point ID {selected_relay_point['id']} for {self.robot_namespace}: "
-                      f"({x_meters:.3f}, {y_meters:.3f}) [is_first: {selected_relay_point.get('is_first', False)}, "
-                      f"is_last: {selected_relay_point.get('is_last', False)}]")
-            else:
-                print(f"[{self.name}] ❌ ERROR: Could not find appropriate relay point for {self.robot_namespace} "
-                      f"(namespace_number: {self.namespace_number})")
-                self.relay_pose = None
-                    
-        except Exception as e:
-            print(f"[{self.name}] ❌ ERROR: Failed to load relay point from JSON: {e}")
-            self.relay_pose = None
+    def relay_pose_callback(self, msg):
+        """Callback for relay point pose updates (compatibility stub)"""
+        print(f"[{self.name}] WARNING: relay_pose_callback called - this should not happen")
+        # We don't update self.relay_pose here anymore as it's loaded from trajectory
     
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates - handles Odometry message"""
+        """Callback for parcel pose updates"""
         self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
         print(f"[{self.name}] Received parcel{self.current_parcel_index} pose: x={msg.pose.pose.position.x:.3f}, y={msg.pose.pose.position.y:.3f}")
     
@@ -1012,17 +967,27 @@ class WaitAction(py_trees.behaviour.Behaviour):
         # pose1 could be from Odometry (robot_pose) - extract position directly
         # pose2 could be from PoseStamped (relay/parcel) - extract from .pose.position
         if hasattr(pose1, 'pose'):
-            # This is a PoseStamped message
-            pos1 = pose1.pose.position
+            # Could be a PoseStamped message
+            if hasattr(pose1.pose, 'position'):
+                pos1 = pose1.pose.position
+            # Could be PoseWithCovariance (from Odometry.pose)
+            elif hasattr(pose1.pose, 'pose'):
+                pos1 = pose1.pose.pose.position
+            else:
+                pos1 = pose1.pose
         else:
-            # This is already a Pose message (from Odometry.pose.pose)
             pos1 = pose1.position
             
         if hasattr(pose2, 'pose'):
-            # This is a PoseStamped message
-            pos2 = pose2.pose.position
+            # Could be a PoseStamped message
+            if hasattr(pose2.pose, 'position'):
+                pos2 = pose2.pose.position
+            # Could be PoseWithCovariance (from Odometry.pose)
+            elif hasattr(pose2.pose, 'pose'):
+                pos2 = pose2.pose.pose.position
+            else:
+                pos2 = pose2.pose
         else:
-            # This is already a Pose message
             pos2 = pose2.position
         
         dx = pos1.x - pos2.x
@@ -1041,10 +1006,21 @@ class WaitAction(py_trees.behaviour.Behaviour):
         self.start_time = time.time()
         self.feedback_message = f"[{self.robot_namespace}] Waiting for {self.duration}s and monitoring parcel proximity"
         print(f"[{self.name}] Starting wait for {self.duration}s with parcel monitoring...")
-        print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, relay: Relaypoint{self.relay_number}")
+        print(f"[{self.name}] Monitoring robot: tb{self.namespace_number}, using relay point from trajectory")
         
-        # Load relay point from JSON file
-        self.load_relay_point()
+        # Load relay point from trajectory if not already loaded
+        if self.relay_pose is None:
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory during initialization")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory")
         
         # Create initial parcel subscription when behavior starts
         self.update_parcel_subscription()
@@ -1056,7 +1032,7 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         # Check if parcel is in relay range (primary success condition)
         if self.check_parcel_in_relay_range():
-            print(f"[{self.name}] SUCCESS: parcel{self.current_parcel_index} is within range of Relaypoint{self.relay_number}!")
+            print(f"[{self.name}] SUCCESS: parcel{self.current_parcel_index} is within range of relay point!")
             return py_trees.common.Status.SUCCESS
         
         # Check timeout condition
@@ -1066,20 +1042,20 @@ class WaitAction(py_trees.behaviour.Behaviour):
         
         # Still running - provide status update
         parcel_relay_dist = self.calculate_distance(self.parcel_pose, self.relay_pose) if self.parcel_pose and self.relay_pose else float('inf')
-        print(f"[{self.name}] Waiting... {elapsed:.1f}/{self.duration}s | parcel{self.current_parcel_index} to Relay{self.relay_number} dist: {parcel_relay_dist:.3f}m (threshold: {self.distance_threshold}m)")
+        print(f"[{self.name}] Waiting... {elapsed:.1f}/{self.duration}s | parcel{self.current_parcel_index} to relay point dist: {parcel_relay_dist:.3f}m (threshold: {self.distance_threshold}m)")
         
         return py_trees.common.Status.RUNNING
     
     def terminate(self, new_status):
         """Clean up when behavior terminates"""
         # Stop the robot
-        if self.cmd_vel_pub:
+        if hasattr(self, 'cmd_vel_pub') and self.cmd_vel_pub:
             cmd = Twist()
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
             self.cmd_vel_pub.publish(cmd)
         
-        self.feedback_message = f"ApproachObject terminated with status: {new_status}"
+        self.feedback_message = f"WaitAction terminated with status: {new_status}"
 
 
 class MobileRobotMPC:
@@ -1194,17 +1170,17 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         self.robot_pose_sub = None
         self.parcel_pose_sub = None
         
-        # Load relay point information from JSON file instead of subscribing to topics
-        self.relay_points_file = '/root/workspace/data/relay_points.json'
-        
         # Pose storage
         self.robot_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be loaded from trajectory file
         self.parcel_pose = None
         self.current_parcel_index = 0
         
         # Thread safety
         self.lock = threading.Lock()
+        
+        # Case name for trajectory file
+        self.case_name = "experi"  # Default case name
         
         # Setup blackboard access for current_parcel_index
         self.blackboard = self.attach_blackboard_client()
@@ -1215,13 +1191,7 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
     
     def extract_namespace_number(self, namespace):
         """Extract number from namespace (e.g., 'robot0' -> 0, 'robot1' -> 1)"""
-        import re
-        # First try 'robot' pattern, then fallback to 'turtlebot' for backward compatibility
         match = re.search(r'robot(\d+)', namespace)
-        if match:
-            return int(match.group(1))
-        # Fallback to turtlebot pattern
-        match = re.search(r'turtlebot(\d+)', namespace)
         return int(match.group(1)) if match else 0
     
     def setup(self, **kwargs):
@@ -1240,8 +1210,18 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
                 10
             )
             
-            # Load relay point from JSON file instead of subscribing to topic
-            self.load_relay_point()
+            # Load relay point from trajectory file
+            success, relay_pose = load_relay_point_from_trajectory(
+                robot_namespace=self.robot_namespace,
+                node=self.node,
+                case_name=self.case_name
+            )
+            
+            if success:
+                self.relay_pose = relay_pose
+                print(f"[{self.name}] ✅ Loaded relay point from trajectory")
+            else:
+                print(f"[{self.name}] ⚠️ Failed to load relay point from trajectory, will try again later")
             
             # Parcel subscription will be created in initialise() when behavior starts
             
@@ -1273,77 +1253,13 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         with self.lock:
             self.robot_pose = msg.pose.pose
     
-    def load_relay_point(self):
-        """Load relay point information from JSON file"""
-        try:
-            # Load relay points from JSON file
-            with open(self.relay_points_file, 'r') as f:
-                relay_data = json.load(f)
-            
-            # Get relay points list and scale factor
-            relay_points = relay_data.get('relay_points', [])
-            pixel_to_meter_scale = relay_data.get('pixel_to_meter_scale', 0.0023)
-            
-            # Find the appropriate relay point based on robot sequence and flags
-            selected_relay_point = None
-            
-            if self.namespace_number == 0:
-                # Robot0 gets the first relay point (is_first: true)
-                for relay_point in relay_points:
-                    if relay_point.get('is_first', False):
-                        selected_relay_point = relay_point
-                        break
-            else:
-                # For other robots, use sequential order among non-first points
-                non_first_points = [rp for rp in relay_points if not rp.get('is_first', False)]
-                non_first_points.sort(key=lambda x: x.get('id', 0))  # Sort by id for consistent order
-                
-                # Robot1 gets first non-first point, Robot2 gets second non-first point, etc.
-                relay_index = self.namespace_number - 1  # robot1->index 0, robot2->index 1, etc.
-                if relay_index < len(non_first_points):
-                    selected_relay_point = non_first_points[relay_index]
-            
-            if selected_relay_point is not None:
-                # Convert pixel coordinates to world coordinates (meters)
-                world_pixel = selected_relay_point['world_pixel']
-                x_meters = world_pixel[0] * pixel_to_meter_scale
-                y_meters = world_pixel[1] * pixel_to_meter_scale
-                
-                # Create PoseStamped message
-                from geometry_msgs.msg import PoseStamped, Point, Quaternion
-                from std_msgs.msg import Header
-                
-                self.relay_pose = PoseStamped()
-                self.relay_pose.header = Header()
-                self.relay_pose.header.frame_id = "map"
-                self.relay_pose.header.stamp.sec = 0
-                
-                self.relay_pose.pose.position = Point()
-                self.relay_pose.pose.position.x = float(x_meters)
-                self.relay_pose.pose.position.y = float(y_meters)
-                self.relay_pose.pose.position.z = 0.0
-                
-                # Default orientation (no rotation)
-                self.relay_pose.pose.orientation = Quaternion()
-                self.relay_pose.pose.orientation.x = 0.0
-                self.relay_pose.pose.orientation.y = 0.0
-                self.relay_pose.pose.orientation.z = 0.0
-                self.relay_pose.pose.orientation.w = 1.0
-                
-                print(f"[{self.name}] ✅ Loaded relay point ID {selected_relay_point['id']} for {self.robot_namespace}: "
-                      f"({x_meters:.3f}, {y_meters:.3f}) [is_first: {selected_relay_point.get('is_first', False)}, "
-                      f"is_last: {selected_relay_point.get('is_last', False)}]")
-            else:
-                print(f"[{self.name}] ❌ ERROR: Could not find appropriate relay point for {self.robot_namespace} "
-                      f"(namespace_number: {self.namespace_number})")
-                self.relay_pose = None
-                    
-        except Exception as e:
-            print(f"[{self.name}] ❌ ERROR: Failed to load relay point from JSON: {e}")
-            self.relay_pose = None
+    def relay_pose_callback(self, msg):
+        """Callback for relay point pose updates"""
+        with self.lock:
+            self.relay_pose = msg
     
     def parcel_pose_callback(self, msg):
-        """Callback for parcel pose updates - handles Odometry message"""
+        """Callback for parcel pose updates"""
         with self.lock:
             self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
     
@@ -1381,12 +1297,26 @@ class CheckPairComplete(py_trees.behaviour.Behaviour):
         
         # Handle different pose message types
         if hasattr(pose1, 'pose'):
-            pos1 = pose1.pose.position
+            # Could be a PoseStamped message
+            if hasattr(pose1.pose, 'position'):
+                pos1 = pose1.pose.position
+            # Could be PoseWithCovariance (from Odometry.pose)
+            elif hasattr(pose1.pose, 'pose'):
+                pos1 = pose1.pose.pose.position
+            else:
+                pos1 = pose1.pose
         else:
             pos1 = pose1.position
             
         if hasattr(pose2, 'pose'):
-            pos2 = pose2.pose.position
+            # Could be a PoseStamped message
+            if hasattr(pose2.pose, 'position'):
+                pos2 = pose2.pose.position
+            # Could be PoseWithCovariance (from Odometry.pose)
+            elif hasattr(pose2.pose, 'pose'):
+                pos2 = pose2.pose.pose.position
+            else:
+                pos2 = pose2.pose
         else:
             pos2 = pose2.position
         
@@ -1668,3 +1598,66 @@ class IncrementIndex(py_trees.behaviour.Behaviour):
             report_node_failure(self.name, error_msg, self.robot_namespace)
             print(f"[{self.name}] Error incrementing index: {e}")
             return py_trees.common.Status.FAILURE
+
+
+def load_relay_point_from_trajectory(robot_namespace, node=None, case_name="simple_maze"):
+    """Load relay point from trajectory file
+    
+    Args:
+        robot_namespace (str): The robot namespace (e.g., 'robot0')
+        node (rclpy.node.Node, optional): ROS node for timestamp. Defaults to None.
+        case_name (str, optional): Case name for trajectory file path. Defaults to "simple_maze".
+        
+    Returns:
+        tuple: (success, relay_pose_msg) - where relay_pose_msg is a PoseStamped message or None if failed
+    """
+    try:
+        # Extract namespace number
+        match = re.search(r'robot(\d+)', robot_namespace)
+        namespace_number = int(match.group(1)) if match else 0
+        
+        # Determine the trajectory file path
+        trajectory_file_path = f"/root/workspace/data/{case_name}/tb{namespace_number}_Trajectory.json"
+        
+        # Check if file exists
+        if not os.path.exists(trajectory_file_path):
+            print(f"[load_relay_point] WARNING: Trajectory file not found: {trajectory_file_path}")
+            return False, None
+            
+        # Load the trajectory data
+        with open(trajectory_file_path, 'r') as json_file:
+            data = json.load(json_file)
+            trajectory = data.get('Trajectory', [])
+            
+            if not trajectory:
+                print(f"[load_relay_point] WARNING: Empty trajectory in file: {trajectory_file_path}")
+                return False, None
+            
+            # Use the first point of the trajectory as the relay point
+            first_point = trajectory[0]
+
+            # Create a PoseStamped message for the relay point
+            relay_pose_msg = PoseStamped()
+            relay_pose_msg.header.frame_id = "map"
+            relay_pose_msg.header.stamp = node.get_clock().now().to_msg() if node else None
+            
+            # Set position from trajectory point
+            relay_pose_msg.pose.position.x = first_point[0]
+            relay_pose_msg.pose.position.y = first_point[1]
+
+            # Set orientation if available
+            if len(first_point) > 2:
+                # Convert heading to quaternion
+                quat = tf.quaternion_from_euler(0, 0, first_point[2])
+                relay_pose_msg.pose.orientation.x = quat[0]
+                relay_pose_msg.pose.orientation.y = quat[1]
+                relay_pose_msg.pose.orientation.z = quat[2]
+                relay_pose_msg.pose.orientation.w = quat[3]
+            
+            print(f"[load_relay_point] ✅ Successfully loaded relay point from trajectory: ({relay_pose_msg.pose.position.x:.3f}, {relay_pose_msg.pose.position.y:.3f})")
+            return True, relay_pose_msg
+            
+    except Exception as e:
+        print(f"[load_relay_point] ERROR: Failed to load relay point from trajectory: {str(e)}")
+        traceback.print_exc()
+        return False, None

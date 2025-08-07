@@ -4,6 +4,15 @@ This package provides behavior tree functionality for multi-robot coordination w
 
 ## Overview
 
+DO NOT USE LAUNCH ! WILL CAUSE THREAD 
+Launch 文件默认的多线程执行器与行为树节点的并发设计叠加，导致线程数膨胀:
+Root Causes of Thread Proliferation:
+Excessive Callback Groups: Each behavior is creating its own callback groups instead of using shared ones
+Multiple Timers: Each behavior creates its own ROS timers for control loops
+Subscription Duplication: Similar subscriptions are created by multiple behaviors
+Control Threads: Some behaviors still use dedicated control threads instead of ROS timers
+File Watchers: ThreadedNotifier for file watching adds additional threads
+
 The behavior tree system supports two deployment modes:
 1. **Multi-Robot Mode**: Individual behavior tree instances for each robot
 2. **Centralized Mode**: Single behavior tree coordinating all robots

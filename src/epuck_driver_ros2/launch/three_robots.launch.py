@@ -49,7 +49,7 @@ def generate_launch_description():
     return LaunchDescription([
         # Robot drivers
         robot0_driver,
-        robot1_driver, 
-        robot2_driver,
-    
+        robot1_driver,  # Not defined
+        robot2_driver,  # Not defined
     ])
+

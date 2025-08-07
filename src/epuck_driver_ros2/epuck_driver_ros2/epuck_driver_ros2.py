@@ -382,7 +382,24 @@ class EPuckDriverROS2(Node):
     def handler_velocity(self, data):
         """
         Controls the velocity of each wheel based on linear and angular velocities.
+        Optimized for efficiency: reduced logging frequency, minimized attribute checks, and reduced time calls.
         """
+        now = time.time()
+        # Use a static attribute for last time, avoid hasattr check every call
+        try:
+            last_time = self._last_cmd_vel_time
+        except AttributeError:
+            last_time = now
+        real_dt = now - last_time
+        self._last_cmd_vel_time = now
+        # Only log dt every 10th message to reduce log spam
+        try:
+            self._cmd_vel_log_count += 1
+        except AttributeError:
+            self._cmd_vel_log_count = 1
+        if self._cmd_vel_log_count % 10 == 0:
+            self.get_logger().info(f"[cmd_vel] Real dt: {real_dt:.4f} s")
+
         linear = data.linear.x
         angular = data.angular.z
 
@@ -391,77 +408,102 @@ class EPuckDriverROS2(Node):
         wheel_separation_m = WHEEL_SEPARATION / 100.0  # Convert cm to m (0.053 m)
 
         # Kinematic model for differential robot.
-        # wl and wr are wheel angular velocities in rad/s
         wl = (linear - (wheel_separation_m / 2.) * angular) / (wheel_diameter_m / 2.)
         wr = (linear + (wheel_separation_m / 2.) * angular) / (wheel_diameter_m / 2.)
 
         # Convert wheel angular velocity (rad/s) to motor steps/s
-        # 1000 steps = 1 full wheel revolution = 2*pi radians
         left_vel = wl * 1000. / (2 * math.pi)
         right_vel = wr * 1000. / (2 * math.pi)
-        
+
         # Store original calculated speeds for debugging
         left_vel_orig = left_vel
         right_vel_orig = right_vel
-        
+
         # Apply e-puck2 speed limits (max 1200 steps/s according to specs)
         MAX_STEPS_PER_SEC = 1200
         left_vel = max(-MAX_STEPS_PER_SEC, min(MAX_STEPS_PER_SEC, left_vel))
         right_vel = max(-MAX_STEPS_PER_SEC, min(MAX_STEPS_PER_SEC, right_vel))
-        
+
         # Check if speeds were clamped
         left_clamped = (abs(left_vel_orig) > MAX_STEPS_PER_SEC)
         right_clamped = (abs(right_vel_orig) > MAX_STEPS_PER_SEC)
-        
+
         # Store commanded speeds for velocity feedback
         self.commanded_left_speed = left_vel
         self.commanded_right_speed = right_vel
-        
+
+        # Set motor speeds, catch errors only if they occur
         try:
             self._bridge.set_motors_speed(left_vel, right_vel)
-            
-            # Add immediate debugging for clamped commands
-            if left_clamped or right_clamped:
-                self.get_logger().warn(f'SPEED CLAMPING: Requested linear={linear:.3f} m/s, angular={angular:.3f} rad/s')
-                self.get_logger().warn(f'Original: left={left_vel_orig:.0f}, right={right_vel_orig:.0f} → Clamped: left={left_vel:.0f}, right={right_vel:.0f}')
-            
-            # Log velocity commands very occasionally (every 100 cycles ≈ 10 seconds at 10Hz)
-            if hasattr(self, '_velocity_log_count'):
-                self._velocity_log_count += 1
-            else:
-                self._velocity_log_count = 0
-                
-            if self._velocity_log_count % 100 == 0:
-                self.get_logger().info(f'Commanded: linear={linear:.3f} m/s, angular={angular:.3f} rad/s')
-                self.get_logger().info(f'Calculated speeds: left={left_vel_orig:.0f}, right={right_vel_orig:.0f} steps/s')
-                self.get_logger().info(f'Clamped speeds: left={left_vel:.0f}, right={right_vel:.0f} steps/s (max: {MAX_STEPS_PER_SEC})')
-                if left_clamped or right_clamped:
-                    self.get_logger().warn(f'Motor speeds were clamped! Original too high for hardware.')
-                    # Calculate achievable velocities
-                    max_linear = MAX_STEPS_PER_SEC * (wheel_diameter_m / 2.) * (2 * math.pi) / 1000.
-                    max_angular = 2 * MAX_STEPS_PER_SEC * (wheel_diameter_m / 2.) * (2 * math.pi) / (1000. * wheel_separation_m)
-                    self.get_logger().warn(f'Max achievable: linear={max_linear:.3f} m/s, angular={max_angular:.3f} rad/s')
-                
         except Exception as e:
             self.get_logger().error(f'Error setting motor speed: {str(e)}')
+
+        # Log velocity commands every 100 cycles (10s at 10Hz)
+        try:
+            self._velocity_log_count += 1
+        except AttributeError:
+            self._velocity_log_count = 1
+        if self._velocity_log_count % 100 == 0:
+            self.get_logger().info(f'Commanded: linear={linear:.3f} m/s, angular={angular:.3f} rad/s')
+            self.get_logger().info(f'Calculated speeds: left={left_vel_orig:.0f}, right={right_vel_orig:.0f} steps/s')
+            self.get_logger().info(f'Clamped speeds: left={left_vel:.0f}, right={right_vel:.0f} steps/s (max: {MAX_STEPS_PER_SEC})')
+            if left_clamped or right_clamped:
+                self.get_logger().warn(f'Motor speeds were clamped! Original too high for hardware.')
+                max_linear = MAX_STEPS_PER_SEC * (wheel_diameter_m / 2.) * (2 * math.pi) / 1000.
+                max_angular = 2 * MAX_STEPS_PER_SEC * (wheel_diameter_m / 2.) * (2 * math.pi) / (1000. * wheel_separation_m)
+                self.get_logger().warn(f'Max achievable: linear={max_linear:.3f} m/s, angular={max_angular:.3f} rad/s')
+
+
+    def update_sensors(self):
+        """
+        Efficient update: sends motor commands and reads motor positions for velocity feedback.
+        Reduced exception handling overhead and attribute checks.
+        """
+        # Send motor commands and read sensor data
+        try:
+            self._bridge.step()
+        except Exception as e:
+            self.get_logger().error(f'Error in _bridge.step(): {str(e)}')
+            return
+
+        # Read motor positions for odometry and velocity feedback
+        motor_pos = None
+        # Try different methods to get motor position (no nested try/except)
+        if hasattr(self._bridge, 'get_motor_position_sensor'):
+            motor_pos = self._bridge.get_motor_position_sensor()
+        elif hasattr(self._bridge, 'get_motors_position'):
+            motor_pos = self._bridge.get_motors_position()
+        elif hasattr(self._bridge, 'get_position'):
+            motor_pos = self._bridge.get_position()
+        elif hasattr(self._bridge, 'motor_position'):
+            motor_pos = self._bridge.motor_position
+        else:
+            if not hasattr(self, '_methods_logged'):
+                methods = [method for method in dir(self._bridge) if not method.startswith('_')]
+                self.get_logger().info(f"Available ePuck methods: {sorted(methods)}")
+                self._methods_logged = True
+
+        if motor_pos is not None and len(motor_pos) >= 2:
+            self.update_internal_odometry(motor_pos)
+        else:
+            if not hasattr(self, '_no_encoder_logged'):
+                self.get_logger().info("No motor position data available - using commanded velocities for internal tracking")
+                self._no_encoder_logged = True
+            self.update_internal_odometry_without_encoders()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    
     try:
         epuck_driver = EPuckDriverROS2()
         epuck_driver.run()
         rclpy.spin(epuck_driver)
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f'Error: {str(e)}')
     finally:
         if 'epuck_driver' in locals():
             epuck_driver.disconnect()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

@@ -14,7 +14,7 @@ def generate_launch_description():
     # Launch Arguments
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
     robot_id = LaunchConfiguration('robot_id', default='0')
-    robot_namespace = LaunchConfiguration('robot_namespace', default='turtlebot0')
+    robot_namespace = LaunchConfiguration('robot_namespace', default='robot0')
     
     # Launch description
     ld = LaunchDescription()
@@ -32,20 +32,20 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument(
         'robot_namespace',
-        default_value='turtlebot0',
-        description='Robot namespace (e.g., turtlebot0, turtlebot1, etc.)'))
+        default_value='robot0',
+        description='Robot namespace (e.g., robot0, robot1, etc.)'))
     
     # Behavior tree node
     behavior_tree_node = Node(
         package='behaviour_tree',
         executable='my_behaviour_tree',
         name='tree',  # Keep consistent with snapshot stream namespace
-        namespace='turtlebot0',  # Use fixed namespace for simplicity
+        namespace='robot0',  # Use fixed namespace for simplicity
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
             'robot_id': '0',
-            'robot_namespace': 'turtlebot0',
+            'robot_namespace': 'robot0',
         }]
     )
     ld.add_action(behavior_tree_node)

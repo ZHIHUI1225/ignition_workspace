@@ -7,9 +7,10 @@ Uses the replanning functions from Replan_behaviors.py to optimize robot traject
 import py_trees
 import time
 import re
+import traceback
 import rclpy
 from std_msgs.msg import Float64
-from .Replan_behaviors import replan_trajectory_parameters_to_target
+from .Replan_behaviors import replan_trajectory_parameters_to_target, load_trajectory_parameters_individual
 
 
 class ReplanPath(py_trees.behaviour.Behaviour):
@@ -46,9 +47,9 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         self.previous_robot_pushing_estimated_time = 45.0  # Default value
         
         # Extract robot number for determining previous robot
-        namespace_match = re.search(r'turtlebot(\d+)', self.robot_namespace)
+        namespace_match = re.search(r'robot(\d+)', self.robot_namespace)
         self.namespace_number = int(namespace_match.group(1)) if namespace_match else 0
-        self.previous_robot_namespace = f"turtlebot{self.namespace_number - 1}" if self.namespace_number > 0 else None
+        self.previous_robot_namespace = f"robot{self.namespace_number - 1}" if self.namespace_number > 0 else None
         
     
     def initialise(self):
@@ -65,7 +66,7 @@ class ReplanPath(py_trees.behaviour.Behaviour):
             raw_target_time = 45.0
             print(f"[{self.name}] Using default target time for robot0: {raw_target_time:.2f}s")
         else:
-            # turtlebotN gets pushing_estimated_time from turtlebot(N-1) via ROS topic
+            # robotN gets pushing_estimated_time from robot(N-1) via ROS topic
             raw_target_time = self.previous_robot_pushing_estimated_time-7# 7 seconds earlier than previous robot's estimate
             print(f"[{self.name}] Getting target time from {self.previous_robot_namespace} via ROS topic: {raw_target_time:.2f}s")
 
@@ -95,15 +96,30 @@ class ReplanPath(py_trees.behaviour.Behaviour):
 
         target_time = raw_target_time
         print(f"[{self.name}] Target time for replanning: {target_time:.2f}s")
-        
+
         # Use robot ID from namespace
         robot_id = self.namespace_number
         print(f"[{self.name}] Using robot ID: {robot_id}")
-        
+
+        # Uniformly get dt from blackboard variable 'discrete_dt', fallback to self.dt if not set
+        try:
+            blackboard_client = py_trees.blackboard.Client(name="replan_dt_loader")
+            blackboard_client.register_key(
+                key="discrete_dt",
+                access=py_trees.common.Access.READ
+            )
+            dt_from_bb = blackboard_client.get("discrete_dt")
+            if dt_from_bb is not None:
+                self.dt = float(dt_from_bb)
+                print(f"[{self.name}] Loaded dt from blackboard: {self.dt}")
+            else:
+                print(f"[{self.name}] Blackboard variable 'discrete_dt' not set, using default dt: {self.dt}")
+        except Exception as e:
+            print(f"[{self.name}] Could not load dt from blackboard, using default dt: {self.dt}. Error: {e}")
+
         # Store parameters for the update method
         self.target_time = target_time
         self.robot_id = robot_id
-        
         self.feedback_message = f"[{self.robot_namespace}] Initializing replanning for Robot {robot_id}..."
     
     def update(self):
@@ -116,7 +132,24 @@ class ReplanPath(py_trees.behaviour.Behaviour):
         
         # Check for timeout
         if elapsed >= self.duration:
-            print(f"[{self.name}] Replanning timeout after {self.duration}s")
+            # Report timeout as a failure to the blackboard
+            from .tree_builder import report_node_failure
+            error_msg = f"Replanning timeout after {self.duration}s"
+            report_node_failure(self.name, error_msg, self.robot_namespace)
+            print(f"[{self.name}] {error_msg}")
+            
+            # Mark the system as failed so the loop will stop
+            try:
+                blackboard_client = py_trees.blackboard.Client(name="replan_timeout_reporter")
+                blackboard_client.register_key(
+                    key=f"{self.robot_namespace}/system_failed",
+                    access=py_trees.common.Access.WRITE
+                )
+                blackboard_client.set(f"{self.robot_namespace}/system_failed", True)
+                print(f"[{self.name}] System failure flag set to TRUE due to replanning timeout")
+            except Exception as bb_error:
+                print(f"[{self.name}] Warning: Could not set system failure flag: {bb_error}")
+            
             return py_trees.common.Status.FAILURE
         
         # Check if replanning failed during initialization (e.g., pushing time too small)
@@ -138,7 +171,51 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     dt=self.dt  # Pass the dt parameter from the ReplanPath instance
                 )
                 
-                if result is not None:
+                # Check if result indicates error due to missing files
+                if isinstance(result, dict) and result.get('success') is False:
+                    error_type = result.get('error_type', '')
+                    error_msg = result.get('error', 'Unknown error')
+                    
+                    if error_type in ['missing_file', 'missing_directory', 'graph_load_error']:
+                        # Handle missing files/directories as critical failures that should stop the behavior tree
+                        from .tree_builder import report_node_failure
+                        
+                        # Prepare detailed error message
+                        if 'missing_file' in result:
+                            error_details = f"Required file not found: {result['missing_file']}"
+                        elif 'missing_directory' in result:
+                            error_details = f"Required directory not found: {result['missing_directory']}"
+                        else:
+                            error_details = error_msg
+                            
+                        # Report failure and set system failure flag to halt the behavior tree
+                        report_node_failure(self.name, error_details, self.robot_namespace)
+                        print(f"[{self.name}] CRITICAL ERROR: {error_details}")
+                        
+                        # Set system failure flag directly to ensure behavior tree stops
+                        try:
+                            blackboard_client = py_trees.blackboard.Client(name="replan_failure_reporter")
+                            blackboard_client.register_key(
+                                key=f"{self.robot_namespace}/system_failed",
+                                access=py_trees.common.Access.WRITE
+                            )
+                            blackboard_client.set(f"{self.robot_namespace}/system_failed", True)
+                            print(f"[{self.name}] System failure flag set to TRUE due to missing required files")
+                        except Exception as bb_error:
+                            print(f"[{self.name}] Warning: Could not set system failure flag: {bb_error}")
+                        
+                        # Mark as failed to return FAILURE status
+                        self.replanning_completed = True
+                        self.replanning_successful = False
+                        return py_trees.common.Status.FAILURE
+                        
+                    else:
+                        # Other types of errors might be recoverable - try fallback
+                        print(f"[{self.name}] Replanning error: {error_msg}")
+                        print(f"[{self.name}] Attempting to use fallback...")
+                        
+                elif result is not None and isinstance(result, dict) and 'optimization_results' in result:
+                    # Successful result with optimization results
                     self.replanning_successful = True
                     self.replanning_completed = True
                     
@@ -197,32 +274,66 @@ class ReplanPath(py_trees.behaviour.Behaviour):
                     return py_trees.common.Status.FAILURE
                     
             except Exception as e:
-                # Replanning failed with exception - try to copy original data as fallback
-                print(f"[{self.name}] Replanning failed with exception: {str(e)}")
-                print(f"[{self.name}] Attempting to copy original trajectory data as fallback...")
+                # Replanning failed with exception - check if it's related to missing files
+                error_str = str(e).lower()
+                traceback_str = traceback.format_exc().lower()
+                file_related_error = any(term in error_str or term in traceback_str 
+                                        for term in ['no such file', 'file not found', 'cannot open', 
+                                                    'no such directory', 'directory not found',
+                                                    'graph_new', '.json'])
                 
-                try:
-                    # Manual fallback - copy original trajectory file
-                    if self._copy_original_trajectory_as_fallback():
-                        self.replanning_completed = True
-                        self.replanning_successful = True
-                        
-                        print(f"[{self.name}] Successfully copied original trajectory as fallback after exception")
-                        print(f"[{self.name}] Robot {self.robot_id} will use original trajectory")
-                        
-                        return py_trees.common.Status.SUCCESS
-                        
-                except Exception as copy_error:
-                    print(f"[{self.name}] Failed to copy original trajectory after exception: {copy_error}")
-                
-                # If fallback copy also failed, report the failure
-                self.replanning_completed = True
-                self.replanning_successful = False
-                
-                from .tree_builder import report_node_failure
-                error_msg = f"Replanning failed with exception and fallback copy also failed: {str(e)}"
-                report_node_failure(self.name, error_msg, self.robot_namespace)
-                print(f"[{self.name}] WARNING: Both replanning and fallback failed due to exception")
+                if file_related_error:
+                    # This is likely a file/directory missing error - treat as critical failure
+                    self.replanning_completed = True
+                    self.replanning_successful = False
+                    
+                    from .tree_builder import report_node_failure
+                    error_msg = f"Critical file-related error during replanning: {str(e)}"
+                    report_node_failure(self.name, error_msg, self.robot_namespace)
+                    print(f"[{self.name}] CRITICAL ERROR: {error_msg}")
+                    print(f"[{self.name}] {traceback.format_exc()}")
+                    
+                    # Set system failure flag to halt the behavior tree
+                    try:
+                        blackboard_client = py_trees.blackboard.Client(name="replan_failure_reporter")
+                        blackboard_client.register_key(
+                            key=f"{self.robot_namespace}/system_failed",
+                            access=py_trees.common.Access.WRITE
+                        )
+                        blackboard_client.set(f"{self.robot_namespace}/system_failed", True)
+                        print(f"[{self.name}] System failure flag set to TRUE due to file-related error")
+                    except Exception as bb_error:
+                        print(f"[{self.name}] Warning: Could not set system failure flag: {bb_error}")
+                    
+                    return py_trees.common.Status.FAILURE
+                    
+                else:
+                    # Other exception - try to copy original data as fallback
+                    print(f"[{self.name}] Replanning failed with exception: {str(e)}")
+                    print(f"[{self.name}] Attempting to copy original trajectory data as fallback...")
+                    
+                    try:
+                        # Manual fallback - copy original trajectory file
+                        if self._copy_original_trajectory_as_fallback():
+                            self.replanning_completed = True
+                            self.replanning_successful = True
+                            
+                            print(f"[{self.name}] Successfully copied original trajectory as fallback after exception")
+                            print(f"[{self.name}] Robot {self.robot_id} will use original trajectory")
+                            
+                            return py_trees.common.Status.SUCCESS
+                            
+                    except Exception as copy_error:
+                        print(f"[{self.name}] Failed to copy original trajectory after exception: {copy_error}")
+                    
+                    # If fallback copy also failed, report the failure
+                    self.replanning_completed = True
+                    self.replanning_successful = False
+                    
+                    from .tree_builder import report_node_failure
+                    error_msg = f"Replanning failed with exception and fallback copy also failed: {str(e)}"
+                    report_node_failure(self.name, error_msg, self.robot_namespace)
+                    print(f"[{self.name}] WARNING: Both replanning and fallback failed due to exception")
                 
                 return py_trees.common.Status.FAILURE
         

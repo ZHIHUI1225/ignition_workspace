@@ -9,13 +9,14 @@ from .basic_behaviors import (
    WaitAction, WaitForPush, WaitForPick, StopSystem, 
     CheckPairComplete, IncrementIndex
 )
-from .event_driven_behaviors import (
-    EventDrivenWaitForPush, create_event_driven_wait_for_push
-)
+from .event_driven_behaviors import EventDrivenWaitForPush
 from .ReplanPath_behaviour import ReplanPath
-from .movement_behaviors import ApproachObject, MoveBackward
+from .movement_behaviors import MoveBackward, ApproachObject
 from .manipulation_behaviors import PushObject
 from .Pickup import PickObject
+
+# Add config import
+from behaviour_tree.config_loader import config
 
 
 
@@ -161,12 +162,10 @@ class GlobalExceptionHandler(py_trees.behaviour.Behaviour):
 
 def create_root(robot_namespace="robot0", case="experi", control_dt=None):
     """Create behavior tree root node with optimized Selector+LoopCondition control and parallel blackboard init"""
-    # Validate that control_dt is provided
-    if control_dt is None:
-        error_msg = f"[ERROR] control_dt parameter is required but was None for robot {robot_namespace}"
-        print(error_msg)
-        raise ValueError(error_msg)
-    
+    # Use provided control_dt or fall back to global default
+    # Load discrete_dt from config
+    discrete_dt = getattr(config, "discrete_dt", 0.2)
+
     root = py_trees.composites.Sequence(name="MainSequence", memory=True)
     
     # OPTIMIZATION: Parallel blackboard initialization for faster startup
@@ -199,6 +198,13 @@ def create_root(robot_namespace="robot0", case="experi", control_dt=None):
             variable_name=f"{robot_namespace}/failure_context",
             variable_value=None,
             overwrite=True
+        ),
+        # Set discrete_dt in blackboard
+        py_trees.behaviours.SetBlackboardVariable(
+            name="DiscreteDT",
+            variable_name="discrete_dt",
+            variable_value=discrete_dt,
+            overwrite=True
         )
     ])
     
@@ -208,7 +214,8 @@ def create_root(robot_namespace="robot0", case="experi", control_dt=None):
     # Pushing sequence
     pushing_sequence = py_trees.composites.Sequence(name="PushingSequence", memory=True)
     pushing_sequence.add_children([
-        create_event_driven_wait_for_push("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
+        # EventDrivenWaitForPush("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
+        WaitForPush("WaitingPush", 3000.0, robot_namespace, distance_threshold=0.14),
         ApproachObject("ApproachingPush", robot_namespace),
         PushObject("Pushing", robot_namespace, distance_threshold=0.07, case=case)
     ])
@@ -276,5 +283,10 @@ def create_root(robot_namespace="robot0", case="experi", control_dt=None):
         init_blackboard_parallel,  # Parallel initialization for speed
         main_loop_selector  # Selector-based loop control with global failure handling
     ])
+    
+    return root
+    
+    return root
+    return root
     
     return root

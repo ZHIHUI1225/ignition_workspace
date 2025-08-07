@@ -28,7 +28,7 @@ def generate_launch_description():
     
     # Robot 1 configuration
     robot_id = 1
-    robot_namespace = f'turtlebot{robot_id}'
+    robot_namespace = f'robot{robot_id}'
     tree_node_name = f'tree_{robot_id}'
     
     # Modular behavior tree node for robot 1

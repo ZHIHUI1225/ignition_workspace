@@ -116,11 +116,31 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
     
     # Load trajectory parameters for the specific robot
     print(f"\n1. Loading trajectory parameters for Robot {robot_id}...")
+    
+    # Check if required directories and files exist
+    data_dir = f'/root/workspace/data/{case}/'
+    if not os.path.exists(data_dir):
+        error_msg = f"Data directory not found: {data_dir}"
+        print(f"⚠ {error_msg} - critical error, cannot continue")
+        return {
+            'success': False,
+            'error': error_msg,
+            'error_type': 'missing_directory',
+            'missing_directory': data_dir
+        }
+        
     trajectory_data = load_trajectory_parameters_individual(case, robot_id)
     
     if not trajectory_data:
-        print(f"No trajectory parameter data found for Robot {robot_id}!")
-        return None
+        robot_file = f'{data_dir}robot_{robot_id}_trajectory_parameters_{case}.json'
+        error_msg = f"No trajectory parameter data found for Robot {robot_id}! File {robot_file} not found or invalid."
+        print(f"⚠ {error_msg} - critical error, cannot continue")
+        return {
+            'success': False,
+            'error': error_msg,
+            'error_type': 'missing_file',
+            'missing_file': robot_file
+        }
     
     print(f"✓ Loaded trajectory data for Robot {robot_id}")
     
@@ -648,51 +668,75 @@ def replan_trajectory_parameters_to_target(case, target_time, robot_id, save_res
         try:
             # Load reeb graph for discrete trajectory generation
             graph_file = f'/root/workspace/data/Graph_new_{case}.json'
-            if os.path.exists(graph_file):
-                sys.path.append('/root/workspace/src/Replanning/scripts')
-                from Graph import load_reeb_graph_from_file
+            if not os.path.exists(graph_file):
+                error_msg = f"Graph file not found: {graph_file}"
+                print(f"⚠ {error_msg} - critical error, cannot continue")
+                # Return None with error information to trigger failure in ReplanPath behavior
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_type': 'missing_file',
+                    'missing_file': graph_file
+                }
                 
-                # Change to the data directory so load_reeb_graph_from_file can find the file
-                old_cwd = os.getcwd()
-                os.chdir('/root/workspace/data')
-                try:
-                    reeb_graph = load_reeb_graph_from_file(f'Graph_new_{case}.json')
-                finally:
-                    os.chdir(old_cwd)  # Restore original directory
-                
-                # Extract trajectory parameters from replanned data
-                waypoints = replanned_trajectory['waypoints']
-                phi = replanned_trajectory['phi']
-                r0 = replanned_trajectory['r0']
-                l = replanned_trajectory['l']
-                phi_new = replanned_trajectory['phi_new']
-                time_segments = replanned_trajectory['time_segments']
-                Flagb = replanned_trajectory['Flagb']
-                
-                # Generate discrete trajectory
-                discrete_result = generate_single_robot_discrete_trajectory(
-                    robot_id=robot_id,
-                    waypoints=waypoints,
-                    phi=phi,
-                    r0=r0,
-                    l=l,
-                    phi_new=phi_new,
-                    time_segments=time_segments,
-                    Flagb=Flagb,
-                    reeb_graph=reeb_graph,
-                    dt=dt,
-                    save_dir=f'/root/workspace/data/{case}/',
-                    case=case
-                )
-                
-                if discrete_result:
-                    print(f"✓ Discrete trajectory generated and saved to: {discrete_result['discrete_trajectory_file']}")
-                    print(f"  Total points: {discrete_result['num_points']}")
-                    print(f"  Total time: {discrete_result['total_time']:.3f}s")
-                else:
-                    print(f"⚠ Failed to generate discrete trajectory")
+            sys.path.append('/root/workspace/src/Replanning/scripts')
+            from Graph import load_reeb_graph_from_file
+            
+            # Change to the data directory so load_reeb_graph_from_file can find the file
+            old_cwd = os.getcwd()
+            os.chdir('/root/workspace/data')
+            try:
+                reeb_graph = load_reeb_graph_from_file(f'Graph_new_{case}.json')
+            except Exception as graph_error:
+                os.chdir(old_cwd)  # Restore original directory
+                error_msg = f"Failed to load graph from {graph_file}: {str(graph_error)}"
+                print(f"⚠ {error_msg} - critical error, cannot continue")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_type': 'graph_load_error',
+                    'missing_file': graph_file
+                }
+            finally:
+                os.chdir(old_cwd)  # Restore original directory
+            
+            # Extract trajectory parameters from replanned data
+            waypoints = replanned_trajectory['waypoints']
+            phi = replanned_trajectory['phi']
+            r0 = replanned_trajectory['r0']
+            l = replanned_trajectory['l']
+            phi_new = replanned_trajectory['phi_new']
+            time_segments = replanned_trajectory['time_segments']
+            Flagb = replanned_trajectory['Flagb']
+            
+            # Generate discrete trajectory
+            discrete_result = generate_single_robot_discrete_trajectory(
+                robot_id=robot_id,
+                waypoints=waypoints,
+                phi=phi,
+                r0=r0,
+                l=l,
+                phi_new=phi_new,
+                time_segments=time_segments,
+                Flagb=Flagb,
+                reeb_graph=reeb_graph,
+                dt=dt,
+                save_dir=f'/root/workspace/data/{case}/',
+                case=case
+            )
+            
+            if discrete_result:
+                print(f"✓ Discrete trajectory generated and saved to: {discrete_result['discrete_trajectory_file']}")
+                print(f"  Total points: {discrete_result['num_points']}")
+                print(f"  Total time: {discrete_result['total_time']:.3f}s")
             else:
-                print(f"⚠ Graph file not found: {graph_file} - skipping discrete trajectory generation")
+                error_msg = "Failed to generate discrete trajectory"
+                print(f"⚠ {error_msg} - critical error, cannot continue")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_type': 'trajectory_generation_error'
+                }
                 
         except Exception as e:
             print(f"⚠ Error generating discrete trajectory: {e}")

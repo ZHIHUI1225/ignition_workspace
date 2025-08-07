@@ -28,13 +28,13 @@ def generate_launch_description():
     
     # Robot 0 configuration
     robot_id = 0
-    robot_namespace = f'turtlebot{robot_id}'
+    robot_namespace = f'robot{robot_id}'
     tree_node_name = f'tree_{robot_id}'
     
     # Modular behavior tree node for robot 0
     behavior_tree_node = Node(
         package='behaviour_tree',
-        executable='my_behaviour_tree_modular',
+        executable='simple_tree',
         name=tree_node_name,
         namespace=robot_namespace,
         output='screen',
@@ -43,7 +43,7 @@ def generate_launch_description():
             'robot_id': robot_id,
             'robot_namespace': robot_namespace,
             'tree_name': f'BehaviorTree_{robot_id}',
-            'case': 'simple_maze'
+            'case': 'experi'
         }],
         remappings=[
             # Robot-specific topic remappings

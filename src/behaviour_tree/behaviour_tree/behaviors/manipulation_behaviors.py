@@ -25,43 +25,67 @@ from threading import Lock  # Also import Lock directly for clarity
 from tf_transformations import euler_from_quaternion
 import tf_transformations as tf
 import copy
-
+import yaml
+def load_config(self):
+    """Load configuration from YAML file"""
+    config_path = '/root/workspace/config/config.yaml'
+    try:
+        with open(config_path, 'r') as file:
+            config = yaml.safe_load(file)
+            return config
+    except Exception as e:
+        print(f"Error loading config from {config_path}: {e}")
+        print("Using default configuration")
+        return {
+            'planning': {
+                'discrete_dt': 0.2  # Default fallback
+            }
+        }
+        
 def extract_namespace_number(namespace):
     """Extract numerical index from robot namespace"""
-    match = re.search(r'turtlebot(\d+)', namespace)
+    match = re.search(r'robot(\d+)', namespace)
     return int(match.group(1)) if match else 0
 class MobileRobotMPC:
     def __init__(self):
-        # MPC parameters - optimized for position convergence
-        self.N = 8           # Longer horizon for better convergence
-        self.N_c = 3         # Longer control horizon for smoother control
-        self.dt = 0.5        # Time step (increased from 0.1s to 0.5s)
-        
-        # Increased weights for better position convergence
-        self.Q = np.diag([150.0, 150.0, 20.0, 1.0, 1.0])  # Higher position weights (x, y, theta, v, omega)
-        self.R = np.diag([0.5, 0.5])                       # Lower control weights for more aggressive control
-        self.F = np.diag([300.0, 300.0, 50.0, 2.0, 2.0])  # Much higher terminal cost weights for convergence
-        
-        # Conservative velocity constraints for numerical stability
-        self.max_vel = 0.2       # m/s
-        self.min_vel = 0.0    # m/s - minimal reverse
-        self.max_omega = np.pi/3 # rad/s
-        self.min_omega = -np.pi/3 # rad/s
-        
-        # Numerical stability parameters
-        self.eps = 1e-6          # Small regularization term
-        self.max_angle_diff = np.pi/2  # Maximum angle difference to prevent wrapping issues
-        
+        self.config = load_config(self)
+        # Use the global config object imported from config_loader
+        # Parameters from config (direct attributes)
+        self.dt = getattr(self.config, 'discrete_dt', 0.2)
+        # Prediction horizon
+        self.N = 5
+        self.N_c = 3  # Not used in mobile_robot_mpc.py, but kept for compatibility
+        # Weights
+        self.Q = np.diag([200.0, 200.0, 3.0, 0.2, 0.2])
+        self.R = np.diag([0.05, 0.3])
+        # Terminal cost weights (F) for compatibility with cost function
+        self.F = np.diag([200.0, 200.0, 3.0, 0.2, 0.2])
+        # Velocity limits
+        # Load velocity limits from config for easy tuning
+        mpc_config = self.config.get('mpc_controller', {})
+        self.max_vel = mpc_config.get('max_linear_velocity', 0.08)     # m/s - default 8 cm/s
+        self.min_vel = mpc_config.get('min_linear_velocity', -0.03)    # m/s - default 3 cm/s  
+        self.max_omega = mpc_config.get('max_angular_velocity', 0.6)   # rad/s - default 34 deg/s
+        self.min_omega = mpc_config.get('min_angular_velocity', -0.6)  # rad/s
         # System dimensions
-        self.nx = 5   # Number of states (x, y, theta, v, omega)
-        self.nu = 2    # Number of controls (v, omega)
-        
+        self.nx = 5
+        self.nu = 2
         # Reference trajectory
         self.ref_traj = None
-        
-        # Solver cache for warm starting
-        self.last_solution = None
-        
+        # MPC state for warm starting
+        self.last_solution_U = None
+        self.last_solution_X = None
+        # PI controller parameters (fallback)
+        pi_config = mpc_config.get('pi_controller', {})
+        self.kp_pos = pi_config.get('kp_position', 0.5)      # Position proportional gain 
+        self.ki_pos = pi_config.get('ki_position', 0.02)     # Position integral gain 
+        self.kp_angle = pi_config.get('kp_angle', 0.6)       # Angle proportional gain - reduced for smoother motion
+        self.ki_angle = pi_config.get('ki_angle', 0.01)      # An
+        self.pos_error_integral = 0.0
+        self.angle_error_integral = 0.0
+        self.max_integral = 0.5
+        self.angle_threshold = 0.8
+        self.distance_threshold = 0.05
         # Initialize MPC
         self.setup_mpc()
 
@@ -93,9 +117,10 @@ class MobileRobotMPC:
             # Orientation tracking - using atan2(sin(θ), cos(θ)) to avoid discontinuity at ±π
             theta_diff = self.X[2, k] - self.ref[2, k]
             # Use atan2(sin(θ), cos(θ)) for smooth angle differences
-            theta_error = ca.atan2(ca.sin(theta_diff), ca.cos(theta_diff))
+            theta_error = self.X[2, k] - self.ref[2, k]  # 直接使用角度差
+            theta_error = ca.fmod(theta_error + ca.pi, 2*ca.pi) - ca.pi  # 映射到[-π, π]
             cost += self.Q[2,2] * theta_error**2
-            
+
             # Velocity tracking - bounded to prevent extreme values
             v_error = ca.fmin(ca.fmax(self.X[3, k] - self.ref[3, k], -5.0), 5.0)
             w_error = ca.fmin(ca.fmax(self.X[4, k] - self.ref[4, k], -5.0), 5.0)
@@ -143,31 +168,18 @@ class MobileRobotMPC:
 
         # Solver settings - optimized for speed and numerical stability with THREAD CONTROL
         self.opti.minimize(cost)
-        
-        # 🔧 CRITICAL: Set environment variables to control BLAS/LAPACK threading
-        import os
-        os.environ['OMP_NUM_THREADS'] = '1'
-        os.environ['OPENBLAS_NUM_THREADS'] = '1' 
-        os.environ['MKL_NUM_THREADS'] = '1'
-        os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
-        os.environ['NUMEXPR_NUM_THREADS'] = '1'
+    
         
         opts = {
-            'ipopt.print_level': 0, 
-            'print_time': 0, 
-            'ipopt.max_iter': 100,        # Reduced iterations for speed
-            'ipopt.max_cpu_time': 0.4,   # Increased time limit (from 0.08s to 0.4s) for 0.5s control frequency
-            'ipopt.tol': 5e-2,           # Relaxed tolerance for speed
-            'ipopt.acceptable_tol': 1e-1, # Very relaxed acceptable tolerance
-            'ipopt.acceptable_iter': 2,   # Accept quickly if reasonable
-            'ipopt.warm_start_init_point': 'no', # Disable warm start initially for stability
-            'ipopt.hessian_approximation': 'limited-memory', # BFGS approximation
-            'ipopt.linear_solver': 'mumps', # Try single-threaded linear solver
-            'ipopt.mu_strategy': 'monotone', # Stable strategy
-            'ipopt.nlp_scaling_method': 'none', # Disable scaling to prevent issues
-            'ipopt.constr_viol_tol': 5e-2, # Relaxed constraint violation
+            'ipopt.max_iter': 15,  # 从30降至15（加速收敛）
+            'ipopt.max_cpu_time': 0.08,  # 从0.15s降至0.08s（硬实时约束）
+            'ipopt.tol': 1e-2,  # 从5e-3放宽（加速收敛）
+            'ipopt.hessian_approximation': 'limited-memory',  # 启用低内存Hessian近似
+            'ipopt.fast_step_computation': 'yes',  # 启用快速步长计算
+            'ipopt.print_level': 0,  # Suppress IPOPT output
+            'ipopt.sb': 'yes',       # Suppress IPOPT banner
+            'print_time': 0,         # Suppress CasADi timing output
         }
-        
         self.opti.solver('ipopt', opts)
 
     def robot_model_safe(self, x, u):
@@ -240,61 +252,67 @@ class MobileRobotMPC:
         except:
             pass  # Continue without initialization if it fails
         
-        # Solve with robust error handling
+        # Solve with robust error handling and timing
+        import time
         try:
+            start_time = time.time()
             sol = self.opti.solve()
-            
+            elapsed = time.time() - start_time
+            print(f"[MPC] CasADi solver time: {elapsed*1000:.2f} ms")
+            if elapsed > 0.15:
+                print(f"[MPC][WARNING] Solver took too long: {elapsed:.3f} s")
+
             # Extract and validate solution
             u_opt = sol.value(self.U)[:, :self.N_c]
-            
+
             # Validate solution
             if np.any(np.isnan(u_opt)) or np.any(np.isinf(u_opt)):
                 return np.zeros((self.nu, self.N_c))
-            
+
             # Bound solution to reasonable values
             u_opt[0, :] = np.clip(u_opt[0, :], self.min_vel, self.max_vel)
             u_opt[1, :] = np.clip(u_opt[1, :], self.min_omega, self.max_omega)
-            
+
             # Store solution for potential future use
             self.last_solution = {
                 'u': sol.value(self.U),
                 'x': sol.value(self.X)
             }
-            
+
             return u_opt
-            
+
         except Exception as e:
             # Clear any stale solution
             self.last_solution = None
-            
+
             # Fallback: Simple proportional control towards reference
             if self.ref_traj is not None and self.ref_traj.shape[1] > 0:
                 # Get target position from reference
                 target_x = self.ref_traj[0, 0]
                 target_y = self.ref_traj[1, 0]
                 target_theta = self.ref_traj[2, 0]
-                
+
                 # Calculate errors
                 dx = target_x - current_state[0]
                 dy = target_y - current_state[1]
                 theta_diff = target_theta - current_state[2]
-                
+
                 # Use atan2(sin(θ), cos(θ)) for smooth angle difference calculation
                 dtheta = np.arctan2(np.sin(theta_diff), np.cos(theta_diff))
-                
+
                 # Simple proportional control
                 distance = np.sqrt(dx*dx + dy*dy)
                 desired_v = min(0.15, max(0.05, 0.3 * distance))  # Speed proportional to distance
                 desired_omega = np.clip(2.0 * dtheta, -0.8, 0.8)  # Angular velocity proportional to angle error
-                
+
                 # Create fallback control sequence
                 fallback_u = np.zeros((self.nu, self.N_c))
                 for i in range(self.N_c):
                     fallback_u[0, i] = desired_v
                     fallback_u[1, i] = desired_omega
-                
+
                 return fallback_u
-            
+
             return np.zeros((self.nu, self.N_c))
     
     def robot_model_np(self, x, u):
@@ -318,29 +336,119 @@ class MobileRobotMPC:
             return np.zeros((self.nx, self.N+1))
 
 class PushObject(py_trees.behaviour.Behaviour):
-    """Push object behavior using MPC controller for trajectory following"""
-    
+    # --- Data recording and plotting (as in mpc_test_node.py) ---
     def __init__(self, name="PushObject", robot_namespace="robot0", distance_threshold=0.08, case="experi"):
+        # Ensure subscription attributes always exist, even if __init__ fails early
+        self.robot_pose_sub = None
+        self.parcel_pose_sub = None
+        # Thread-safe state lock for callback protection
+        from threading import Lock
+        self.state_lock = Lock()
+        # Only pass name to py_trees.behaviour.Behaviour FIRST (must be before blackboard usage)
         super().__init__(name)
+        # Blackboard client setup (as in ApproachObject)
+        self.blackboard = self.attach_blackboard_client(name=f"{name}_bb")
+        # Register all required blackboard keys (add more as needed)
+        self.blackboard.register_key(key="discrete_dt", access=py_trees.common.Access.READ)
+        self.blackboard.register_key(key=f"{robot_namespace}/current_parcel_index", access=py_trees.common.Access.READ)
         self.robot_namespace = robot_namespace  # Use provided namespace
         self.case = case  # Use provided case instead of hardcoded default
-        self.number=extract_namespace_number(robot_namespace)
+        self.number = extract_namespace_number(robot_namespace)
         self.distance_threshold = distance_threshold  # Distance threshold for success condition
+        self.dt = 0.2
+        # Ensure control_sequence and related attributes always exist
+        self.control_sequence = None
+        self.control_step = 0
+
+    def init_data_recording(self):
+        self.recording_data = True
+        self.robot_positions = []  # [timestamp, x, y, theta, v, omega]
+        self.target_positions = []  # [timestamp, x_ref, y_ref, theta_ref, v_ref, omega_ref]
+        self.control_commands = []  # [timestamp, v_cmd, omega_cmd]
+        self.start_time = None
+        self.trajectory_completed = False
+
+    def save_data_json(self, data_dir, robot_data, target_data, control_data):
+        import json, os
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            with open(os.path.join(data_dir, 'robot_positions.json'), 'w') as f:
+                json.dump(robot_data, f)
+            with open(os.path.join(data_dir, 'target_positions.json'), 'w') as f:
+                json.dump(target_data, f)
+            with open(os.path.join(data_dir, 'control_commands.json'), 'w') as f:
+                json.dump(control_data, f)
+        except Exception as e:
+            print(f"[DataSave] Error saving data: {e}")
+
+    def generate_plots(self, data_dir, robot_data, target_data, control_data):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            robot_data = np.array(robot_data)
+            target_data = np.array(target_data)
+            control_data = np.array(control_data)
+            # Plot robot and target trajectory
+            plt.figure()
+            plt.plot(robot_data[:,1], robot_data[:,2], label='Robot Trajectory')
+            plt.plot(target_data[:,1], target_data[:,2], label='Target Trajectory')
+            plt.legend()
+            plt.xlabel('X (m)')
+            plt.ylabel('Y (m)')
+            plt.title('Trajectory Tracking')
+            plt.savefig(os.path.join(data_dir, 'trajectory_tracking.png'))
+        except Exception:
+            pass
         
-        # Setup blackboard access for namespaced current_parcel_index only
-        self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key=f"{robot_namespace}/current_parcel_index", 
-            access=py_trees.common.Access.READ
-        )
-        
-        # ROS2 topics for pushing coordination instead of blackboard
-        self.pushing_finished_pub = None
-        self.pushing_estimated_time_pub = None
-        self.pushing_estimated_time = 45.0  # Default value
-        
-        # ROS node (will be set in setup)
-        self.node = None
+    def initialise(self):
+        """Initialize behavior state and start dedicated control thread"""
+        print(f"[{self.name}] Starting pushing behavior initialization...")
+
+        # --- Data recording: start recording at initialization ---
+        self.init_data_recording()
+
+        # Initialize data cache mechanism
+        try:
+            self._init_data_cache()
+        except Exception:
+            pass
+
+        # Reset state variables - use None instead of zeros to distinguish "uninitialized" from "received zero values"
+        self.current_state = None
+        self.pushing_active = True
+        self.start_time = time.time()
+        self.parcel_pose = None
+        self.relay_pose = None
+
+        # 重置轨迹索引到起始位置
+        self.trajectory_index = 0
+
+        # 添加初始化完成标志，防止控制循环在数据到达前运行
+        self.initialization_complete = False
+
+        # 重置回调计数器用于调试
+        self._robot_callback_count = 0
+        self._parcel_callback_count = 0
+
+        # 线程安全标志
+        self.terminating = False
+
+        # 重置PI控制器
+        self._reset_pi_controller()
+
+        # 设置初始状态发布
+        self.publish_pushing_finished(False)
+
+        # 创建新的MPC控制器
+        self.mpc = MobileRobotMPC()
+        # Ensure the controller uses the correct dt from blackboard
+        if hasattr(self, 'dt') and hasattr(self.mpc, 'dt'):
+            self.mpc.dt = self.dt
+        self.P_HOR = self.mpc.N
+
+        # 加载轨迹
+        # First load the trajectory and setup relay point from it
         
         # State variables (will be reset in initialise)
         self.current_state = None
@@ -357,11 +465,11 @@ class PushObject(py_trees.behaviour.Behaviour):
         self.reference_pub = None
         self.robot_pose_sub = None
         self.parcel_pose_sub = None
-        self.relay_pose_sub = None
+        # relay_pose_sub removed as we're now using trajectory points
         
         # Pose storage for success checking (will be reset in initialise)
         self.parcel_pose = None
-        self.relay_pose = None
+        self.relay_pose = None  # Will be set from trajectory points
         self.current_parcel_index = 0
         
         # Path messages for visualization (will be reset in initialise)
@@ -374,7 +482,15 @@ class PushObject(py_trees.behaviour.Behaviour):
         # Control sequence management (will be reset in initialise)
         self.control_sequence = None
         self.control_step = 0
-        self.dt = 0.5  # 0.5s timer period for MPC control
+        # Set dt from blackboard variable 'discrete_dt' if available, else fallback to 0.5
+        try:
+            bb_dt = self.blackboard.get('discrete_dt')
+            if bb_dt is not None:
+                self.dt = float(bb_dt)
+            else:
+                self.dt = 0.5
+        except Exception:
+            self.dt = 0.5  # fallback if blackboard not ready
         
         # State tracking (will be reset in initialise)
         self.pushing_active = False
@@ -439,7 +555,7 @@ class PushObject(py_trees.behaviour.Behaviour):
     
     def _extract_namespace_number(self):
         """Extract numerical index from robot namespace"""
-        match = re.search(r'turtlebot(\d+)', self.robot_namespace)
+        match = re.search(r'robot(\d+)', self.robot_namespace)
         return int(match.group(1)) if match else 0
     
     def _load_trajectory(self):
@@ -566,14 +682,14 @@ class PushObject(py_trees.behaviour.Behaviour):
             pass
 
     def parcel_pose_callback(self, msg):
-        """Update parcel pose from PoseStamped message - optimized as atomic operation"""
+        """Update parcel pose from Odometry message - optimized as atomic operation"""
         try:
             # Atomic operation to update pose data (minimize lock holding time)
             with self.state_lock:
-                self.parcel_pose = msg.pose
+                self.parcel_pose = msg.pose.pose  # Extract pose from Odometry message
                 # 添加到缓存
                 try:
-                    self._add_to_parcel_cache(msg.pose)
+                    self._add_to_parcel_cache(msg.pose.pose)
                 except Exception as cache_error:
                     # 缓存失败不应该影响主要功能
                     pass
@@ -595,20 +711,13 @@ class PushObject(py_trees.behaviour.Behaviour):
             pass
 
     def relay_pose_callback(self, msg):
-        """Update relay point pose from PoseStamped message - read once (static pose)"""
-        # 中继点位置是静态的，只需要读取一次
+        """Legacy method for compatibility - relay pose now comes from trajectory"""
+        # This method is kept for backward compatibility but should not be called
+        print(f"[{self.name}] WARNING: relay_pose_callback called, but relay pose is now derived from trajectory")
+        # We'll still update the relay_pose in case this is somehow called
         if self.relay_pose is None:
             with self.state_lock:
                 self.relay_pose = msg.pose
-            
-            # 读取一次后立即销毁订阅以节省资源
-            if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub is not None:
-                try:
-                    self.node.destroy_subscription(self.relay_pose_sub)
-                    self.relay_pose_sub = None
-                except Exception as e:
-                    pass
-        # 如果已经有中继点数据，忽略后续消息（不应该发生，因为订阅已销毁）
     
     def _calculate_distance(self, pose1, pose2):
         """Calculate Euclidean distance between two poses"""
@@ -907,8 +1016,6 @@ class PushObject(py_trees.behaviour.Behaviour):
                             self._mpc_call_counter = 0
                         self._mpc_call_counter += 1
                         
-    
-                        
                         # Step 1: Calculate current position error to determine if we need closest point search
                         if self.trajectory_index < len(self.ref_trajectory):
                             ref_pos = np.array([self.ref_trajectory[self.trajectory_index][0], 
@@ -921,25 +1028,26 @@ class PushObject(py_trees.behaviour.Behaviour):
                             curr_pos = np.array([self.current_state[0], self.current_state[1]])
                             current_error = np.linalg.norm(curr_pos - ref_pos)
                         
-                        # Reduced position error logging frequency
-                        if self._mpc_call_counter % 20 == 0:
-                            print(f"[{self.name}] 📏 Current position error: {current_error:.4f}m")
-                        
-                        # Step 2: If error > 0.02m, find closest trajectory point and update trajectory index
-                        if current_error > 0.02:
-                            # Optimized closest point search with limited range
-                            best_idx, min_dist = self._find_closest_reference_point(current_error)
-                            
-                            # Update trajectory index to closest point (forward-only)
-                            old_idx = self.trajectory_index
-                            self._safe_update_trajectory_index(max(self.trajectory_index, best_idx), "error_correction")
-                            
-                            # Reduced logging for performance - only log significant changes
-                            if self.trajectory_index > old_idx + 5:  # Only log if significant jump
-                                print(f"[{self.name}] ✅ Trajectory index updated: {old_idx} -> {self.trajectory_index} (closest distance: {min_dist:.3f}m)")
+                        # # Reduced position error logging frequency
+                        # if self._mpc_call_counter % 20 == 0:
+                        #     print(f"[{self.name}] 📏 Current position error: {current_error:.4f}m")
+                        # skip = False
+                        # # Step 2: If error > 0.03m, find closest trajectory point and update trajectory index
+                        # if current_error > 0.12:
+                        #     skip=True
+                        #     # Find closest trajectory point
+                        #     best_idx, min_dist = self._find_closest_reference_point(current_error)
+                        #     old_idx = self.trajectory_index
+                        #     # Only update if closest index is ahead of current
+                        #     if best_idx > self.trajectory_index:
+                        #         self._safe_update_trajectory_index(best_idx, "error_correction_closest_ahead")
+                        #         skip = False
+                        #     else:
+                        #         print(f"[{self.name}] Closest trajectory index {best_idx} is behind current {self.trajectory_index}, not updating.")
                         # Removed verbose logging for small errors to improve performance
-                        
+                    
                         # Step 3: Prepare reference trajectory for MPC (from current index)
+                        # if not skip:
                         ref_array = np.zeros((5, self.mpc.N+1))
                         for i in range(self.mpc.N + 1):
                             if self.trajectory_index + i < len(self.ref_trajectory):
@@ -1064,10 +1172,10 @@ class PushObject(py_trees.behaviour.Behaviour):
                 return False
             
             # Create new parcel subscription (使用可靠QoS和共享ReentrantCallbackGroup)
-            parcel_topic = f'/parcel{current_parcel_index}/pose'
+            parcel_topic = f'/parcel{current_parcel_index}/odom'
             reliable_qos = self._create_reliable_qos_profile()
             self.parcel_pose_sub = self.node.create_subscription(
-                PoseStamped,
+                Odometry,
                 parcel_topic,
                 self.parcel_pose_callback,
                 reliable_qos,
@@ -1082,40 +1190,42 @@ class PushObject(py_trees.behaviour.Behaviour):
             return False
 
     def setup_relay_subscription(self):
-        """Set up relay subscription - one-shot for static pose, 使用ReentrantCallbackGroup"""
-        if self.node is None:
-            print(f"[{self.name}] WARNING: Cannot setup relay subscription - no ROS node")
+        """Set up relay point data from trajectory points instead of subscription"""
+        if not hasattr(self, 'ref_trajectory') or self.ref_trajectory is None:
+            print(f"[{self.name}] WARNING: Cannot setup relay pose - no trajectory data loaded")
             return False
             
         try:
-            # 如果已经有中继点数据，无需重新订阅
+            # If relay pose is already set, no need to do it again
             if self.relay_pose is not None:
-                print(f"[{self.name}] ✅ Relay point data already exists, skipping subscription")
+                print(f"[{self.name}] ✅ Relay point data already exists, no need to update")
                 return True
             
-            # Clean up existing subscription if it exists
-            if self.relay_pose_sub is not None:
-                self.node.destroy_subscription(self.relay_pose_sub)
-                self.relay_pose_sub = None
-            
-            # 🔧 使用共享回调组管理器 - 不再创建临时回调组
-            if not hasattr(self, 'pose_callback_group') or self.pose_callback_group is None:
-                print(f"[{self.name}] ❌ ERROR: Shared callback group not properly set up, cannot create relay point subscription")
-                return False
-            
-            # Subscribe to relay point pose (一次性读取静态数据，使用可靠QoS)
+            # Create a relay point pose from the last point of the trajectory
             relay_number = self._extract_namespace_number() + 1  # Relaypoint{i+1}
-            relay_topic = f'/Relaypoint{relay_number}/pose'
-            reliable_qos = self._create_reliable_qos_profile()
-            self.relay_pose_sub = self.node.create_subscription(
-                PoseStamped, relay_topic,
-                self.relay_pose_callback, reliable_qos,
-                callback_group=self.pose_callback_group)
-            print(f"[{self.name}] ✅ Successfully subscribed to relay topic: {relay_topic} (relay point: {relay_number}) [one-time read, using ReentrantCallbackGroup, node: {self.node.get_name()}]")
+            
+            # Get the last point from trajectory
+            last_point = self.ref_trajectory[-1]
+            
+            # Create a Pose object for the relay point
+            self.relay_pose = Pose()
+            self.relay_pose.position.x = last_point[0]
+            self.relay_pose.position.y = last_point[1]
+            
+            # Create orientation from the trajectory heading if available
+            if len(last_point) > 2:
+                # Convert heading to quaternion
+                quat = tf.quaternion_from_euler(0, 0, last_point[2])
+                self.relay_pose.orientation.x = quat[0]
+                self.relay_pose.orientation.y = quat[1]
+                self.relay_pose.orientation.z = quat[2]
+                self.relay_pose.orientation.w = quat[3]
+            
+            print(f"[{self.name}] ✅ Successfully set relay point from trajectory end point: ({self.relay_pose.position.x}, {self.relay_pose.position.y}) [relay point: {relay_number}]")
             return True
             
         except Exception as e:
-            print(f"[{self.name}] ERROR: Failed to setup relay subscription: {e}")
+            print(f"[{self.name}] ERROR: Failed to setup relay point from trajectory: {e}")
             return False
 
     def setup_robot_subscription(self):
@@ -1136,7 +1246,7 @@ class PushObject(py_trees.behaviour.Behaviour):
                 return False
             
             # Subscribe to robot odometry (使用可靠QoS和共享ReentrantCallbackGroup) 
-            robot_odom_topic = f'/turtlebot{self._extract_namespace_number()}/odom_map'
+            robot_odom_topic = f'/robot{self._extract_namespace_number()}/odom'
             reliable_qos = self._create_reliable_qos_profile()
             self.robot_pose_sub = self.node.create_subscription(
                 Odometry, robot_odom_topic, self.robot_pose_callback, reliable_qos,
@@ -1196,22 +1306,26 @@ class PushObject(py_trees.behaviour.Behaviour):
         
         # 创建新的MPC控制器
         self.mpc = MobileRobotMPC()
+        # Ensure the controller uses the correct dt from blackboard
+        if hasattr(self, 'dt') and hasattr(self.mpc, 'dt'):
+            self.mpc.dt = self.dt
         self.P_HOR = self.mpc.N
         
         # 加载轨迹
+        # First load the trajectory and setup relay point from it
         self._load_trajectory()
         
         # Setup ROS subscriptions (using optimized callback groups and QoS)
         print(f"[{self.name}] Setting up ROS subscriptions...")
         robot_sub_ok = self.setup_robot_subscription()
         parcel_sub_ok = self.setup_parcel_subscription()
-        relay_sub_ok = self.setup_relay_subscription()
+        relay_setup_ok = self.setup_relay_subscription()  # Now sets relay_pose from trajectory
         
-        print(f"[{self.name}] Subscription status: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_sub_ok}")
+        print(f"[{self.name}] Subscription status: robot={robot_sub_ok}, parcel={parcel_sub_ok}, relay={relay_setup_ok}")
         
         # Critical: wait longer to ensure subscriptions are established and callbacks start receiving data
         print(f"[{self.name}] Waiting for subscriptions to establish and data reception...")
-        time.sleep(0.8)  # 增加等待时间到800ms以确保gazebo到ros2转换稳定
+        time.sleep(0.1)
         self.check_topic_connectivity()
         
         # Non-blocking data availability check (no while loops in timer callbacks)
@@ -1247,7 +1361,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         # 启动控制定时器（替代专用线程）- 使用共享回调组
         if hasattr(self, 'control_callback_group') and self.control_callback_group is not None:
             self.control_timer = self.node.create_timer(
-                self.dt,  # 0.5s 定时器周期
+                self.dt,  
                 self.control_loop,
                 callback_group=self.control_callback_group  # 使用共享回调组
             )
@@ -1264,9 +1378,9 @@ class PushObject(py_trees.behaviour.Behaviour):
     def check_topic_connectivity(self):
         """验证话题数据流连通性（使用回调组避免阻塞）"""
         topics = [
-            f'/turtlebot{self._extract_namespace_number()}/odom_map',
-            f'/parcel{self.current_parcel_index}/pose',
-            f'/Relaypoint{self._extract_namespace_number()+1}/pose'
+            f'/robot{self._extract_namespace_number()}/odom',
+            f'/parcel{self.current_parcel_index}/odom'
+            # Removed relay point topic as we're using trajectory points instead
         ]
         
         print(f"[{self.name}] 📊 Topic connectivity check (node: {self.node.get_name() if self.node else 'None'})")
@@ -1299,7 +1413,7 @@ class PushObject(py_trees.behaviour.Behaviour):
         print(f"[{self.name}] 📊 Subscription object status:")
         print(f"   robot_pose_sub: {self.robot_pose_sub is not None}")
         print(f"   parcel_pose_sub: {self.parcel_pose_sub is not None}")
-        print(f"   relay_pose_sub: {self.relay_pose_sub is not None}")
+        print(f"   relay_pose: {self.relay_pose is not None} [from trajectory]")
         print(f"   callback_group: {hasattr(self, 'callback_group') and self.callback_group is not None}")
         
         # Force a topic list check to see what topics actually exist
@@ -1442,6 +1556,12 @@ class PushObject(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.RUNNING
     
     def terminate(self, new_status):
+        # --- Data recording: save and plot data on termination ---
+        try:
+            self.save_and_plot_data()
+        except Exception as e:
+            print(f"[{self.name}] Data save/plot failed on terminate: {e}")
+        # ...existing code...
         """Clean up when behavior terminates - with thread-safe cleanup"""
         print(f"[{self.name}] Starting push behavior termination, status: {new_status}")
         
@@ -1500,32 +1620,20 @@ class PushObject(py_trees.behaviour.Behaviour):
                 except Exception as e:
                     subscription_errors.append(f"parcel_pose_sub: {e}")
             
-            # Clean up relay point pose subscription (may have been auto-destroyed)
-            if hasattr(self, 'relay_pose_sub') and self.relay_pose_sub is not None:
-                try:
-                    self.node.destroy_subscription(self.relay_pose_sub)
-                    self.relay_pose_sub = None
-                    print(f"[{self.name}] Relay point subscription cleaned up")
-                except Exception as e:
-                    subscription_errors.append(f"relay_pose_sub: {e}")
-            else:
-                # Relay point subscription may have been automatically destroyed after reading static data
-                print(f"[{self.name}] Relay point subscription already destroyed (normal case)")
+            # Clean up relay point pose (now from trajectory, not subscription)
+            # No need to destroy relay_pose_sub since we're not using it anymore
+            print(f"[{self.name}] Relay point data from trajectory cleaned up")
             
             if subscription_errors:
                 print(f"[{self.name}] Subscription cleanup warnings: {subscription_errors}")
         
         print(f"[{self.name}] Push behavior termination complete, status: {new_status}")
     
-    def _find_closest_reference_point(self, current_error=None, search_range=None):
+    def _find_closest_reference_point(self, current_error=None):
         """
         Find the closest reference point in the trajectory to the current robot position
         Optimized for speed with intelligent search range selection
-        
-        Args:
-            current_error: Current position error (optional, for optimization)
-            search_range: Range to search in (optional, for optimization)
-        """
+    """
         if not self.ref_trajectory or self.current_state is None:
             return self.trajectory_index, float('inf')
         
@@ -1533,28 +1641,16 @@ class PushObject(py_trees.behaviour.Behaviour):
         min_dist = float('inf')
         best_idx = self.trajectory_index
         
-        # Optimized search range selection for speed
-        if search_range is not None:
-            # Use provided search range
-            start_idx = max(0, self.trajectory_index)
-            end_idx = min(len(self.ref_trajectory), start_idx + search_range)
-            search_scope = "limited"
-        elif current_error is not None and current_error < 0.03:
-            # If error is very small, only search next 10 points for maximum efficiency
-            start_idx = max(0, self.trajectory_index)
-            end_idx = min(len(self.ref_trajectory), start_idx + 10)
-            search_scope = "micro"
-        elif current_error is not None and current_error < 0.1:
-            # If error is small, only search next 15 points for efficiency
-            start_idx = max(0, self.trajectory_index - 5)
-            end_idx = min(len(self.ref_trajectory), self.trajectory_index + 15)
-            search_scope = "local"
+        # Always search only from current index forward
+        start_idx = self.trajectory_index
+        if current_error is not None and current_error > 0.1:
+            # Large error: search all remaining trajectory
+            end_idx = len(self.ref_trajectory)
+            search_scope = "forward_full"
         else:
-            # Search broader range but still limited for performance
-            start_idx = max(0, self.trajectory_index - 10)
-            end_idx = min(len(self.ref_trajectory), start_idx + 50)
-            search_scope = "regional"
-        
+            # Small error: only check next 20 indices
+            end_idx = min(len(self.ref_trajectory), self.trajectory_index + 20)
+            search_scope = "forward20"
         # Vectorized distance calculation for speed (if range is small)
         search_range_size = end_idx - start_idx
         if search_range_size <= 30:
@@ -1685,26 +1781,6 @@ class PushObject(py_trees.behaviour.Behaviour):
         self._pi_last_time = time.time()
         print(f"[{self.name}] PI controller integral terms reset")
 
-    def _advance_trajectory_index(self, best_idx=None):
-        """Advance trajectory index with progress tracking - FORWARD ONLY"""
-        old_trajectory_index = self.trajectory_index
-        
-        if self.trajectory_index < len(self.ref_trajectory) - 1:
-            if best_idx is not None:
-                # Use the closest index found, but ENSURE FORWARD PROGRESS ONLY
-                # Never allow trajectory index to decrease
-                new_index = max(self.trajectory_index + 1, best_idx)
-                safe_new_index = max(self.trajectory_index, new_index)  # Double-check: never go backwards
-                self._safe_update_trajectory_index(safe_new_index, "_advance_trajectory_index")
-            else:
-                # Normal forward progress
-                self._safe_update_trajectory_index(self.trajectory_index + 1, "_advance_trajectory_index_normal")
-        else:
-            # At end of trajectory, keep using last state as target
-            print(f"[{self.name}] At end of trajectory, maintaining last state as target (index: {self.trajectory_index})")
-        
-        # Update pushing estimated time after trajectory index change
-        self._update_pushing_estimated_time()
 
     def _safe_update_trajectory_index(self, new_index, context="unknown"):
         """Safely update trajectory index ensuring forward-only progress"""
