@@ -14,6 +14,8 @@ bag_turtlebot/
 *.bak 
 *.tmp
 *.json
+
+data/
 *.mp4
 
 # ROS bag files (can be very large)
@@ -49,4 +51,7 @@ Thumbs.db
 
 # Git pack files and temporary files
 .git/objects/pack/pack-*.pack
-.git/objects/pack/tmp_pack_*
+.git/objects/pack/tmp_pack_*data/
+*.mp4
+*.db3
+rosbag2_*/
